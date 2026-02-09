@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Vendor install/update script.
+
+Reads .vendored/config.json, resolves the target version for a vendor,
+downloads and runs its install.sh, and outputs structured results for
+PR creation.
+
+Usage:
+    python3 .vendored/install <vendor|all> [--version <version>]
+
+Output (key=value lines for workflow consumption):
+    vendor=<name>
+    old_version=<version>
+    new_version=<version>
+    changed=true|false
+
+Environment:
+    GITHUB_TOKEN - Auth for public repos
+    VENDOR_PAT   - Auth for private repos (vendor.private: true)
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+
+def load_config(config_path=".vendored/config.json"):
+    """Load and return the vendored config."""
+    if not os.path.isfile(config_path):
+        print(f"::error::Config not found: {config_path}")
+        sys.exit(1)
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def get_auth_token(vendor_config):
+    """Get the appropriate auth token for a vendor."""
+    if vendor_config.get("private"):
+        token = os.environ.get("VENDOR_PAT", "")
+        if not token:
+            print("::error::VENDOR_PAT required for private vendor repos")
+            sys.exit(1)
+        return token
+    return os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
+
+
+def resolve_version(vendor_name, vendor_config, requested_version, token):
+    """Resolve the target version for a vendor.
+
+    Strategy:
+    1. If a specific version is given (not 'latest'), use it
+    2. Try GitHub releases API for latest release tag
+    3. Fall back to reading VERSION file from default branch
+    """
+    repo = vendor_config["repo"]
+
+    if requested_version and requested_version != "latest":
+        return requested_version
+
+    # Try releases API
+    version = _resolve_from_releases(repo, token)
+    if version:
+        return version
+
+    # Fallback: VERSION file on default branch
+    version = _resolve_from_version_file(repo, token)
+    if version:
+        return version
+
+    print(f"::error::Could not resolve version for {vendor_name} from {repo}")
+    sys.exit(1)
+
+
+def _resolve_from_releases(repo, token):
+    """Try to get latest version from GitHub releases."""
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        tag = result.stdout.strip()
+        # Strip leading 'v' if present
+        return tag.lstrip("v")
+    return None
+
+
+def _resolve_from_version_file(repo, token):
+    """Fallback: read VERSION file from repo default branch."""
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/VERSION", "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        import base64
+        try:
+            content = base64.b64decode(result.stdout.strip()).decode().strip()
+            return content
+        except Exception:
+            pass
+    return None
+
+
+def _gh_env(token):
+    """Build environment dict with GH_TOKEN set."""
+    env = os.environ.copy()
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
+def get_current_version(vendor_name, vendor_config):
+    """Read the currently installed version for a vendor.
+
+    Checks vendor-specific version file patterns:
+    - .<vendor_dir>/.version (e.g., .vendored/.version, .pearls/.prl-version)
+    """
+    # Common patterns for vendor version files
+    candidates = []
+
+    # Check if vendor has a known version file based on config patterns
+    for pattern in vendor_config.get("allowed", []):
+        if ".version" in pattern or "prl-version" in pattern:
+            # This is likely a version file
+            # Only use if it's a concrete path (no globs)
+            if "*" not in pattern and "?" not in pattern:
+                candidates.append(pattern)
+
+    # Also try standard convention: first protected dir + .version
+    for pattern in vendor_config.get("protected", []):
+        if pattern.endswith("/**"):
+            base_dir = pattern[:-3]  # strip /**
+            candidates.append(f"{base_dir}/.version")
+            break
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return open(path).read().strip()
+
+    return None
+
+
+def download_and_run_install(vendor_name, vendor_config, version, token):
+    """Download the vendor's install.sh and run it."""
+    repo = vendor_config["repo"]
+    env = _gh_env(token)
+
+    # Download install.sh at the target version ref
+    ref = f"v{version}"
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/install.sh?ref={ref}",
+         "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+
+    if result.returncode != 0 or not result.stdout.strip():
+        # Try without v prefix
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/contents/install.sh?ref={version}",
+             "--jq", ".content"],
+            capture_output=True, text=True, env=env
+        )
+
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"::error::Failed to download install.sh from {repo} at {ref}")
+        print(f"  stderr: {result.stderr.strip()}")
+        sys.exit(1)
+
+    import base64
+    install_script = base64.b64decode(result.stdout.strip()).decode()
+
+    # Write to temp file and execute
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+        f.write(install_script)
+        temp_path = f.name
+
+    try:
+        run_env = env.copy()
+        run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
+
+        result = subprocess.run(
+            ["bash", temp_path, version],
+            capture_output=True, text=True, env=run_env
+        )
+        print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        if result.returncode != 0:
+            print(f"::error::install.sh failed for {vendor_name} (exit {result.returncode})")
+            sys.exit(1)
+    finally:
+        os.unlink(temp_path)
+
+
+def install_vendor(vendor_name, vendor_config, requested_version):
+    """Install or update a single vendor. Returns result dict."""
+    token = get_auth_token(vendor_config)
+    target_version = resolve_version(vendor_name, vendor_config, requested_version, token)
+    current_version = get_current_version(vendor_name, vendor_config)
+
+    if current_version == target_version:
+        print(f"{vendor_name}: already at v{target_version}, skipping")
+        return {
+            "vendor": vendor_name,
+            "old_version": current_version or "none",
+            "new_version": target_version,
+            "changed": False,
+        }
+
+    print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
+    download_and_run_install(vendor_name, vendor_config, target_version, token)
+
+    return {
+        "vendor": vendor_name,
+        "old_version": current_version or "none",
+        "new_version": target_version,
+        "changed": True,
+    }
+
+
+def output_result(result):
+    """Output a single vendor result as key=value lines."""
+    print(f"vendor={result['vendor']}")
+    print(f"old_version={result['old_version']}")
+    print(f"new_version={result['new_version']}")
+    print(f"changed={str(result['changed']).lower()}")
+
+
+def output_results(results):
+    """Output results. For single vendor, key=value. For multiple, JSON."""
+    changed = [r for r in results if r["changed"]]
+    if len(results) == 1:
+        output_result(results[0])
+    else:
+        # For 'all' mode, output JSON array of changed vendors
+        print(f"results={json.dumps(changed)}")
+        print(f"changed_count={len(changed)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Install or update vendored tools")
+    parser.add_argument("vendor", help='Vendor name or "all"')
+    parser.add_argument(
+        "--version", default="latest",
+        help="Version to install (default: latest)"
+    )
+    args = parser.parse_args()
+
+    config = load_config()
+    vendors = config.get("vendors", {})
+
+    if not vendors:
+        print("No vendors configured in .vendored/config.json")
+        sys.exit(0)
+
+    if args.vendor == "all":
+        results = []
+        for name, vcfg in vendors.items():
+            results.append(install_vendor(name, vcfg, args.version))
+        output_results(results)
+    else:
+        if args.vendor not in vendors:
+            print(f"::error::Unknown vendor: {args.vendor}")
+            print(f"  Available: {', '.join(vendors.keys())}")
+            sys.exit(1)
+        result = install_vendor(args.vendor, vendors[args.vendor], args.version)
+        output_result(result)
+
+
+if __name__ == "__main__":
+    main()
