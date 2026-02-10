@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Vendor install/update script.
+"""Vendor update script.
 
 Reads .vendored/config.json, resolves the target version for a vendor,
 downloads and runs its install.sh, and outputs structured results for
 PR creation.
 
 Usage:
-    python3 .vendored/install <vendor|all> [--version <version>]
+    python3 .vendored/update <vendor|all> [--version <version>]
 
 Output (key=value lines for workflow consumption):
     vendor=<name>
@@ -265,7 +265,7 @@ def main():
     else:
         if args.vendor not in vendors:
             print(f"::error::Unknown vendor: {args.vendor}")
-            print(f"  Available: {', '.join(vendors.keys())}")
+            print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
             sys.exit(1)
         result = install_vendor(args.vendor, vendors[args.vendor], args.version)
         output_result(result)

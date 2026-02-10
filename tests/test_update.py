@@ -1,4 +1,4 @@
-"""Tests for the vendored/install script."""
+"""Tests for the vendored/update script."""
 
 import importlib.machinery
 import importlib.util
@@ -9,22 +9,22 @@ from unittest.mock import patch, MagicMock, call
 
 import pytest
 
-# ── Import install script as module ────────────────────────────────────────
+# ── Import update script as module ────────────────────────────────────────
 
 ROOT = Path(__file__).parent.parent
 
 
-def _import_install():
-    filepath = str(ROOT / "vendored" / "install")
-    loader = importlib.machinery.SourceFileLoader("vendored_install", filepath)
-    spec = importlib.util.spec_from_loader("vendored_install", loader, origin=filepath)
+def _import_update():
+    filepath = str(ROOT / "vendored" / "update")
+    loader = importlib.machinery.SourceFileLoader("vendored_update", filepath)
+    spec = importlib.util.spec_from_loader("vendored_update", loader, origin=filepath)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["vendored_install"] = module
+    sys.modules["vendored_update"] = module
     spec.loader.exec_module(module)
     return module
 
 
-inst = _import_install()
+inst = _import_update()
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────
@@ -136,22 +136,22 @@ class TestResolveVersion:
         version = inst.resolve_version("tool", SAMPLE_VENDOR, "1.5.0", "token")
         assert version == "1.5.0"
 
-    @patch("vendored_install._resolve_from_releases")
+    @patch("vendored_update._resolve_from_releases")
     def test_latest_uses_releases(self, mock_releases):
         mock_releases.return_value = "2.0.0"
         version = inst.resolve_version("tool", SAMPLE_VENDOR, "latest", "token")
         assert version == "2.0.0"
 
-    @patch("vendored_install._resolve_from_releases")
-    @patch("vendored_install._resolve_from_version_file")
+    @patch("vendored_update._resolve_from_releases")
+    @patch("vendored_update._resolve_from_version_file")
     def test_fallback_to_version_file(self, mock_vf, mock_releases):
         mock_releases.return_value = None
         mock_vf.return_value = "1.0.0"
         version = inst.resolve_version("tool", SAMPLE_VENDOR, "latest", "token")
         assert version == "1.0.0"
 
-    @patch("vendored_install._resolve_from_releases")
-    @patch("vendored_install._resolve_from_version_file")
+    @patch("vendored_update._resolve_from_releases")
+    @patch("vendored_update._resolve_from_version_file")
     def test_exits_if_cannot_resolve(self, mock_vf, mock_releases):
         mock_releases.return_value = None
         mock_vf.return_value = None
@@ -163,9 +163,9 @@ class TestResolveVersion:
 # ── Tests: install_vendor ──────────────────────────────────────────────────
 
 class TestInstallVendor:
-    @patch("vendored_install.download_and_run_install")
-    @patch("vendored_install.resolve_version")
-    @patch("vendored_install.get_auth_token")
+    @patch("vendored_update.download_and_run_install")
+    @patch("vendored_update.resolve_version")
+    @patch("vendored_update.get_auth_token")
     def test_skip_when_current(self, mock_token, mock_resolve, mock_download, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "1.0.0"
@@ -177,9 +177,9 @@ class TestInstallVendor:
         assert result["old_version"] == "1.0.0"
         mock_download.assert_not_called()
 
-    @patch("vendored_install.download_and_run_install")
-    @patch("vendored_install.resolve_version")
-    @patch("vendored_install.get_auth_token")
+    @patch("vendored_update.download_and_run_install")
+    @patch("vendored_update.resolve_version")
+    @patch("vendored_update.get_auth_token")
     def test_installs_new_version(self, mock_token, mock_resolve, mock_download, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "2.0.0"
@@ -192,9 +192,9 @@ class TestInstallVendor:
         assert result["new_version"] == "2.0.0"
         mock_download.assert_called_once()
 
-    @patch("vendored_install.download_and_run_install")
-    @patch("vendored_install.resolve_version")
-    @patch("vendored_install.get_auth_token")
+    @patch("vendored_update.download_and_run_install")
+    @patch("vendored_update.resolve_version")
+    @patch("vendored_update.get_auth_token")
     def test_fresh_install(self, mock_token, mock_resolve, mock_download, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "1.0.0"
