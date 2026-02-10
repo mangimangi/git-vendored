@@ -50,7 +50,7 @@ python3 .vendored/add owner/repo-name --name my-custom-name
 The `install-vendored.yml` workflow runs weekly (Mondays 9am UTC) or on manual dispatch:
 
 ```
-schedule/manual trigger → vendored/update → detect changes → create PR
+schedule/manual trigger → vendored/update --pr → detect changes → create PR
 ```
 
 Update a specific vendor manually:
@@ -60,6 +60,9 @@ Update a specific vendor manually:
 # Or locally:
 python3 .vendored/update my-vendor --version 2.0.0
 python3 .vendored/update all  # update all vendors
+
+# With automatic PR creation (used by CI):
+python3 .vendored/update all --pr
 ```
 
 ## Configuration
