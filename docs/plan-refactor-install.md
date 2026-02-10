@@ -134,16 +134,40 @@ since git-vendored IS the system. Changes:
 - Download `vendored/add` in addition to `vendored/update` and `vendored/check`
 - The self-registration logic stays here (it's part of bootstrap)
 
-### 5. PR creation fix (bug)
+### 5. PR creation bug: `VENDOR_PAT` token leaking into PR creation
 
-The "Create Pull Request" step in `install-vendored.yml` is failing after
-a successful push. The `gh pr create` call may be failing due to:
-- Missing `--head` flag (gh may not detect the branch correctly)
-- Token permissions
-- PR already exists for that branch
+The "Create Pull Request" step uses this token chain:
+```yaml
+GH_TOKEN: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
+```
 
-Need to investigate the exact error. Likely fix: add `--head "$BRANCH"` to
-the `gh pr create` call, or add `|| true` with a check for existing PRs.
+**The problem:** If `VENDOR_PAT` is set as a repo secret (needed for private
+vendors like `pearls`), it gets used for PR creation on **all** vendor
+updates — even public ones. That PAT is likely scoped for reading private
+repo contents, not for creating PRs on the current repo. So PR creation
+fails silently (error swallowed into `PR_URL` via `2>&1`).
+
+**The fix:** Use different tokens for different steps:
+- **Install step**: needs `VENDOR_PAT` to download from private repos
+- **PR creation step**: should always use `github.token`, which has
+  `contents: write` + `pull-requests: write` from the workflow `permissions`
+  block
+
+```yaml
+# Install step — needs VENDOR_PAT for private repo downloads
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+  VENDOR_PAT: ${{ secrets.token || secrets.VENDOR_PAT || '' }}
+  GH_TOKEN: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
+
+# PR creation step — always use github.token for repo operations
+env:
+  GH_TOKEN: ${{ github.token }}
+```
+
+Additionally:
+- Add `--head "$BRANCH"` to `gh pr create` for robustness
+- Handle "PR already exists" case gracefully
 
 ---
 
