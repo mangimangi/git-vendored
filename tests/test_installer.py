@@ -228,3 +228,59 @@ class TestInstaller:
         """Fresh install should not have .vendored/install."""
         run_installer(mock_fetch)
         assert not (tmp_repo / ".vendored" / "install").exists()
+
+
+class TestWorkflowTemplate:
+    """Verify workflow template properties for token handling, automerge, and PR creation."""
+
+    @pytest.fixture(autouse=True)
+    def load_template(self):
+        import yaml
+
+        template_path = ROOT / "templates" / "github" / "workflows" / "install-vendored.yml"
+        self.raw = template_path.read_text()
+        self.workflow = yaml.safe_load(self.raw)
+        self.steps = self.workflow["jobs"]["install"]["steps"]
+
+    def _step(self, name_prefix):
+        """Find a step by name prefix."""
+        for step in self.steps:
+            if step.get("name", "").startswith(name_prefix):
+                return step
+        raise KeyError(f"No step starting with {name_prefix!r}")
+
+    def test_pr_creation_uses_github_token(self):
+        """PR creation step must use github.token, not VENDOR_PAT."""
+        pr_step = self._step("Create Pull Request")
+        gh_token = pr_step["env"]["GH_TOKEN"]
+        assert gh_token == "${{ github.token }}"
+
+    def test_update_step_provides_vendor_pat(self):
+        """Update step should expose VENDOR_PAT for private repo downloads."""
+        update_step = self._step("Run vendored update")
+        assert "VENDOR_PAT" in update_step["env"]
+
+    def test_automerge_defaults_to_false(self):
+        """Automerge must default to False, not True."""
+        pr_step = self._step("Create Pull Request")
+        run_script = pr_step["run"]
+        assert "automerge', False)" in run_script
+
+    def test_gh_pr_create_includes_head_flag(self):
+        """gh pr create must include --head to specify the branch."""
+        pr_step = self._step("Create Pull Request")
+        run_script = pr_step["run"]
+        assert '--head "$BRANCH"' in run_script
+
+    def test_pr_already_exists_handled(self):
+        """Workflow should handle 'PR already exists' without failing."""
+        pr_step = self._step("Create Pull Request")
+        run_script = pr_step["run"]
+        assert "already exists" in run_script
+
+    def test_update_step_references_vendored_update(self):
+        """Update step must call .vendored/update, not .vendored/install."""
+        update_step = self._step("Run vendored update")
+        run_script = update_step["run"]
+        assert "python3 .vendored/update" in run_script
+        assert "python3 .vendored/install" not in run_script
