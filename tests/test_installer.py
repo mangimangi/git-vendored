@@ -81,10 +81,6 @@ fi
 
 install_workflow() {{
     local workflow="$1"
-    if [ -f ".github/workflows/$workflow" ]; then
-        echo "Workflow .github/workflows/$workflow already exists, skipping"
-        return
-    fi
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
     fi
@@ -92,12 +88,6 @@ install_workflow() {{
 
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
-
-# Patch existing workflow files to reference the renamed script
-if [ -f .github/workflows/install-vendored.yml ]; then
-    sed -i 's|python3 \\.vendored/install|python3 .vendored/update|g' \\
-        .github/workflows/install-vendored.yml
-fi
 
 python3 -c "
 import json
@@ -219,21 +209,20 @@ class TestInstaller:
         # update should exist instead
         assert (tmp_repo / ".vendored" / "update").is_file()
 
-    def test_patches_workflow_references(self, mock_fetch, tmp_repo):
-        """sed replacement updates old .vendored/install references in workflow."""
+    def test_updates_existing_workflow_templates(self, mock_fetch, tmp_repo):
+        """Workflow templates are always updated, even if they already exist."""
         (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
         (tmp_repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
-        # Write a workflow file with old reference
+        # Write a stale workflow file
         workflow = tmp_repo / ".github" / "workflows" / "install-vendored.yml"
-        workflow.write_text(
-            'run: python3 .vendored/install "$VENDOR" --version "$VERSION"\n'
-        )
+        workflow.write_text("# stale workflow content\n")
 
         run_installer(mock_fetch)
 
         content = workflow.read_text()
+        # Should be replaced with the template content, not the stale content
+        assert "# stale workflow content" not in content
         assert "python3 .vendored/update" in content
-        assert "python3 .vendored/install" not in content
 
     def test_old_install_not_present_after_fresh_install(self, mock_fetch, tmp_repo):
         """Fresh install should not have .vendored/install."""

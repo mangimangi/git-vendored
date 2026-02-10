@@ -10,11 +10,10 @@
 #
 # Behavior:
 #   - Always updates: .vendored/add, .vendored/update, .vendored/check, .vendored/.version
-#   - First install only: workflow templates to .github/workflows/ (skipped if present)
+#   - Always updates: workflow templates in .github/workflows/
 #   - Preserves .vendored/config.json (only creates if missing)
 #   - Self-registers git-vendored as a vendor in .vendored/config.json
 #   - Cleans up old .vendored/install (renamed to .vendored/update)
-#   - Patches existing workflow files to reference .vendored/update
 #
 set -euo pipefail
 
@@ -66,27 +65,16 @@ if [ ! -f .vendored/config.json ]; then
     echo "Created .vendored/config.json"
 fi
 
-# Helper to install a workflow file (first install only)
+# Install/update workflow templates (always updated to propagate changes)
 install_workflow() {
     local workflow="$1"
-    if [ -f ".github/workflows/$workflow" ]; then
-        echo "Workflow .github/workflows/$workflow already exists, skipping"
-        return
-    fi
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
     fi
 }
 
-# Install workflow templates (skipped if already present)
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
-
-# Patch existing workflow files to reference the renamed script
-if [ -f .github/workflows/install-vendored.yml ]; then
-    sed -i 's|python3 \.vendored/install|python3 .vendored/update|g' \
-        .github/workflows/install-vendored.yml
-fi
 
 # Self-register git-vendored as a vendor in config.json
 python3 -c "
