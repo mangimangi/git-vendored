@@ -56,13 +56,20 @@ echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
 mkdir -p .vendored .github/workflows
 
-echo "Downloading .vendored/install..."
-fetch_file "vendored/install" ".vendored/install"
-chmod +x .vendored/install
+echo "Downloading .vendored/add..."
+fetch_file "vendored/add" ".vendored/add"
+chmod +x .vendored/add
+
+echo "Downloading .vendored/update..."
+fetch_file "vendored/update" ".vendored/update"
+chmod +x .vendored/update
 
 echo "Downloading .vendored/check..."
 fetch_file "vendored/check" ".vendored/check"
 chmod +x .vendored/check
+
+# Clean up old install script (renamed to update)
+rm -f .vendored/install
 
 echo "$VERSION" > .vendored/.version
 echo "Installed git-vendored v$VERSION"
@@ -85,6 +92,12 @@ install_workflow() {{
 
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
+
+# Patch existing workflow files to reference the renamed script
+if [ -f .github/workflows/install-vendored.yml ]; then
+    sed -i 's|python3 \\.vendored/install|python3 .vendored/update|g' \\
+        .github/workflows/install-vendored.yml
+fi
 
 python3 -c "
 import json
@@ -129,12 +142,14 @@ class TestInstaller:
 
     def test_installs_scripts(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
-        assert (tmp_repo / ".vendored" / "install").is_file()
+        assert (tmp_repo / ".vendored" / "add").is_file()
+        assert (tmp_repo / ".vendored" / "update").is_file()
         assert (tmp_repo / ".vendored" / "check").is_file()
 
     def test_scripts_are_executable(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
-        assert os.access(tmp_repo / ".vendored" / "install", os.X_OK)
+        assert os.access(tmp_repo / ".vendored" / "add", os.X_OK)
+        assert os.access(tmp_repo / ".vendored" / "update", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "check", os.X_OK)
 
     def test_writes_version(self, mock_fetch, tmp_repo):
@@ -190,3 +205,37 @@ class TestInstaller:
     def test_exit_code_zero(self, mock_fetch, tmp_repo):
         result = run_installer(mock_fetch)
         assert result.returncode == 0
+
+    def test_cleans_up_old_install_script(self, mock_fetch, tmp_repo):
+        """rm -f .vendored/install removes the old script."""
+        (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
+        old_install = tmp_repo / ".vendored" / "install"
+        old_install.write_text("#!/bin/bash\n# old install script")
+        assert old_install.is_file()
+
+        run_installer(mock_fetch)
+
+        assert not old_install.exists()
+        # update should exist instead
+        assert (tmp_repo / ".vendored" / "update").is_file()
+
+    def test_patches_workflow_references(self, mock_fetch, tmp_repo):
+        """sed replacement updates old .vendored/install references in workflow."""
+        (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
+        (tmp_repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+        # Write a workflow file with old reference
+        workflow = tmp_repo / ".github" / "workflows" / "install-vendored.yml"
+        workflow.write_text(
+            'run: python3 .vendored/install "$VENDOR" --version "$VERSION"\n'
+        )
+
+        run_installer(mock_fetch)
+
+        content = workflow.read_text()
+        assert "python3 .vendored/update" in content
+        assert "python3 .vendored/install" not in content
+
+    def test_old_install_not_present_after_fresh_install(self, mock_fetch, tmp_repo):
+        """Fresh install should not have .vendored/install."""
+        run_installer(mock_fetch)
+        assert not (tmp_repo / ".vendored" / "install").exists()

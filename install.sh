@@ -9,10 +9,12 @@
 #              Falls back to curl for public repos when not set.
 #
 # Behavior:
-#   - Always updates: .vendored/install, .vendored/check, .vendored/.version
+#   - Always updates: .vendored/add, .vendored/update, .vendored/check, .vendored/.version
 #   - First install only: workflow templates to .github/workflows/ (skipped if present)
 #   - Preserves .vendored/config.json (only creates if missing)
 #   - Self-registers git-vendored as a vendor in .vendored/config.json
+#   - Cleans up old .vendored/install (renamed to .vendored/update)
+#   - Patches existing workflow files to reference .vendored/update
 #
 set -euo pipefail
 
@@ -39,13 +41,20 @@ echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 mkdir -p .vendored .github/workflows
 
 # Download vendored scripts
-echo "Downloading .vendored/install..."
-fetch_file "vendored/install" ".vendored/install"
-chmod +x .vendored/install
+echo "Downloading .vendored/add..."
+fetch_file "vendored/add" ".vendored/add"
+chmod +x .vendored/add
+
+echo "Downloading .vendored/update..."
+fetch_file "vendored/update" ".vendored/update"
+chmod +x .vendored/update
 
 echo "Downloading .vendored/check..."
 fetch_file "vendored/check" ".vendored/check"
 chmod +x .vendored/check
+
+# Clean up old install script (renamed to update)
+rm -f .vendored/install
 
 # Write version
 echo "$VERSION" > .vendored/.version
@@ -72,6 +81,12 @@ install_workflow() {
 # Install workflow templates (skipped if already present)
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
+
+# Patch existing workflow files to reference the renamed script
+if [ -f .github/workflows/install-vendored.yml ]; then
+    sed -i 's|python3 \.vendored/install|python3 .vendored/update|g' \
+        .github/workflows/install-vendored.yml
+fi
 
 # Self-register git-vendored as a vendor in config.json
 python3 -c "
