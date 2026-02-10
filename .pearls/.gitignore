@@ -1,0 +1,10 @@
+# Pearls issue tracker ignores
+
+# Lock files (runtime)
+.sync.lock
+
+# Backup files from migrations
+*.backup.*
+
+# Version tracking (optional - some prefer to commit this)
+# .prl-version

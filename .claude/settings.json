@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/configure-prl.sh",
+            "statusMessage": "Configuring prl (pearls) issue tracker..."
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/configure-prl.sh --resume",
+            "statusMessage": "Configuring prl (pearls) issue tracker..."
+          }
+        ]
+      }
+    ]
+  }
+}
