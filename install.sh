@@ -9,10 +9,11 @@
 #              Falls back to curl for public repos when not set.
 #
 # Behavior:
-#   - Always updates: .vendored/install, .vendored/check, .vendored/.version
-#   - First install only: workflow templates to .github/workflows/ (skipped if present)
+#   - Always updates: .vendored/add, .vendored/update, .vendored/check, .vendored/.version
+#   - Always updates: workflow templates in .github/workflows/
 #   - Preserves .vendored/config.json (only creates if missing)
 #   - Self-registers git-vendored as a vendor in .vendored/config.json
+#   - Cleans up old .vendored/install (renamed to .vendored/update)
 #
 set -euo pipefail
 
@@ -39,13 +40,20 @@ echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 mkdir -p .vendored .github/workflows
 
 # Download vendored scripts
-echo "Downloading .vendored/install..."
-fetch_file "vendored/install" ".vendored/install"
-chmod +x .vendored/install
+echo "Downloading .vendored/add..."
+fetch_file "vendored/add" ".vendored/add"
+chmod +x .vendored/add
+
+echo "Downloading .vendored/update..."
+fetch_file "vendored/update" ".vendored/update"
+chmod +x .vendored/update
 
 echo "Downloading .vendored/check..."
 fetch_file "vendored/check" ".vendored/check"
 chmod +x .vendored/check
+
+# Clean up old install script (renamed to update)
+rm -f .vendored/install
 
 # Write version
 echo "$VERSION" > .vendored/.version
@@ -57,19 +65,14 @@ if [ ! -f .vendored/config.json ]; then
     echo "Created .vendored/config.json"
 fi
 
-# Helper to install a workflow file (first install only)
+# Install/update workflow templates (always updated to propagate changes)
 install_workflow() {
     local workflow="$1"
-    if [ -f ".github/workflows/$workflow" ]; then
-        echo "Workflow .github/workflows/$workflow already exists, skipping"
-        return
-    fi
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
     fi
 }
 
-# Install workflow templates (skipped if already present)
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
 
