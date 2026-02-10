@@ -9,25 +9,38 @@
         ".github/workflows/install-vendored.yml",
         ".github/workflows/check-vendor.yml"
       ],
-      "allowed": [".vendored/config.json"]
+      "allowed": [
+        ".vendored/config.json"
+      ]
     },
     "git-dogfood": {
       "repo": "mangimangi/git-dogfood",
       "install_branch": "chore/install-git-dogfood",
-      "protected": [".dogfood/**", ".github/workflows/dogfood.yml"]
+      "protected": [
+        ".dogfood/**",
+        ".github/workflows/dogfood.yml"
+      ]
     },
     "git-semver": {
       "repo": "mangimangi/git-semver",
       "install_branch": "chore/install-git-semver",
-      "protected": [".semver/**", ".github/workflows/version-bump.yml", ".github/workflows/release.yml"],
-      "allowed": [".semver/config.json"]
+      "dogfood": true,
+      "protected": [
+        ".semver/**"
+      ],
+      "allowed": [
+        ".semver/config.json",
+        ".semver/.version"
+      ]
     },
     "pearls": {
       "repo": "mangimangi/pearls",
       "private": true,
       "install_branch": "chore/install-pearls",
       "automerge": true,
-      "protected": [".pearls/**"],
+      "protected": [
+        ".pearls/**"
+      ],
       "allowed": [
         ".pearls/issues.jsonl",
         ".pearls/config.json",

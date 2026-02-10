@@ -5,13 +5,13 @@ Subcommands:
     version                          Print current version
     check [--since <commit>]         Check if a bump is needed (exit 0=yes, 1=no)
     bump [patch|minor|major] [opts]  Bump version, commit, tag, push
+    bump-all --since <commit> [opts] Check all components, bump all triggered
 
 Config: .semver/config.json (see README for schema)
 """
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -22,6 +22,16 @@ from pathlib import Path
 DEFAULT_CONFIG_PATH = ".semver/config.json"
 DEFAULT_VERSION_FILE = "VERSION"
 
+# Keys reserved for root-level config (not subdirectory names)
+RESERVED_KEYS = frozenset({
+    "version_file", "files", "updates", "changelog", "install",
+})
+
+
+class SemverError(Exception):
+    """Raised for git-semver operational errors."""
+    pass
+
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -29,17 +39,33 @@ def load_config(config_path=None):
     """Load and validate .semver/config.json."""
     path = Path(config_path or DEFAULT_CONFIG_PATH)
     if not path.exists():
-        print(f"Error: config not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise SemverError(f"Config not found: {path}")
     with open(path) as f:
         config = json.load(f)
-    if "files" not in config:
-        print("Error: 'files' key required in config", file=sys.stderr)
-        sys.exit(1)
-    if "updates" not in config:
-        print("Error: 'updates' key required in config", file=sys.stderr)
-        sys.exit(1)
     return config
+
+
+def get_subdirectories(config):
+    """Extract subdirectory configs from root config.
+
+    Any top-level key that is not reserved, does not start with '_',
+    and whose value is a dict is treated as a subdirectory configuration.
+    """
+    subdirs = {}
+    for key, value in config.items():
+        if key.startswith("_"):
+            continue
+        if key not in RESERVED_KEYS and isinstance(value, dict):
+            subdirs[key] = value
+    return subdirs
+
+
+def get_subdir_config(config, subdir):
+    """Get and validate config for a specific subdirectory."""
+    subdirs = get_subdirectories(config)
+    if subdir not in subdirs:
+        raise SemverError(f"Subdirectory '{subdir}' not found in config")
+    return subdirs[subdir]
 
 
 def get_version_file(config):
@@ -47,21 +73,49 @@ def get_version_file(config):
     return config.get("version_file", DEFAULT_VERSION_FILE)
 
 
-def parse_changelog_config(config):
+def parse_changelog_config(config, subdir=None):
     """Parse changelog config into (enabled, file, ignore_prefixes).
 
+    For subdirectories, checks the subdir config first, then inherits
+    from root config. The default file for subdirectories is
+    <subdir>/CHANGELOG.md.
+
     Returns:
-        (enabled: bool, file: str, ignore_prefixes: list[str])
+        (enabled: bool, file: str | None, ignore_prefixes: list[str])
     """
-    cl = config.get("changelog", True)
+    default_file = f"{subdir}/CHANGELOG.md" if subdir else "CHANGELOG.md"
+
+    if subdir is not None:
+        subconfig = get_subdir_config(config, subdir)
+        if "changelog" in subconfig:
+            return _parse_changelog_value(subconfig["changelog"], default_file)
+        # Inherit from root — but always use subdir's default file path
+        root_cl = config.get("changelog", True)
+        if isinstance(root_cl, dict):
+            return (
+                True,
+                default_file,
+                root_cl.get("ignore_prefixes", []),
+            )
+        return _parse_changelog_value(root_cl, default_file)
+
+    return _parse_changelog_value(config.get("changelog", True), default_file)
+
+
+def _parse_changelog_value(cl, default_file="CHANGELOG.md"):
+    """Parse a single changelog config value.
+
+    Returns:
+        (enabled: bool, file: str | None, ignore_prefixes: list[str])
+    """
     if cl is False:
         return False, None, []
     if cl is True or cl is None:
-        return True, "CHANGELOG.md", []
+        return True, default_file, []
     # Object form
     return (
         True,
-        cl.get("file", "CHANGELOG.md"),
+        cl.get("file", default_file),
         cl.get("ignore_prefixes", []),
     )
 
@@ -72,8 +126,7 @@ def read_version(version_file):
     """Read current version from version_file."""
     path = Path(version_file)
     if not path.exists():
-        print(f"Error: version file not found: {path}", file=sys.stderr)
-        sys.exit(1)
+        raise SemverError(f"Version file not found: {path}")
     return path.read_text().strip()
 
 
@@ -81,9 +134,11 @@ def parse_version(version_str):
     """Parse 'X.Y.Z' into (major, minor, patch) ints."""
     parts = version_str.split(".")
     if len(parts) != 3:
-        print(f"Error: invalid version format: {version_str}", file=sys.stderr)
-        sys.exit(1)
-    return int(parts[0]), int(parts[1]), int(parts[2])
+        raise SemverError(f"Invalid version format: {version_str}")
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        raise SemverError(f"Invalid version format: {version_str}")
 
 
 def compute_new_version(major, minor, patch, bump_type):
@@ -170,8 +225,7 @@ def git(*args, check=True, capture=True):
     )
     if check and result.returncode != 0:
         stderr = result.stderr.strip() if capture else ""
-        print(f"Error: git {' '.join(args)} failed: {stderr}", file=sys.stderr)
-        sys.exit(1)
+        raise SemverError(f"git {' '.join(args)} failed: {stderr}")
     return result
 
 
@@ -185,11 +239,15 @@ def get_changed_files(since):
     return [f for f in result.stdout.strip().split("\n") if f]
 
 
-def get_commits_since_tag(tag=None):
-    """Get commit messages since the last tag (or all if no tag)."""
+def get_commits_since_tag(tag=None, subdir=None):
+    """Get commit messages since the last tag (or all if no tag).
+
+    For subdirectories, uses <subdir>/v* tag pattern.
+    """
     if tag is None:
+        tag_match = f"{subdir}/v*" if subdir else "v*"
         result = git(
-            "describe", "--tags", "--abbrev=0", "--match", "v*",
+            "describe", "--tags", "--abbrev=0", "--match", tag_match,
             check=False,
         )
         tag = result.stdout.strip() if result.returncode == 0 else None
@@ -237,7 +295,8 @@ def apply_updates(updates, new_version):
 
 # ── Changelog ───────────────────────────────────────────────────────────────
 
-def update_changelog(changelog_file, new_version, description=None, ignore_prefixes=None):
+def update_changelog(changelog_file, new_version, description=None,
+                     ignore_prefixes=None, subdir=None):
     """Update changelog with a new version entry."""
     path = Path(changelog_file)
     if not path.exists():
@@ -247,7 +306,7 @@ def update_changelog(changelog_file, new_version, description=None, ignore_prefi
     if description:
         commits_text = f"- {description}"
     else:
-        commits = get_commits_since_tag()
+        commits = get_commits_since_tag(subdir=subdir)
         if ignore_prefixes:
             commits = [
                 c for c in commits
@@ -268,61 +327,115 @@ def update_changelog(changelog_file, new_version, description=None, ignore_prefi
     print(f"Updated {changelog_file}")
 
 
-# ── Subcommands ─────────────────────────────────────────────────────────────
+# ── Tag helpers ─────────────────────────────────────────────────────────────
 
-def cmd_version(args):
-    """Print current version."""
-    config = load_config(args.config)
-    version_file = get_version_file(config)
-    version = read_version(version_file)
-    print(version)
+def format_tag(version, subdir=None):
+    """Format a version tag string."""
+    if subdir:
+        return f"{subdir}/v{version}"
+    return f"v{version}"
 
 
-def cmd_check(args):
-    """Check if a version bump is needed based on changed files."""
-    config = load_config(args.config)
-    patterns = config["files"]
-    since = args.since or "HEAD~1"
+# ── Core bump logic ────────────────────────────────────────────────────────
 
-    changed = get_changed_files(since)
-    if not changed:
-        print("No files changed")
-        sys.exit(1)
+def bump_component(config, subdir=None, bump_type="patch", description=None):
+    """Bump version for a single component (root or subdirectory).
 
-    matches = check_files_changed(changed, patterns)
-    if matches:
-        for filepath, pattern in matches:
-            print(f"Matched: {filepath} (pattern: {pattern})")
-        sys.exit(0)
+    Updates version file, applies file updates, updates changelog.
+    Returns (subdir, old_version, new_version, tag_name).
+    """
+    if subdir:
+        effective = get_subdir_config(config, subdir)
     else:
-        print("No matching files changed")
-        sys.exit(1)
+        effective = config
 
-
-def cmd_bump(args):
-    """Bump version, update files, commit, tag, push."""
-    config = load_config(args.config)
-    version_file = get_version_file(config)
-    bump_type = args.bump_type or "patch"
-
-    # Read and bump version
+    version_file = get_version_file(effective)
     current = read_version(version_file)
     major, minor, patch = parse_version(current)
     new_major, new_minor, new_patch = compute_new_version(major, minor, patch, bump_type)
     new_version = format_version(new_major, new_minor, new_patch)
-    print(f"Bumping ({bump_type}): {current} -> {new_version}")
+    tag = format_tag(new_version, subdir)
+
+    label = subdir or "root"
+    print(f"Bumping {label} ({bump_type}): {current} -> {new_version}")
 
     # Write version file
     Path(version_file).write_text(new_version + "\n")
     print(f"Updated {version_file}")
 
     # Apply updates
-    apply_updates(config.get("updates", {}), new_version)
+    apply_updates(effective.get("updates", {}), new_version)
 
     # Update changelog
-    cl_enabled, cl_file, cl_ignore = parse_changelog_config(config)
+    cl_enabled, cl_file, cl_ignore = parse_changelog_config(config, subdir)
     if cl_enabled:
-        update_changelog(cl_file, new_version, args.description, cl_ignore)
+        update_changelog(cl_file, new_version, description, cl_ignore, subdir=subdir)
+
+    return subdir, current, new_version, tag
+
+
+# ── Subcommands ─────────────────────────────────────────────────────────────
+
+def cmd_version(args):
+    """Print current version."""
+    config = load_config(args.config)
+    subdir = getattr(args, "subdir", None)
+
+    if subdir:
+        effective = get_subdir_config(config, subdir)
+    else:
+        effective = config
+
+    version_file = get_version_file(effective)
+    version = read_version(version_file)
+    print(version)
+
+
+def cmd_check(args):
+    """Check if a version bump is needed based on changed files.
+
+    Returns 0 if bump needed, 1 if not.
+    """
+    config = load_config(args.config)
+    subdir = getattr(args, "subdir", None)
+    since = args.since or "HEAD~1"
+
+    if subdir:
+        effective = get_subdir_config(config, subdir)
+    else:
+        effective = config
+
+    patterns = effective.get("files")
+    if not patterns:
+        raise SemverError(
+            "No 'files' patterns configured"
+            + (f" for '{subdir}'" if subdir else " for root config")
+        )
+
+    changed = get_changed_files(since)
+    if not changed:
+        print("No files changed")
+        return 1
+
+    matches = check_files_changed(changed, patterns)
+    if matches:
+        for filepath, pattern in matches:
+            print(f"Matched: {filepath} (pattern: {pattern})")
+        return 0
+    else:
+        print("No matching files changed")
+        return 1
+
+
+def cmd_bump(args):
+    """Bump version, update files, commit, tag, push."""
+    config = load_config(args.config)
+    subdir = getattr(args, "subdir", None)
+    bump_type = args.bump_type or "patch"
+
+    _, _, new_version, tag = bump_component(
+        config, subdir=subdir, bump_type=bump_type, description=args.description
+    )
 
     if args.no_commit:
         print(f"\nVersion bumped to {new_version} (files only, no commit)")
@@ -330,13 +443,13 @@ def cmd_bump(args):
 
     # Commit
     git("add", "-A")
-    git("commit", "-m", f"chore: bump version to v{new_version}")
-    print(f"Committed: chore: bump version to v{new_version}")
+    git("commit", "-m", f"chore: bump version to {tag}")
+    print(f"Committed: chore: bump version to {tag}")
 
     # Tag
-    git("tag", "-a", f"v{new_version}", "-m", f"v{new_version}")
+    git("tag", "-a", tag, "-m", tag)
     git("tag", "-f", "latest")
-    print(f"Tagged: v{new_version} + latest")
+    print(f"Tagged: {tag} + latest")
 
     if args.no_push:
         print(f"\nVersion bumped to {new_version} (no push)")
@@ -348,9 +461,85 @@ def cmd_bump(args):
     print(f"\nVersion bumped to {new_version} and pushed")
 
 
+def cmd_bump_all(args):
+    """Check all components and bump those with changes since the given commit.
+
+    Iterates root config (if it has files/updates) and all subdirectory configs.
+    Produces a single commit with tags for each bumped component.
+    """
+    config = load_config(args.config)
+    since = args.since
+    if not since:
+        raise SemverError("--since is required for bump-all")
+    bump_type = args.bump_type or "patch"
+
+    changed = get_changed_files(since)
+    if not changed:
+        print("No files changed")
+        return
+
+    bumps = []  # list of (subdir, old_ver, new_ver, tag)
+
+    # Check root config
+    if config.get("files"):
+        matches = check_files_changed(changed, config["files"])
+        if matches:
+            for filepath, pattern in matches:
+                print(f"Root matched: {filepath} (pattern: {pattern})")
+            result = bump_component(
+                config, subdir=None, bump_type=bump_type,
+                description=args.description,
+            )
+            bumps.append(result)
+
+    # Check subdirectories
+    for name, subconfig in get_subdirectories(config).items():
+        if subconfig.get("files"):
+            matches = check_files_changed(changed, subconfig["files"])
+            if matches:
+                for filepath, pattern in matches:
+                    print(f"{name} matched: {filepath} (pattern: {pattern})")
+                result = bump_component(
+                    config, subdir=name, bump_type=bump_type,
+                    description=args.description,
+                )
+                bumps.append(result)
+
+    if not bumps:
+        print("No components triggered")
+        return
+
+    if args.no_commit:
+        print(f"\nBumped {len(bumps)} component(s) (files only, no commit)")
+        return
+
+    # Single commit for all bumps
+    tags = [tag for _, _, _, tag in bumps]
+    tags_str = ", ".join(tags)
+    git("add", "-A")
+    git("commit", "-m", f"chore: bump version {tags_str}")
+    print(f"Committed: chore: bump version {tags_str}")
+
+    # Create tags
+    for _, _, _, tag in bumps:
+        git("tag", "-a", tag, "-m", tag)
+    git("tag", "-f", "latest")
+    print(f"Tagged: {tags_str} + latest")
+
+    if args.no_push:
+        print(f"\nBumped {len(bumps)} component(s) (no push)")
+        return
+
+    # Push
+    git("push", check=True)
+    git("push", "--tags", "--force", check=True)
+    print(f"\nBumped {len(bumps)} component(s) and pushed")
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
-def main():
+def build_parser():
+    """Build the argument parser."""
     parser = argparse.ArgumentParser(
         description="Config-driven semantic versioning for git repos",
         prog="git-semver",
@@ -362,11 +551,13 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # version
-    subparsers.add_parser("version", help="Print current version")
+    version_parser = subparsers.add_parser("version", help="Print current version")
+    version_parser.add_argument("--subdir", default=None, help="Subdirectory name")
 
     # check
     check_parser = subparsers.add_parser("check", help="Check if bump is needed")
     check_parser.add_argument("--since", default=None, help="Commit ref to diff since")
+    check_parser.add_argument("--subdir", default=None, help="Subdirectory name")
 
     # bump
     bump_parser = subparsers.add_parser("bump", help="Bump version")
@@ -375,10 +566,36 @@ def main():
         choices=["patch", "minor", "major"],
         help="Bump type (default: patch)",
     )
+    bump_parser.add_argument("--subdir", default=None, help="Subdirectory name")
     bump_parser.add_argument("--description", default=None, help="Changelog description override")
     bump_parser.add_argument("--no-push", action="store_true", help="Skip push")
     bump_parser.add_argument("--no-commit", action="store_true", help="Skip commit and push")
 
+    # bump-all
+    bump_all_parser = subparsers.add_parser(
+        "bump-all", help="Check and bump all triggered components",
+    )
+    bump_all_parser.add_argument(
+        "bump_type", nargs="?", default="patch",
+        choices=["patch", "minor", "major"],
+        help="Bump type (default: patch)",
+    )
+    bump_all_parser.add_argument(
+        "--since", required=True, help="Commit ref to diff since",
+    )
+    bump_all_parser.add_argument(
+        "--description", default=None, help="Changelog description override",
+    )
+    bump_all_parser.add_argument("--no-push", action="store_true", help="Skip push")
+    bump_all_parser.add_argument(
+        "--no-commit", action="store_true", help="Skip commit and push",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -388,8 +605,16 @@ def main():
         "version": cmd_version,
         "check": cmd_check,
         "bump": cmd_bump,
+        "bump-all": cmd_bump_all,
     }
-    commands[args.command](args)
+
+    try:
+        result = commands[args.command](args)
+        if isinstance(result, int):
+            sys.exit(result)
+    except SemverError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
