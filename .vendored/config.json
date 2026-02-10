@@ -3,6 +3,7 @@
     "git-vendored": {
       "repo": "mangimangi/git-vendored",
       "install_branch": "chore/install-git-vendored",
+      "dogfood": true,
       "protected": [
         ".vendored/**",
         ".github/workflows/install-vendored.yml",
@@ -18,7 +19,6 @@
     "git-semver": {
       "repo": "mangimangi/git-semver",
       "install_branch": "chore/install-git-semver",
-      "dogfood": true,
       "protected": [".semver/**", ".github/workflows/version-bump.yml", ".github/workflows/release.yml"],
       "allowed": [".semver/config.json"]
     },
