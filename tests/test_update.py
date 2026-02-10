@@ -324,3 +324,226 @@ class TestWriteGithubOutput:
         content = output_file.read_text()
         assert "existing=value\n" in content
         assert "new_key=new_value\n" in content
+
+
+# ── Tests: get_pr_metadata ──────────────────────────────────────────────
+
+class TestGetPrMetadata:
+    def test_single_vendor_metadata(self, make_config):
+        """Single vendor result — branch includes install_branch and version."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        meta = inst.get_pr_metadata(results)
+        assert meta["branch"] == "chore/install-tool-v2.0.0"
+        assert meta["title"] == "chore: install tool v2.0.0"
+        assert "1.0.0" in meta["body"]
+        assert "2.0.0" in meta["body"]
+
+    def test_single_vendor_automerge_true(self, make_config):
+        """Single vendor with automerge — metadata includes automerge=True."""
+        vendor = dict(SAMPLE_VENDOR, automerge=True)
+        make_config({"vendors": {"tool": vendor}})
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        meta = inst.get_pr_metadata(results)
+        assert meta["automerge"] is True
+
+    def test_single_vendor_automerge_default(self, make_config):
+        """Single vendor without automerge — defaults to False."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        meta = inst.get_pr_metadata(results)
+        assert meta["automerge"] is False
+
+    def test_multi_vendor_metadata(self, make_config):
+        """Multiple vendors — title lists all changed vendors with versions."""
+        make_config({"vendors": {"a": SAMPLE_VENDOR, "b": SAMPLE_VENDOR}})
+        results = [
+            {"vendor": "a", "old_version": "1.0", "new_version": "2.0", "changed": True},
+            {"vendor": "b", "old_version": "1.0", "new_version": "3.0", "changed": True},
+        ]
+        meta = inst.get_pr_metadata(results)
+        assert meta["branch"] == "chore/install-vendors"
+        assert "a v2.0" in meta["title"]
+        assert "b v3.0" in meta["title"]
+        assert meta["automerge"] is False
+
+    def test_multi_vendor_only_changed_in_title(self, make_config):
+        """Multi-vendor mode — only changed vendors appear in title."""
+        make_config({"vendors": {"a": SAMPLE_VENDOR, "b": SAMPLE_VENDOR}})
+        results = [
+            {"vendor": "a", "old_version": "1.0", "new_version": "2.0", "changed": True},
+            {"vendor": "b", "old_version": "1.0", "new_version": "1.0", "changed": False},
+        ]
+        meta = inst.get_pr_metadata(results)
+        assert "a v2.0" in meta["title"]
+        assert "b" not in meta["title"]
+
+    def test_no_changes_returns_none(self, make_config):
+        """No vendors changed — returns None."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "1.0.0", "changed": False}]
+        assert inst.get_pr_metadata(results) is None
+
+    def test_fallback_install_branch(self, make_config):
+        """Vendor without install_branch in config — uses default pattern."""
+        vendor = {"repo": "owner/tool", "protected": [".tool/**"]}
+        make_config({"vendors": {"tool": vendor}})
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        meta = inst.get_pr_metadata(results)
+        assert meta["branch"] == "chore/install-tool-v2.0.0"
+
+
+# ── Tests: create_pull_request ───────────────────────────────────────────
+
+class TestCreatePullRequest:
+    def _mock_subprocess(self, pr_stdout="https://github.com/o/r/pull/1\n",
+                         pr_returncode=0, pr_stderr="",
+                         diff_returncode=1):
+        """Build a side_effect function for subprocess.run mocking."""
+        def side_effect(cmd, **kwargs):
+            if cmd[0] == "git" and cmd[1] == "diff":
+                return MagicMock(returncode=diff_returncode)
+            if cmd[0] == "gh" and cmd[1] == "pr" and cmd[2] == "create":
+                return MagicMock(
+                    returncode=pr_returncode,
+                    stdout=pr_stdout, stderr=pr_stderr,
+                )
+            if cmd[0] == "gh" and cmd[1] == "pr" and cmd[2] == "merge":
+                return MagicMock(returncode=0)
+            # git config, checkout, add, commit, push
+            return MagicMock(returncode=0)
+        return side_effect
+
+    @patch("vendored_update.subprocess.run")
+    def test_creates_pr_single_vendor(self, mock_run, make_config, monkeypatch):
+        """Single vendor with changes — calls git and gh pr create."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        pr_url = inst.create_pull_request(results)
+        assert pr_url == "https://github.com/o/r/pull/1"
+
+        # Verify git commands were called
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        git_cmds = [c for c in calls if c[0] == "git"]
+        assert ["git", "config", "user.name", "github-actions[bot]"] in git_cmds
+        assert any("checkout" in c for c in git_cmds)
+        assert ["git", "add", "-A"] in git_cmds
+        assert any("commit" in c for c in git_cmds)
+        assert any("push" in c for c in git_cmds)
+
+    @patch("vendored_update.subprocess.run")
+    def test_no_changes_skips_pr(self, mock_run, make_config, capsys):
+        """No vendors changed — prints message, no git/gh calls."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "1.0.0", "changed": False}]
+        result = inst.create_pull_request(results)
+        assert result is None
+        out = capsys.readouterr().out
+        assert "No vendor changes" in out
+        mock_run.assert_not_called()
+
+    @patch("vendored_update.subprocess.run")
+    def test_no_staged_changes_returns_early(self, mock_run, make_config, monkeypatch, capsys):
+        """Git diff --cached shows no changes — returns early after staging."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess(diff_returncode=0)
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        result = inst.create_pull_request(results)
+        assert result is None
+        out = capsys.readouterr().out
+        assert "No changes to commit" in out
+
+    @patch("vendored_update.subprocess.run")
+    def test_pr_already_exists(self, mock_run, make_config, monkeypatch, capsys):
+        """gh pr create fails with 'already exists' — exits gracefully."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess(
+            pr_returncode=1, pr_stderr="already exists for pull request",
+            pr_stdout="",
+        )
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        result = inst.create_pull_request(results)
+        assert result is None
+        out = capsys.readouterr().out
+        assert "PR already exists" in out
+
+    @patch("vendored_update.subprocess.run")
+    def test_pr_create_failure_exits(self, mock_run, make_config, monkeypatch):
+        """gh pr create fails with unexpected error — exits with code 1."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess(
+            pr_returncode=1, pr_stderr="network error", pr_stdout="",
+        )
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        with pytest.raises(SystemExit) as exc_info:
+            inst.create_pull_request(results)
+        assert exc_info.value.code == 1
+
+    @patch("vendored_update.subprocess.run")
+    def test_automerge_when_enabled(self, mock_run, make_config, monkeypatch):
+        """Vendor with automerge: true — calls gh pr merge."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        vendor = dict(SAMPLE_VENDOR, automerge=True)
+        make_config({"vendors": {"tool": vendor}})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        inst.create_pull_request(results)
+
+        merge_calls = [c for c in mock_run.call_args_list
+                       if c[0][0][0:3] == ["gh", "pr", "merge"]]
+        assert len(merge_calls) == 1
+
+    @patch("vendored_update.subprocess.run")
+    def test_no_automerge_by_default(self, mock_run, make_config, monkeypatch):
+        """Vendor without automerge — does not call gh pr merge."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        inst.create_pull_request(results)
+
+        merge_calls = [c for c in mock_run.call_args_list
+                       if c[0][0][0:3] == ["gh", "pr", "merge"]]
+        assert len(merge_calls) == 0
+
+    @patch("vendored_update.subprocess.run")
+    def test_uses_github_token_for_gh(self, mock_run, make_config, monkeypatch):
+        """PR creation uses GITHUB_TOKEN (not VENDOR_PAT) for gh CLI."""
+        monkeypatch.setenv("GITHUB_TOKEN", "repo-token")
+        monkeypatch.setenv("GH_TOKEN", "vendor-pat")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        inst.create_pull_request(results)
+
+        # Find the gh pr create call and check its env
+        pr_create_calls = [c for c in mock_run.call_args_list
+                           if c[0][0][0:3] == ["gh", "pr", "create"]]
+        assert len(pr_create_calls) == 1
+        env = pr_create_calls[0][1].get("env", {})
+        assert env.get("GH_TOKEN") == "repo-token"

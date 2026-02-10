@@ -2,7 +2,7 @@
 # Installs or updates vendored tools via .vendored/config.json.
 #
 # Handles all vendors from a single workflow — no per-vendor workflow files.
-# Logic lives in .vendored/update; this workflow handles triggers and PR creation.
+# All logic lives in .vendored/update; this workflow just provides triggers.
 #
 # Triggers:
 #   - schedule: weekly check for all vendors
@@ -54,7 +54,6 @@ jobs:
           token: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
 
       - name: Run vendored update
-        id: update
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VENDOR_PAT: ${{ secrets.token || secrets.VENDOR_PAT || '' }}
@@ -62,70 +61,4 @@ jobs:
         run: |
           VENDOR="${{ inputs.vendor || 'all' }}"
           VERSION="${{ inputs.version || 'latest' }}"
-          python3 .vendored/update "$VENDOR" --version "$VERSION"
-
-      - name: Create Pull Request
-        if: steps.update.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VENDOR: ${{ steps.update.outputs.vendor }}
-          NEW_VER: ${{ steps.update.outputs.new_version }}
-          OLD_VER: ${{ steps.update.outputs.old_version }}
-          INSTALL_BRANCH: ${{ steps.update.outputs.install_branch }}
-          CHANGED_COUNT: ${{ steps.update.outputs.changed_count }}
-          CHANGED_VENDORS: ${{ steps.update.outputs.changed_vendors }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if [ -n "$CHANGED_COUNT" ]; then
-            # Multi-vendor mode
-            BRANCH="chore/install-vendors"
-            TITLE="chore: install vendor updates"
-            VENDOR_LIST=$(python3 -c "
-          import json, sys
-          results = json.loads(sys.argv[1])
-          print(', '.join(r['vendor'] for r in results))
-          " "$CHANGED_VENDORS")
-            BODY=$(printf "Automated vendor updates.\n\n**Updated:** %s" "$VENDOR_LIST")
-          else
-            # Single vendor mode
-            BRANCH="${INSTALL_BRANCH}-v${NEW_VER}"
-            TITLE="chore: install ${VENDOR} v${NEW_VER}"
-            BODY=$(printf "Automated vendor update for **%s**.\n\n**Version:** \`%s\` → \`%s\`" "$VENDOR" "$OLD_VER" "$NEW_VER")
-          fi
-
-          git checkout -b "$BRANCH"
-          git add -A
-          git diff --cached --quiet && { echo "No changes to commit"; exit 0; }
-          git commit -m "$TITLE"
-          git push -u origin "$BRANCH"
-
-          # Create PR, handle "already exists" gracefully
-          PR_URL=$(gh pr create \
-            --title "$TITLE" \
-            --body "$BODY" \
-            --head "$BRANCH" \
-            --base main 2>&1) || {
-            if echo "$PR_URL" | grep -q "already exists"; then
-              echo "PR already exists for $BRANCH"
-              exit 0
-            fi
-            echo "Failed to create PR: $PR_URL"
-            exit 1
-          }
-          echo "Created PR: $PR_URL"
-
-          # Automerge: only when vendor config explicitly has "automerge": true
-          if [ -z "$CHANGED_COUNT" ]; then
-            AUTOMERGE=$(python3 -c "
-          import json
-          c = json.load(open('.vendored/config.json'))
-          v = c.get('vendors', {}).get('$VENDOR', {})
-          print(str(v.get('automerge', False)).lower())
-          " 2>/dev/null || echo "false")
-
-            if [ "$AUTOMERGE" = "true" ]; then
-              gh pr merge "$PR_URL" --auto --squash || true
-            fi
-          fi
+          python3 .vendored/update "$VENDOR" --version "$VERSION" --pr

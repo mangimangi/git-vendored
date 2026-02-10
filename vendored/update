@@ -269,12 +269,141 @@ def output_results(results):
         })
 
 
+def get_pr_metadata(results):
+    """Determine PR branch, title, and body from update results.
+
+    Returns dict with: branch, title, body, automerge.
+    Returns None if no vendors changed.
+    """
+    changed = [r for r in results if r["changed"]]
+    if not changed:
+        return None
+
+    config = load_config()
+    vendors = config.get("vendors", {})
+
+    if len(results) == 1:
+        # Single vendor mode
+        r = changed[0]
+        vendor_config = vendors.get(r["vendor"], {})
+        install_branch = vendor_config.get(
+            "install_branch", f"chore/install-{r['vendor']}"
+        )
+        return {
+            "branch": f"{install_branch}-v{r['new_version']}",
+            "title": f"chore: install {r['vendor']} v{r['new_version']}",
+            "body": (
+                f"Automated vendor update for **{r['vendor']}**.\n\n"
+                f"**Version:** `{r['old_version']}` \u2192 `{r['new_version']}`"
+            ),
+            "automerge": vendor_config.get("automerge", False),
+        }
+    else:
+        # Multi-vendor mode
+        vendor_versions = ", ".join(
+            f"{r['vendor']} v{r['new_version']}" for r in changed
+        )
+        return {
+            "branch": "chore/install-vendors",
+            "title": f"chore: install {vendor_versions}",
+            "body": f"Automated vendor updates.\n\n**Updated:** {vendor_versions}",
+            "automerge": False,
+        }
+
+
+def create_pull_request(results):
+    """Create a PR with vendor update changes.
+
+    Handles git branch/commit/push, PR creation via gh CLI, and automerge.
+    Uses GITHUB_TOKEN for repo operations (not vendor-specific PAT).
+    """
+    meta = get_pr_metadata(results)
+    if meta is None:
+        print("No vendor changes to create PR for")
+        return
+
+    branch = meta["branch"]
+    title = meta["title"]
+    body = meta["body"]
+
+    # Environment for gh CLI: prefer GITHUB_TOKEN (repo token) over GH_TOKEN
+    # which may be a vendor-specific PAT
+    gh_env = os.environ.copy()
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if github_token:
+        gh_env["GH_TOKEN"] = github_token
+
+    # Configure git identity
+    subprocess.run(
+        ["git", "config", "user.name", "github-actions[bot]"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email",
+         "github-actions[bot]@users.noreply.github.com"],
+        check=True, capture_output=True,
+    )
+
+    # Create branch, stage, commit, push
+    subprocess.run(
+        ["git", "checkout", "-b", branch],
+        check=True, capture_output=True,
+    )
+    subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+
+    # Check if there are actual staged changes
+    diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
+    if diff_result.returncode == 0:
+        print("No changes to commit")
+        return
+
+    subprocess.run(
+        ["git", "commit", "-m", title],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        check=True, capture_output=True,
+    )
+
+    # Create PR, handle "already exists" gracefully
+    pr_result = subprocess.run(
+        ["gh", "pr", "create", "--title", title, "--body", body,
+         "--head", branch, "--base", "main"],
+        capture_output=True, text=True, env=gh_env,
+    )
+
+    if pr_result.returncode != 0:
+        output = pr_result.stdout + pr_result.stderr
+        if "already exists" in output:
+            print(f"PR already exists for {branch}")
+            return
+        print(f"Failed to create PR: {output}")
+        sys.exit(1)
+
+    pr_url = pr_result.stdout.strip()
+    print(f"Created PR: {pr_url}")
+
+    # Automerge when vendor config has "automerge": true (single vendor only)
+    if meta["automerge"]:
+        subprocess.run(
+            ["gh", "pr", "merge", pr_url, "--auto", "--squash"],
+            capture_output=True, env=gh_env,
+        )
+
+    return pr_url
+
+
 def main():
     parser = argparse.ArgumentParser(description="Install or update vendored tools")
     parser.add_argument("vendor", help='Vendor name or "all"')
     parser.add_argument(
         "--version", default="latest",
         help="Version to install (default: latest)"
+    )
+    parser.add_argument(
+        "--pr", action="store_true",
+        help="Create a PR with the changes (for CI use)"
     )
     args = parser.parse_args()
 
@@ -297,6 +426,10 @@ def main():
             sys.exit(1)
         result = install_vendor(args.vendor, vendors[args.vendor], args.version)
         output_result(result)
+        results = [result]
+
+    if args.pr:
+        create_pull_request(results)
 
 
 if __name__ == "__main__":
