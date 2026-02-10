@@ -27,20 +27,21 @@ its own config. No separate manifest file needed.
 
 ## Tasks
 
-### 1. Create `vendored/add` (local-only CLI tool)
+### 1. Create `vendored/add`
 
-**New file:** `vendored/add`
+**New file:** `vendored/add` (source) → installed to `.vendored/add` by `install.sh`
 
 **Usage:** `python3 .vendored/add <owner/repo> [--name <name>]`
 
-Runs locally (not as a workflow). Adding a vendor is a rare, intentional
-action — the user commits and pushes the result. This also avoids the
-GitHub restriction where `GITHUB_TOKEN` can't push changes to
+Run by the user locally (not by workflows). Adding a vendor is a rare,
+intentional action — the user commits and pushes the result. This also
+avoids the GitHub restriction where `GITHUB_TOKEN` can't push changes to
 `.github/workflows/` files.
 
 **Flow:**
 1. **Pre-validate** the target repo:
-   - Confirm `install.sh` exists at repo root (via GitHub API)
+   - Confirm `install.sh` exists at repo root (via GitHub contents API:
+     `gh api repos/{owner/repo}/contents/install.sh`)
    - Confirm version is resolvable (GitHub Releases or VERSION file)
    - Fail with "repo does not implement git-vendored" if either is missing
 2. **Snapshot** `.vendored/config.json` (before state)
@@ -54,12 +55,12 @@ GitHub restriction where `GITHUB_TOKEN` can't push changes to
 5. **Output** summary of what was added
 
 **Error cases:**
-- Repo doesn't exist or is inaccessible -> error with auth hint
-- No `install.sh` found -> "repo does not implement git-vendored"
-- `install.sh` didn't write a config entry -> "install.sh must self-register"
-- Vendor already registered -> error or prompt to update instead
+- Repo doesn't exist or is inaccessible → error with auth hint
+- No `install.sh` found → "repo does not implement git-vendored"
+- `install.sh` didn't write a config entry → "install.sh must self-register"
+- Vendor already registered → error or prompt to update instead
 
-**Tests:** `tests/test_add.py`
+**Tests:** `tests/test_add.py` (see [Test Plan](#test-plan-test_addpy) below)
 
 ---
 
@@ -160,9 +161,58 @@ Currently `automerge` defaults to `true` in a buried shell one-liner.
 **Edit:** `install.sh`
 
 `install.sh` remains as the bootstrap entrypoint. Changes:
-- Download `vendored/add` in addition to `vendored/update` and `vendored/check`
-- Rename references from `vendored/install` to `vendored/update`
+
+**Download changes:**
+- Download `vendored/add` → `.vendored/add` (new)
+- Download `vendored/update` → `.vendored/update` (renamed from `install`)
+- Download `vendored/check` → `.vendored/check` (unchanged)
+
+**Migration cleanup:**
+- `rm -f .vendored/install` — remove the old script so it stops existing
+  (the source file is renamed to `vendored/update` in Task 2, so this
+  only matters for repos that had the old file installed)
+
+**Workflow patching:**
+- After downloading files, patch existing workflow files that reference
+  the old path. In `.github/workflows/install-vendored.yml`, replace
+  `python3 .vendored/install` with `python3 .vendored/update`:
+  ```bash
+  if [ -f .github/workflows/install-vendored.yml ]; then
+      sed -i 's|python3 \.vendored/install|python3 .vendored/update|g' \
+          .github/workflows/install-vendored.yml
+  fi
+  ```
+  This ensures existing repos pick up the rename without manual intervention.
+
+**Unchanged:**
 - Self-registration logic stays (it's part of bootstrap)
+- First-install-only guard for workflow templates stays
+
+---
+
+## Task Order
+
+Tasks have ordering constraints due to shared files:
+
+```
+2 (rename install→update)
+├── 3 (GITHUB_OUTPUT from Python) — edits vendored/update
+├── 6 (install.sh bootstrap) — references vendored/update
+│   └── 1 (vendored/add) — downloaded by install.sh
+4 (token fix) ─┐
+5 (automerge)  ─┤── both edit the workflow template, do together or sequentially
+```
+
+**Recommended implementation order:** 2 → 3 → 4+5 → 1 → 6
+
+- **2 first** — the rename creates `vendored/update`, which Tasks 3 and 6 depend on
+- **3 next** — edits `vendored/update` (GITHUB_OUTPUT), simplifies the workflow
+  for Tasks 4+5
+- **4+5 together** — both edit the workflow template; doing them together
+  avoids merge conflicts
+- **1 next** — `vendored/add` is a new file, no dependencies on other tasks,
+  but Task 6 needs to download it
+- **6 last** — references all renamed/new files, handles migration
 
 ---
 
@@ -170,13 +220,13 @@ Currently `automerge` defaults to `true` in a buried shell one-liner.
 
 | Action | File | Description |
 |--------|------|-------------|
-| **New** | `vendored/add` | New add command (Python) |
-| **Rename** | `vendored/install` -> `vendored/update` | Refocus as update-only |
+| **New** | `vendored/add` | New add command (Python), installed to `.vendored/add` |
+| **Rename** | `vendored/install` → `vendored/update` | Refocus as update-only |
 | **Edit** | `vendored/update` | Write `$GITHUB_OUTPUT` directly, improve error msg |
-| **Edit** | `install.sh` | Download `add` + `update` instead of `install` |
+| **Edit** | `install.sh` | Download `add` + `update`, delete old `install`, patch workflow |
 | **Edit** | `templates/github/workflows/install-vendored.yml` | Token fix, automerge default, simplified parsing |
 | **New** | `tests/test_add.py` | Tests for add command |
-| **Rename** | `tests/test_install.py` -> `tests/test_update.py` | Match rename |
+| **Rename** | `tests/test_install.py` → `tests/test_update.py` | Match rename |
 | **No change** | `vendored/check` | Already independent |
 
 ---
@@ -184,11 +234,60 @@ Currently `automerge` defaults to `true` in a buried shell one-liner.
 ## Migration / Backwards Compatibility
 
 - Existing repos have `.vendored/install` — the bootstrap `install.sh` will
-  replace it with `.vendored/update` on next update. The old `install` path
-  stops existing; workflows reference the new name.
-- The workflow template gets updated by `install.sh` only on first install
-  (existing repos keep their workflow). May need a flag or docs for manual
-  workflow update.
+  download `.vendored/update` and `rm -f .vendored/install` (Task 6).
+- Existing repos have workflows referencing `python3 .vendored/install` —
+  `install.sh` patches the workflow file in-place with `sed` to reference
+  `.vendored/update` (Task 6). No manual intervention required.
+
+---
+
+## Test Plan: `test_add.py`
+
+Tests follow existing patterns: dynamic module import, `tmp_repo` + `make_config`
+fixtures, `monkeypatch` for env vars, `unittest.mock.patch` for subprocess calls.
+
+### TestPreValidate
+
+| Test | Description |
+|------|-------------|
+| `test_repo_with_install_sh_passes` | Mock GitHub API returns `install.sh` contents → no error |
+| `test_repo_without_install_sh_fails` | Mock API returns 404 → exits with "does not implement git-vendored" |
+| `test_repo_not_found_fails` | Mock API returns 404 for repo → exits with auth hint |
+| `test_version_resolvable_from_releases` | Mock releases API returns tag → version resolved |
+| `test_version_resolvable_from_version_file` | Mock releases fails, VERSION file fallback works |
+| `test_version_not_resolvable_fails` | Both resolution methods fail → exits with error |
+
+### TestSnapshotAndDiff
+
+| Test | Description |
+|------|-------------|
+| `test_detects_new_config_entry` | Config before has 1 vendor, after has 2 → new entry found |
+| `test_no_new_entry_fails` | Config unchanged after install.sh → exits with "must self-register" |
+
+### TestPostValidate
+
+| Test | Description |
+|------|-------------|
+| `test_valid_entry_passes` | New entry has `repo`, `protected`, `install_branch` → success |
+| `test_missing_repo_fails` | New entry missing `repo` → exits with clear message |
+| `test_missing_protected_fails` | New entry missing `protected` → exits with clear message |
+| `test_missing_install_branch_fails` | New entry missing `install_branch` → exits with clear message |
+
+### TestAddVendor (integration)
+
+| Test | Description |
+|------|-------------|
+| `test_add_new_vendor` | Full flow: pre-validate → run install.sh → post-validate → success output |
+| `test_add_already_registered_fails` | Vendor already in config → exits with "already registered" |
+| `test_add_with_custom_name` | `--name` flag overrides vendor key in config lookup |
+
+### TestAddOutput
+
+| Test | Description |
+|------|-------------|
+| `test_summary_shows_vendor_name` | Output includes vendor name |
+| `test_summary_shows_version` | Output includes installed version |
+| `test_summary_shows_registered_files` | Output includes what `install.sh` added to config |
 
 ---
 
@@ -203,7 +302,11 @@ Currently `automerge` defaults to `true` in a buried shell one-liner.
    validated against `config.json` with a helpful error listing registered
    vendors.
 3. **`add` runs initial install** — Register + install in one shot.
-4. **`add` is local-only** — Not a workflow. User runs locally, commits,
-   pushes.
+4. **`add` is vendored, not a workflow** — Distributed via `install.sh`
+   to `.vendored/add` like other tools. User runs it locally (not used by
+   workflows); user commits and pushes the result.
 5. **`$GITHUB_OUTPUT` directly from Python** — Eliminates fragile
    grep/cut shell parsing in the workflow.
+6. **Workflow patching over manual migration** — `install.sh` patches
+   existing workflow files in-place (`sed`) to reference the renamed
+   script. No flag needed, no manual step for existing repos.
