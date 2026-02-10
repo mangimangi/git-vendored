@@ -47,40 +47,36 @@ templates/github/workflows/    # Workflow templates (install + check)
 
 ## Proposed Changes
 
-### 1. New command: `vendored/add`
+### 1. New command: `vendored/add` (local-only CLI tool)
 
 **Usage:** `python3 .vendored/add <owner/repo> [--name <name>]`
 
-**Responsibilities:**
-- Validate the target repo implements git-vendored:
-  - Confirm `install.sh` exists at repo root (via GitHub API)
-  - Confirm version is resolvable (releases or VERSION file)
-- Register the vendor in `.vendored/config.json`
-  - Auto-generate `install_branch` from vendor name
-  - If vendor repo provides a manifest (future: `vendor.json`), use it to
-    populate `protected`, `allowed`, etc.
-  - Otherwise, use sensible defaults (e.g., `protected: [".<name>/**"]`)
-- Run the initial install (download + execute `install.sh`)
-- Output what was added and installed
+Runs locally (not as a workflow). Adding a vendor is a rare, intentional
+action — the user commits and pushes the result.
 
-**Validation ("implements git-vendored"):**
-For now, the minimum contract is:
-1. Repo has `install.sh` at root
-2. Repo has either GitHub Releases or a `VERSION` file
+**Flow:**
+1. **Pre-validate** the target repo:
+   - Confirm `install.sh` exists at repo root (via GitHub API)
+   - Confirm version is resolvable (GitHub Releases or VERSION file)
+   - Fail with "repo does not implement git-vendored" if either is missing
+2. **Snapshot** `.vendored/config.json` (before state)
+3. **Run** the vendor's `install.sh` (downloads files, writes config entry)
+4. **Post-validate** the config entry the vendor registered:
+   - Diff config before/after to find the new entry
+   - Required fields: `repo`, `protected`, `install_branch`
+   - Fail with clear message if `install.sh` didn't register itself:
+     "vendor's install.sh must add an entry to .vendored/config.json
+     with at least: repo, protected, install_branch"
+5. **Output** summary of what was added
 
-Future: a `vendor.json` manifest at repo root could declare:
-```json
-{
-  "protected": [".<dir>/**", ".github/workflows/<workflow>.yml"],
-  "allowed": [".<dir>/config.json"],
-  "install_branch_prefix": "chore/install-<name>"
-}
-```
-This would let `add` fully auto-populate the config entry.
+The vendor's `install.sh` IS the manifest — it installs files AND declares
+its own config (protected paths, allowed paths, install_branch, etc.).
+No separate manifest file needed.
 
 **Error cases:**
 - Repo doesn't exist or is inaccessible -> error with auth hint
-- No `install.sh` found -> error: "repo does not implement git-vendored"
+- No `install.sh` found -> "repo does not implement git-vendored"
+- `install.sh` didn't write a config entry -> "install.sh must self-register"
 - Vendor already registered -> error or prompt to update instead
 
 ### 2. Rename/refocus: `vendored/install` -> `vendored/update`
@@ -92,23 +88,39 @@ This is the existing `vendored/install` with minimal changes:
 - Only operates on vendors already in config (no registration)
 - Same version resolution, same download-and-run logic
 - Same output format (key=value for single, JSON for all)
+- Improve unknown vendor error to list registered vendors:
+  ```
+  ::error::Unknown vendor: typo-name
+  Registered vendors: git-vendored, git-semver, git-dogfood, pearls
+  ```
+  (Current code already does this partially — just needs the phrasing tightened)
 
 ### 3. Workflow improvements
 
-#### `install-vendored.yml` -> split or simplify
+#### `add` is local-only, `update` stays as the workflow
 
-**Option A (recommended):** Keep one workflow, rename to `vendored.yml`
-- `workflow_dispatch` inputs:
-  - `action`: `add` or `update` (default: `update`)
-  - `vendor`: vendor name or `all` — for `update`, could use `type: choice`
-    but GitHub doesn't support dynamic choices from files, so keep as string
-    input with "all" default
-  - `version`: version string (default: `latest`)
-  - `repo`: only used when action=`add`
-- Schedule trigger always runs `update all`
+`add` is a rare, intentional operation — no workflow needed. User runs it
+locally: `python3 .vendored/add owner/repo`. This also avoids the GitHub
+restriction where `GITHUB_TOKEN` can't push changes to `.github/workflows/`
+files (would need a PAT with `workflows` scope).
 
-**Option B:** Two workflows (`add-vendor.yml`, `update-vendor.yml`)
-- Simpler per-workflow but more files to maintain
+`update` keeps the existing workflow with these changes:
+
+#### Vendor input validation against config
+
+The `vendor` input stays as `type: string` (free-text). GitHub Actions
+doesn't support dynamic `choice` options populated from a file.
+
+Instead, `vendored/update` validates the input against `.vendored/config.json`
+and fails fast with a helpful message if unrecognized:
+
+```
+::error::Unknown vendor: typo-name
+Registered vendors: git-vendored, git-semver, git-dogfood, pearls
+```
+
+This runs before any version resolution or downloads, so the feedback
+is immediate.
 
 #### Clean up output parsing
 
@@ -196,12 +208,16 @@ Additionally:
 
 ---
 
-## Open Questions
+## Resolved Decisions
 
-1. **Vendor manifest (`vendor.json`)**: Do we want this now or later? It makes
-   `add` much more powerful but adds a requirement to vendor repos.
-2. **Dynamic workflow dropdown**: GitHub doesn't natively support populating
-   `choice` options from a file. Worth a two-job approach (job 1 reads config,
-   job 2 uses matrix/choice) or just keep as free-text input?
-3. **Should `add` run the initial install automatically**, or just register
-   and let the user run `update` separately?
+1. **No separate vendor manifest** — The vendor's `install.sh` is the
+   manifest. It installs files AND writes its own config entry. `add`
+   validates the result after running it.
+2. **No dynamic workflow dropdown** — GitHub doesn't support dynamic
+   `choice` options from files, and updating workflow YAML programmatically
+   requires a PAT with `workflows` scope. Instead: free-text `vendor` input,
+   validated against `config.json` with a helpful error listing registered
+   vendors.
+3. **`add` runs initial install** — Register + install in one shot.
+4. **`add` is local-only** — Not a workflow. User runs locally, commits,
+   pushes.
