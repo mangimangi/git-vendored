@@ -2,7 +2,7 @@
 # Installs or updates vendored tools via .vendored/config.json.
 #
 # Handles all vendors from a single workflow — no per-vendor workflow files.
-# Logic lives in .vendored/install; this workflow handles triggers and PR creation.
+# Logic lives in .vendored/update; this workflow handles triggers and PR creation.
 #
 # Triggers:
 #   - schedule: weekly check for all vendors
@@ -53,8 +53,8 @@ jobs:
         with:
           token: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
 
-      - name: Run vendored install
-        id: install
+      - name: Run vendored update
+        id: update
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VENDOR_PAT: ${{ secrets.token || secrets.VENDOR_PAT || '' }}
@@ -62,70 +62,34 @@ jobs:
         run: |
           VENDOR="${{ inputs.vendor || 'all' }}"
           VERSION="${{ inputs.version || 'latest' }}"
-          python3 .vendored/install "$VENDOR" --version "$VERSION" | tee /tmp/install-output.txt
-
-          # Parse output for PR creation
-          # Single vendor: key=value lines (vendor=, old_version=, new_version=, changed=)
-          # All mode (2+ vendors): results=<JSON> and changed_count=N
-          if grep -q "^vendor=" /tmp/install-output.txt; then
-            VENDOR_NAME=$(grep "^vendor=" /tmp/install-output.txt | cut -d= -f2)
-            OLD_VER=$(grep "^old_version=" /tmp/install-output.txt | cut -d= -f2)
-            NEW_VER=$(grep "^new_version=" /tmp/install-output.txt | cut -d= -f2)
-            CHANGED=$(grep "^changed=" /tmp/install-output.txt | cut -d= -f2)
-            MODE="single"
-          elif grep -q "^changed_count=" /tmp/install-output.txt; then
-            CHANGED_COUNT=$(grep "^changed_count=" /tmp/install-output.txt | cut -d= -f2)
-            if [ "${CHANGED_COUNT:-0}" -gt 0 ] 2>/dev/null; then
-              CHANGED="true"
-              RESULTS_JSON=$(grep "^results=" /tmp/install-output.txt | cut -d= -f2-)
-              VENDOR_NAME=$(python3 -c "
-          import json, sys
-          results = json.loads(sys.argv[1])
-          print('+'.join(r['vendor'] for r in results))
-          " "$RESULTS_JSON")
-              NEW_VER="multi"
-              OLD_VER="various"
-            else
-              CHANGED="false"
-            fi
-            MODE="all"
-          else
-            CHANGED="false"
-            MODE="single"
-          fi
-
-          echo "vendor=${VENDOR_NAME:-$VENDOR}" >> $GITHUB_OUTPUT
-          echo "old_version=${OLD_VER:-unknown}" >> $GITHUB_OUTPUT
-          echo "new_version=${NEW_VER:-unknown}" >> $GITHUB_OUTPUT
-          echo "changed=${CHANGED:-false}" >> $GITHUB_OUTPUT
-          echo "mode=${MODE}" >> $GITHUB_OUTPUT
+          python3 .vendored/update "$VENDOR" --version "$VERSION"
 
       - name: Create Pull Request
-        if: steps.install.outputs.changed == 'true'
+        if: steps.update.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
-          VENDOR: ${{ steps.install.outputs.vendor }}
-          NEW_VER: ${{ steps.install.outputs.new_version }}
-          OLD_VER: ${{ steps.install.outputs.old_version }}
-          MODE: ${{ steps.install.outputs.mode }}
+          VENDOR: ${{ steps.update.outputs.vendor }}
+          NEW_VER: ${{ steps.update.outputs.new_version }}
+          OLD_VER: ${{ steps.update.outputs.old_version }}
+          INSTALL_BRANCH: ${{ steps.update.outputs.install_branch }}
+          CHANGED_COUNT: ${{ steps.update.outputs.changed_count }}
+          CHANGED_VENDORS: ${{ steps.update.outputs.changed_vendors }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if [ "$MODE" = "all" ]; then
-            # Multi-vendor: combined branch and PR
+          if [ -n "$CHANGED_COUNT" ]; then
+            # Multi-vendor mode
             BRANCH="chore/install-vendors"
             TITLE="chore: install vendor updates"
-            BODY=$(printf "Automated vendor updates.\n\n**Updated:** %s" "${VENDOR//+/, }")
+            VENDOR_LIST=$(python3 -c "
+          import json, sys
+          results = json.loads(sys.argv[1])
+          print(', '.join(r['vendor'] for r in results))
+          " "$CHANGED_VENDORS")
+            BODY=$(printf "Automated vendor updates.\n\n**Updated:** %s" "$VENDOR_LIST")
           else
-            # Single vendor: per-vendor branch from config
-            INSTALL_BRANCH=$(python3 -c "
-          import json
-          c = json.load(open('.vendored/config.json'))
-          v = c.get('vendors', {}).get('$VENDOR', {})
-          print(v.get('install_branch', 'chore/install-$VENDOR'))
-          " 2>/dev/null || echo "chore/install-$VENDOR")
-
+            # Single vendor mode
             BRANCH="${INSTALL_BRANCH}-v${NEW_VER}"
             TITLE="chore: install ${VENDOR} v${NEW_VER}"
             BODY=$(printf "Automated vendor update for **%s**.\n\n**Version:** \`%s\` → \`%s\`" "$VENDOR" "$OLD_VER" "$NEW_VER")
@@ -144,7 +108,7 @@ jobs:
           echo "Created PR: $PR_URL"
 
           # Automerge: check per-vendor config (skip for multi-vendor)
-          if [ "$MODE" != "all" ]; then
+          if [ -z "$CHANGED_COUNT" ]; then
             AUTOMERGE=$(python3 -c "
           import json
           c = json.load(open('.vendored/config.json'))

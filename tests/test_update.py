@@ -208,7 +208,9 @@ class TestInstallVendor:
 # ── Tests: output_result ──────────────────────────────────────────────────
 
 class TestOutputResult:
-    def test_single_result_format(self, capsys):
+    def test_single_result_format(self, make_config, capsys, monkeypatch):
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
         inst.output_result({
             "vendor": "tool",
             "old_version": "1.0.0",
@@ -221,7 +223,9 @@ class TestOutputResult:
         assert "new_version=2.0.0" in out
         assert "changed=true" in out
 
-    def test_output_results_single(self, capsys):
+    def test_output_results_single(self, make_config, capsys, monkeypatch):
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
         results = [{
             "vendor": "tool",
             "old_version": "1.0.0",
@@ -232,7 +236,8 @@ class TestOutputResult:
         out = capsys.readouterr().out
         assert "vendor=tool" in out
 
-    def test_output_results_multiple(self, capsys):
+    def test_output_results_multiple(self, capsys, monkeypatch):
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
         results = [
             {"vendor": "a", "old_version": "1.0", "new_version": "2.0", "changed": True},
             {"vendor": "b", "old_version": "1.0", "new_version": "1.0", "changed": False},
@@ -241,3 +246,81 @@ class TestOutputResult:
         out = capsys.readouterr().out
         assert "changed_count=1" in out
         assert "results=" in out
+
+
+# ── Tests: write_github_output ────────────────────────────────────────────
+
+class TestWriteGithubOutput:
+    def test_writes_to_github_output_file(self, tmp_repo, monkeypatch):
+        """When GITHUB_OUTPUT is set, key=value pairs are written to the file."""
+        output_file = tmp_repo / "github_output.txt"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+
+        inst.write_github_output({"vendor": "tool", "changed": "true"})
+
+        content = output_file.read_text()
+        assert "vendor=tool\n" in content
+        assert "changed=true\n" in content
+
+    def test_no_file_when_env_unset(self, tmp_repo, monkeypatch):
+        """When GITHUB_OUTPUT is not set, no file is written."""
+        monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+        output_file = tmp_repo / "github_output.txt"
+
+        inst.write_github_output({"vendor": "tool"})
+
+        assert not output_file.exists()
+
+    def test_single_vendor_writes_github_output(self, make_config, tmp_repo, monkeypatch, capsys):
+        """output_result writes to GITHUB_OUTPUT when env var is set."""
+        output_file = tmp_repo / "github_output.txt"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        inst.output_result({
+            "vendor": "tool",
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "changed": True,
+        })
+
+        content = output_file.read_text()
+        assert "vendor=tool\n" in content
+        assert "old_version=1.0.0\n" in content
+        assert "new_version=2.0.0\n" in content
+        assert "changed=true\n" in content
+        assert "install_branch=chore/install-tool\n" in content
+
+    def test_multi_vendor_writes_github_output(self, tmp_repo, monkeypatch, capsys):
+        """output_results (multi) writes changed_vendors and changed_count to GITHUB_OUTPUT."""
+        output_file = tmp_repo / "github_output.txt"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+
+        results = [
+            {"vendor": "a", "old_version": "1.0", "new_version": "2.0", "changed": True},
+            {"vendor": "b", "old_version": "1.0", "new_version": "1.0", "changed": False},
+        ]
+        inst.output_results(results)
+
+        content = output_file.read_text()
+        assert "changed_count=1\n" in content
+        assert "changed=true\n" in content
+        assert "changed_vendors=" in content
+        # Parse the JSON
+        for line in content.strip().split("\n"):
+            if line.startswith("changed_vendors="):
+                vendors_json = json.loads(line.split("=", 1)[1])
+                assert len(vendors_json) == 1
+                assert vendors_json[0]["vendor"] == "a"
+
+    def test_appends_to_existing_file(self, tmp_repo, monkeypatch):
+        """GITHUB_OUTPUT appends to existing content."""
+        output_file = tmp_repo / "github_output.txt"
+        output_file.write_text("existing=value\n")
+        monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+
+        inst.write_github_output({"new_key": "new_value"})
+
+        content = output_file.read_text()
+        assert "existing=value\n" in content
+        assert "new_key=new_value\n" in content

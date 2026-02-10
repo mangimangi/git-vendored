@@ -222,12 +222,34 @@ def install_vendor(vendor_name, vendor_config, requested_version):
     }
 
 
+def write_github_output(pairs):
+    """Write key=value pairs to $GITHUB_OUTPUT file if env var is set."""
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if not output_file:
+        return
+    with open(output_file, "a") as f:
+        for key, value in pairs.items():
+            f.write(f"{key}={value}\n")
+
+
 def output_result(result):
     """Output a single vendor result as key=value lines."""
     print(f"vendor={result['vendor']}")
     print(f"old_version={result['old_version']}")
     print(f"new_version={result['new_version']}")
     print(f"changed={str(result['changed']).lower()}")
+
+    config = load_config()
+    vendor_config = config.get("vendors", {}).get(result["vendor"], {})
+    install_branch = vendor_config.get("install_branch", f"chore/install-{result['vendor']}")
+
+    write_github_output({
+        "vendor": result["vendor"],
+        "old_version": result["old_version"],
+        "new_version": result["new_version"],
+        "changed": str(result["changed"]).lower(),
+        "install_branch": install_branch,
+    })
 
 
 def output_results(results):
@@ -239,6 +261,12 @@ def output_results(results):
         # For 'all' mode, output JSON array of changed vendors
         print(f"results={json.dumps(changed)}")
         print(f"changed_count={len(changed)}")
+
+        write_github_output({
+            "changed_vendors": json.dumps(changed),
+            "changed_count": str(len(changed)),
+            "changed": str(len(changed) > 0).lower(),
+        })
 
 
 def main():
