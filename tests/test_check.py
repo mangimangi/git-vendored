@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -235,3 +236,108 @@ class TestGetBranchName:
             )
             branch = check.get_branch_name()
             assert branch == "main"
+
+
+# ── Tests: get_staged_files ──────────────────────────────────────────────
+
+class TestGetStagedFiles:
+    def test_returns_staged_files(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=".vendored/install\nREADME.md\n"
+            )
+            files = check.get_staged_files()
+            assert files == [".vendored/install", "README.md"]
+            mock_run.assert_called_once_with(
+                ["git", "diff", "--cached", "--name-only"],
+                capture_output=True, text=True
+            )
+
+    def test_empty_staging_area(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="\n"
+            )
+            files = check.get_staged_files()
+            assert files == []
+
+    def test_git_failure_exits(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stderr="fatal: not a git repo"
+            )
+            with pytest.raises(SystemExit) as exc_info:
+                check.get_staged_files()
+            assert exc_info.value.code == 1
+
+
+# ── Tests: install_hook ──────────────────────────────────────────────────
+
+class TestInstallHook:
+    def test_creates_symlink(self, tmp_repo):
+        # Create the hook source
+        hooks_dir = tmp_repo / ".vendored" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / "pre-commit").write_text("#!/bin/bash\n")
+
+        # Create .git/hooks directory
+        git_hooks = tmp_repo / ".git" / "hooks"
+        git_hooks.mkdir(parents=True)
+
+        check.install_hook()
+
+        hook_dst = git_hooks / "pre-commit"
+        assert hook_dst.is_symlink()
+        assert os.readlink(str(hook_dst)) == "../../.vendored/hooks/pre-commit"
+
+    def test_overwrites_existing_file(self, tmp_repo):
+        hooks_dir = tmp_repo / ".vendored" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / "pre-commit").write_text("#!/bin/bash\n")
+
+        git_hooks = tmp_repo / ".git" / "hooks"
+        git_hooks.mkdir(parents=True)
+        (git_hooks / "pre-commit").write_text("#!/bin/bash\nold hook\n")
+
+        check.install_hook()
+
+        hook_dst = git_hooks / "pre-commit"
+        assert hook_dst.is_symlink()
+        assert os.readlink(str(hook_dst)) == "../../.vendored/hooks/pre-commit"
+
+    def test_overwrites_existing_symlink(self, tmp_repo):
+        hooks_dir = tmp_repo / ".vendored" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / "pre-commit").write_text("#!/bin/bash\n")
+
+        git_hooks = tmp_repo / ".git" / "hooks"
+        git_hooks.mkdir(parents=True)
+        # Symlink to pearls hook (the scenario we're squashing)
+        os.symlink("../../.pearls/hooks/pre-commit", str(git_hooks / "pre-commit"))
+
+        check.install_hook()
+
+        hook_dst = git_hooks / "pre-commit"
+        assert hook_dst.is_symlink()
+        assert os.readlink(str(hook_dst)) == "../../.vendored/hooks/pre-commit"
+
+    def test_errors_when_hook_source_missing(self, tmp_repo):
+        (tmp_repo / ".git" / "hooks").mkdir(parents=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            check.install_hook()
+        assert exc_info.value.code == 1
+
+    def test_creates_git_hooks_dir(self, tmp_repo):
+        hooks_dir = tmp_repo / ".vendored" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / "pre-commit").write_text("#!/bin/bash\n")
+
+        # .git dir exists but no hooks subdir
+        (tmp_repo / ".git").mkdir(exist_ok=True)
+
+        check.install_hook()
+
+        hook_dst = tmp_repo / ".git" / "hooks" / "pre-commit"
+        assert hook_dst.is_symlink()

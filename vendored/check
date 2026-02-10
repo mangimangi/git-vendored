@@ -7,6 +7,13 @@ install_branch prefix.
 
 Usage:
     python3 .vendored/check [--base <ref>]
+    python3 .vendored/check --staged
+    python3 .vendored/check --install-hook
+
+Modes:
+    (default)       Diff against base ref (for CI / PR checks)
+    --staged        Check staged files only (for pre-commit hook)
+    --install-hook  Install pre-commit hook into .git/hooks/
 
 Exit codes:
     0 - No violations (or all changes are allowed)
@@ -45,6 +52,18 @@ def get_changed_files(base_ref):
         if result.returncode != 0:
             print(f"Failed to get changed files: {result.stderr.strip()}")
             sys.exit(1)
+    return [f for f in result.stdout.strip().split("\n") if f]
+
+
+def get_staged_files():
+    """Get list of files staged for commit."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"Failed to get staged files: {result.stderr.strip()}")
+        sys.exit(1)
     return [f for f in result.stdout.strip().split("\n") if f]
 
 
@@ -108,6 +127,25 @@ def check_vendor(vendor_name, vendor_config, changed_files, branch):
     return violations
 
 
+def install_hook():
+    """Install the pre-commit hook by symlinking into .git/hooks/."""
+    hook_src = os.path.join(".vendored", "hooks", "pre-commit")
+    hook_dst = os.path.join(".git", "hooks", "pre-commit")
+
+    if not os.path.isfile(hook_src):
+        print(f"Error: {hook_src} not found. Run the install-vendored workflow first.")
+        sys.exit(1)
+
+    os.makedirs(os.path.join(".git", "hooks"), exist_ok=True)
+
+    # Force-overwrite any existing hook (file or symlink)
+    if os.path.islink(hook_dst) or os.path.isfile(hook_dst):
+        os.remove(hook_dst)
+
+    os.symlink(os.path.join("..", "..", ".vendored", "hooks", "pre-commit"), hook_dst)
+    print(f"Installed pre-commit hook: {hook_dst} -> {hook_src}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check for unauthorized vendor file modifications"
@@ -116,17 +154,20 @@ def main():
         "--base", default=None,
         help="Base ref to diff against (default: origin/<base_branch> from env)"
     )
+    parser.add_argument(
+        "--staged", action="store_true",
+        help="Check staged files only (for pre-commit hook)"
+    )
+    parser.add_argument(
+        "--install-hook", action="store_true",
+        help="Install pre-commit hook into .git/hooks/"
+    )
     args = parser.parse_args()
 
-    # Determine base ref
-    base_ref = args.base
-    if not base_ref:
-        # GitHub Actions sets GITHUB_BASE_REF for PRs
-        github_base = os.environ.get("GITHUB_BASE_REF", "")
-        if github_base:
-            base_ref = f"origin/{github_base}"
-        else:
-            base_ref = "origin/main"
+    # --install-hook mode: just install and exit
+    if args.install_hook:
+        install_hook()
+        sys.exit(0)
 
     config = load_config()
     vendors = config.get("vendors", {})
@@ -135,7 +176,21 @@ def main():
         print("No vendors configured")
         sys.exit(0)
 
-    changed_files = get_changed_files(base_ref)
+    # Get files to check
+    if args.staged:
+        changed_files = get_staged_files()
+    else:
+        # Determine base ref
+        base_ref = args.base
+        if not base_ref:
+            # GitHub Actions sets GITHUB_BASE_REF for PRs
+            github_base = os.environ.get("GITHUB_BASE_REF", "")
+            if github_base:
+                base_ref = f"origin/{github_base}"
+            else:
+                base_ref = "origin/main"
+        changed_files = get_changed_files(base_ref)
+
     if not changed_files:
         print("No changed files")
         sys.exit(0)
