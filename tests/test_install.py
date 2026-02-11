@@ -1278,6 +1278,52 @@ class TestMigrateProjectConfigs:
         assert "Merged project config" in err
         assert ".tool/config.json" in err
 
+    def test_removes_empty_dotdir(self, tmp_repo):
+        """Empty dot-directory is cleaned up after config migration."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Dot-directory with only config.json
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        assert not (tmp_repo / ".tool").exists()
+
+    def test_preserves_non_empty_dotdir(self, tmp_repo):
+        """Dot-directory with other files is NOT removed."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Dot-directory with config.json AND other files
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+        (tmp_repo / ".tool" / "data.db").write_text("data")
+
+        inst.migrate_project_configs()
+
+        # config.json removed but dir preserved because of data.db
+        assert not (tmp_repo / ".tool" / "config.json").exists()
+        assert (tmp_repo / ".tool").exists()
+        assert (tmp_repo / ".tool" / "data.db").exists()
+
+    def test_logs_empty_dir_removal(self, tmp_repo, capsys):
+        """Cleanup of empty dot-directory is logged."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        err = capsys.readouterr().err
+        assert "Removed empty directory" in err
+
 
 # ── Tests: CLI routing ────────────────────────────────────────────────────
 

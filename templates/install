@@ -815,6 +815,14 @@ def migrate_project_configs():
         print(f"  Merged project config: {legacy_path} -> {vendor_filepath}",
               file=sys.stderr)
 
+        # Clean up empty dot-directory
+        dotdir = os.path.dirname(legacy_path)
+        try:
+            os.rmdir(dotdir)
+            print(f"  Removed empty directory: {dotdir}", file=sys.stderr)
+        except OSError:
+            pass  # Directory not empty, leave it
+
 
 def _should_migrate_project_configs():
     """Check if any legacy project configs need migrating."""
