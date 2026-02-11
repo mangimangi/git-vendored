@@ -1310,6 +1310,29 @@ class TestMigrateProjectConfigs:
         assert (tmp_repo / ".tool").exists()
         assert (tmp_repo / ".tool" / "data.db").exists()
 
+    def test_preserves_dotdir_with_data_and_git_infra(self, tmp_repo):
+        """Dot-directory with data files and git infrastructure is retained as data zone."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Simulate a vendor dot-dir with data files and git infrastructure
+        dotdir = tmp_repo / ".tool"
+        dotdir.mkdir()
+        (dotdir / "config.json").write_text(json.dumps({"x": 1}))
+        (dotdir / "issues.jsonl").write_text('{"id":"t-1"}\n')
+        (dotdir / ".gitattributes").write_text("*.jsonl merge=custom\n")
+        (dotdir / ".gitignore").write_text("*.lock\n")
+
+        inst.migrate_project_configs()
+
+        # config.json migrated away, but data + git infra preserved
+        assert not (dotdir / "config.json").exists()
+        assert dotdir.exists()
+        assert (dotdir / "issues.jsonl").exists()
+        assert (dotdir / ".gitattributes").exists()
+        assert (dotdir / ".gitignore").exists()
+
     def test_logs_empty_dir_removal(self, tmp_repo, capsys):
         """Cleanup of empty dot-directory is logged."""
         configs_dir = tmp_repo / ".vendored" / "configs"

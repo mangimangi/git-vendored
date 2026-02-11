@@ -178,6 +178,8 @@ This prevents accidental edits to vendor-managed files while allowing the automa
     pre-commit                   # shared pre-commit hook
 ```
 
+Vendor data files (e.g. `.pearls/issues.jsonl`, `.semver/.version`) remain in their original `.<vendor>/` directories — these are vendor-owned, not framework-managed. After migration, dot-directories become data-only zones. See `docs/vendor-install-dir-guide.md` for details.
+
 Manifest `.files` are plain text, one-path-per-line. Easy to `cat`, `diff`, `grep`.
 
 ## Migration

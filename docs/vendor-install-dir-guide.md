@@ -187,6 +187,54 @@ MY_SETTING=$(jq -r '.my_setting // empty' "$CONFIG_FILE")
 | `.vendored/configs/<vendor>.json` missing | Fall back to legacy `.<vendor>/config.json` |
 | Pre-`_vendor` flat config (no `_vendor` key) | All keys treated as registry fields by framework |
 
+## Data Files
+
+After the directory restructure, vendor files split into three categories with different locations and ownership:
+
+| Category | Location | Managed By | Examples |
+|----------|----------|------------|----------|
+| Code | `.vendored/pkg/<vendor>/` | Framework (manifest-protected) | `prl.py`, `git-semver` |
+| Config | `.vendored/configs/<vendor>.json` | Framework (`_vendor`) + vendor (top-level) | registry fields, project settings |
+| Data | `.<vendor>/` | Vendor tool | `issues.jsonl`, `.version`, `archive/` |
+
+### Why Data Stays in Dot-Directories
+
+Data files remain in their original `.<vendor>/` directories because:
+
+1. **Vendor tools own their data** — tools like `prl` hardcode `.<vendor>/` as their data directory. Data file creation, modification, and archival is a vendor responsibility, not a framework concern.
+2. **Different lifecycle** — code and config update on vendor release cycles; data files change continuously during normal usage.
+3. **Git infrastructure** — dot-directories may contain `.gitattributes` (merge drivers for data formats) and `.gitignore` (runtime file exclusions) that depend on data files being siblings.
+4. **No framework benefit** — `.vendored/pkg/<vendor>/` is for installed code protected by manifests. Data files need `allowed` exemptions, not protection.
+
+After migration, vendor dot-directories transition from "code + config + data" to "data only":
+
+```
+# Before migration
+.my-tool/
+  script.sh         # code  → moves to .vendored/pkg/my-tool/
+  config.json        # config → merges into .vendored/configs/my-tool.json
+  data.db            # data  → stays here
+  .gitattributes     # git   → stays here
+
+# After migration
+.my-tool/
+  data.db            # data (vendor-managed)
+  .gitattributes     # git infrastructure
+```
+
+### Allowed Patterns for Data Files
+
+Data files in dot-directories are covered by `protected` patterns (e.g. `".pearls/**"`) but exempted via `allowed` patterns so users and vendor tools can modify them:
+
+```json
+{
+  "_vendor": {
+    "protected": [".vendored/pkg/my-tool/**"],
+    "allowed": [".vendored/configs/my-tool.json", ".my-tool/data.db"]
+  }
+}
+```
+
 ## What Vendor Repos Need to Change
 
 1. **Read `VENDOR_INSTALL_DIR`** — use it as the base directory for installed files, with fallback to the original location

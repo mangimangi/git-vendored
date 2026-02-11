@@ -815,13 +815,19 @@ def migrate_project_configs():
         print(f"  Merged project config: {legacy_path} -> {vendor_filepath}",
               file=sys.stderr)
 
-        # Clean up empty dot-directory
+        # Clean up empty dot-directory.
+        # After code migrates to pkg/<vendor>/ and config merges into
+        # configs/<vendor>.json, the dot-directory may still contain vendor
+        # data files (e.g. .pearls/issues.jsonl, .semver/.version) and git
+        # infrastructure (.gitattributes, .gitignore). These stay in the
+        # dot-directory — data files are vendor-owned, not framework-managed.
+        # Only remove the directory if it's truly empty.
         dotdir = os.path.dirname(legacy_path)
         try:
             os.rmdir(dotdir)
             print(f"  Removed empty directory: {dotdir}", file=sys.stderr)
         except OSError:
-            pass  # Directory not empty, leave it
+            pass  # Directory has data files — retained as vendor data zone
 
 
 def _should_migrate_project_configs():
