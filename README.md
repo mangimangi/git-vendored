@@ -25,7 +25,9 @@ This creates:
 - `.vendored/install` — add new vendors or update existing ones
 - `.vendored/check` — enforce file protection rules
 - `.vendored/remove` — cleanly uninstall a vendor
-- `.vendored/config.json` — vendor registry
+- `.vendored/config.json` — framework-level config (legacy vendor registry)
+- `.vendored/configs/` — per-vendor config files (`<vendor>.json`)
+- `.vendored/pkg/` — vendor-installed files (`<vendor>/`)
 - `.vendored/manifests/` — manifest storage (file lists + versions)
 - `.github/workflows/install-vendored.yml` — automated update workflow
 - `.github/workflows/check-vendor.yml` — PR protection checks
@@ -38,7 +40,7 @@ python3 .vendored/install owner/repo-name
 
 This will:
 1. Verify the repo has `install.sh` and a resolvable version
-2. Run the vendor's `install.sh` with `VENDOR_REPO`, `VENDOR_REF`, and `VENDOR_MANIFEST` set
+2. Run the vendor's `install.sh` with `VENDOR_REPO`, `VENDOR_REF`, `VENDOR_MANIFEST`, and `VENDOR_INSTALL_DIR` set
 3. Read the manifest output and store it at `.vendored/manifests/<vendor>.files`
 4. Store the version at `.vendored/manifests/<vendor>.version`
 
@@ -78,20 +80,16 @@ This uses the manifest to cleanly remove all vendor files, delete the manifest, 
 
 ## Configuration
 
-`.vendored/config.json` holds the vendor registry:
+Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 
 ```json
 {
-  "vendors": {
-    "my-tool": {
-      "repo": "owner/my-tool",
-      "install_branch": "chore/install-my-tool",
-      "allowed": [".my-tool/config.json"],
-      "private": false,
-      "automerge": false,
-      "dogfood": false
-    }
-  }
+  "repo": "owner/my-tool",
+  "install_branch": "chore/install-my-tool",
+  "allowed": [".vendored/pkg/my-tool/config.json"],
+  "private": false,
+  "automerge": false,
+  "dogfood": false
 }
 ```
 
@@ -102,9 +100,11 @@ This uses the manifest to cleanly remove all vendor files, delete the manifest, 
 | `allowed` | no | Glob patterns of vendor-managed files that users *can* edit |
 | `private` | no | If `true`, requires `VENDOR_PAT` secret for access |
 | `automerge` | no | If `true`, auto-merge vendor update PRs (default: `false`) |
-| `dogfood` | no | If `true`, included in dogfood workflow |
+| `dogfood` | no | If `true`, skips `VENDOR_INSTALL_DIR` (installs into framework paths) |
 
-**Note:** The `protected` field is no longer used in the config. Protection rules are derived automatically from manifests at `.vendored/manifests/<vendor>.files`. For v1 vendors without manifests, `check` falls back to config `protected` patterns for backwards compatibility.
+**Backwards compatibility:** If `.vendored/configs/` has no `.json` files, the framework falls back to reading from a monolithic `.vendored/config.json` with a `vendors` key. The first time `install` runs after upgrading, it automatically migrates the monolithic config into per-vendor files.
+
+**Note:** The `protected` field is preserved in per-vendor config for v1 fallback compatibility. Protection rules are derived automatically from manifests at `.vendored/manifests/<vendor>.files`. For v1 vendors without manifests, `check` falls back to config `protected` patterns.
 
 ## Vendor Contract
 
@@ -122,7 +122,10 @@ A vendor repo must provide:
 | `VENDOR_REPO` | `owner/repo` for API calls |
 | `VENDOR_REF` | Git ref to fetch files at |
 | `VENDOR_MANIFEST` | Path to write the file manifest to |
+| `VENDOR_INSTALL_DIR` | Target directory for vendor files (e.g., `.vendored/pkg/<vendor>`) |
 | `GH_TOKEN` | Auth token (when available) |
+
+`VENDOR_INSTALL_DIR` is set for non-dogfood vendors. Vendors SHOULD install their primary files under this directory but MAY install to other paths (workflows, hooks) when the target system requires specific locations. If not set, the vendor falls back to its original file layout.
 
 ### Manifest
 
@@ -149,23 +152,52 @@ A vendor repo must provide:
 
 This prevents accidental edits to vendor-managed files while allowing the automated update workflow to function.
 
-## Manifest Storage
+## Directory Layout
 
 ```
-.vendored/manifests/
-  git-vendored.files      # one filepath per line
-  git-vendored.version    # single line: version string
-  my-tool.files
-  my-tool.version
+.vendored/
+  install                        # framework command: add/update vendors
+  check                          # framework command: file protection checks
+  remove                         # framework command: uninstall vendors
+  config.json                    # framework-level config (legacy)
+  configs/
+    my-tool.json                 # per-vendor config
+    pearls.json
+  pkg/
+    my-tool/                     # vendor-installed files
+      script.sh
+      lib.py
+    pearls/
+      prl.py
+  manifests/
+    my-tool.files                # one filepath per line
+    my-tool.version              # single line: version string
+    pearls.files
+    pearls.version
+  hooks/
+    pre-commit                   # shared pre-commit hook
 ```
 
-Plain text, one-path-per-line for `.files`. Easy to `cat`, `diff`, `grep`.
+Manifest `.files` are plain text, one-path-per-line. Easy to `cat`, `diff`, `grep`.
 
-## Migrating from v1 to v2
+## Migration
+
+### From v1 to v2
 
 If you're upgrading from a v1 git-vendored installation:
 
-1. **Re-bootstrap**: Run the latest `install.sh` — it will clean up deprecated files (`.vendored/add`, `.vendored/update`, `.vendored/.version`)
-2. **Manifests generated on update**: The next time each vendor is updated via `.vendored/install`, a manifest will be generated and stored. Until then, `check` falls back to config `protected` patterns.
-3. **Config `protected` field**: No longer needed once manifests exist. It will be ignored when a manifest is present but serves as backwards-compatible fallback for vendors not yet updated.
-4. **Vendor `install.sh` updates**: Vendor repos should update their `install.sh` to read `VENDOR_REF`/`VENDOR_REPO` env vars and write a manifest to `$VENDOR_MANIFEST`. The framework still runs v1 install.sh scripts — they just won't benefit from manifest-driven protection until updated.
+1. **Re-bootstrap**: Run the latest `install.sh` — it will clean up deprecated files (`.vendored/add`, `.vendored/update`, `.vendored/.version`) and create `configs/` and `pkg/` directories
+2. **Config migration**: The first time `.vendored/install` runs, it automatically splits the monolithic `config.json` vendors dict into individual `configs/<vendor>.json` files
+3. **Manifests generated on update**: The next time each vendor is updated via `.vendored/install`, a manifest will be generated and stored. Until then, `check` falls back to config `protected` patterns
+4. **Vendor `install.sh` updates**: Vendor repos should update their `install.sh` to use `VENDOR_INSTALL_DIR` for file placement and write a manifest to `$VENDOR_MANIFEST`. The framework still runs old install.sh scripts — they just won't benefit from the new directory layout until updated
+
+### Migrating vendor file layout
+
+To move a vendor's files from dotdirs (e.g., `.my-tool/`) into `.vendored/pkg/my-tool/`:
+
+```bash
+python3 .vendored/remove my-tool --force
+python3 .vendored/install owner/my-tool
+```
+
+This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_INSTALL_DIR`. See `docs/vendor-install-dir-guide.md` for details.
