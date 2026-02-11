@@ -36,6 +36,9 @@ set -euo pipefail
 VERSION="${{1:?}}"
 VENDORED_REPO="${{2:-mangimangi/git-vendored}}"
 
+# Track installed files for manifest
+INSTALLED_FILES=()
+
 # Override fetch_file to copy from source tree
 fetch_file() {{
     local repo_path="$1"
@@ -49,24 +52,24 @@ fetch_file() {{
     fi
 }}
 
-# Source the rest of install.sh (skip the shebang and function definition)
-# Instead, just inline the logic after fetch_file is defined
-
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
-mkdir -p .vendored .vendored/hooks .github/workflows
+mkdir -p .vendored .vendored/hooks .vendored/manifests .github/workflows
 
 echo "Downloading .vendored/install..."
 fetch_file "templates/install" ".vendored/install"
 chmod +x .vendored/install
+INSTALLED_FILES+=(".vendored/install")
 
 echo "Downloading .vendored/check..."
 fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
+INSTALLED_FILES+=(".vendored/check")
 
 echo "Downloading .vendored/remove..."
 fetch_file "templates/remove" ".vendored/remove"
 chmod +x .vendored/remove
+INSTALLED_FILES+=(".vendored/remove")
 
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
@@ -74,9 +77,11 @@ rm -f .vendored/add .vendored/update
 echo "Downloading .vendored/hooks/pre-commit..."
 fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
+INSTALLED_FILES+=(".vendored/hooks/pre-commit")
 
 echo "$VERSION" > .vendored/.version
 echo "Installed git-vendored v$VERSION"
+INSTALLED_FILES+=(".vendored/.version")
 
 if [ ! -f .vendored/config.json ]; then
     fetch_file "templates/config.json" ".vendored/config.json"
@@ -87,6 +92,7 @@ install_workflow() {{
     local workflow="$1"
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
+        INSTALLED_FILES+=(".github/workflows/$workflow")
     fi
 }}
 
@@ -113,6 +119,17 @@ with open('.vendored/config.json', 'w') as f:
     f.write('\\n')
 "
 
+# Write manifest (v2 contract)
+write_manifest() {{
+    if [ -n "${{VENDOR_MANIFEST:-}}" ]; then
+        printf '%s\\n' "${{INSTALLED_FILES[@]}}" > "$VENDOR_MANIFEST"
+    fi
+    printf '%s\\n' "${{INSTALLED_FILES[@]}}" | sort > .vendored/manifests/git-vendored.files
+    echo "$VERSION" > .vendored/manifests/git-vendored.version
+}}
+
+write_manifest
+
 echo ""
 echo "Done! git-vendored v$VERSION installed."
 """)
@@ -120,11 +137,11 @@ echo "Done! git-vendored v$VERSION installed."
     return wrapper
 
 
-def run_installer(wrapper, version="0.1.0"):
+def run_installer(wrapper, version="0.1.0", env=None):
     """Run the mock installer."""
     result = subprocess.run(
         ["bash", str(wrapper), version],
-        capture_output=True, text=True
+        capture_output=True, text=True, env=env
     )
     return result
 
@@ -237,6 +254,59 @@ class TestInstaller:
         run_installer(mock_fetch)
         assert not (tmp_repo / ".vendored" / "add").exists()
         assert not (tmp_repo / ".vendored" / "update").exists()
+
+
+class TestManifest:
+    """Verify v2 manifest contract in install.sh."""
+
+    def test_writes_manifest_files(self, mock_fetch, tmp_repo):
+        """install.sh should write .vendored/manifests/git-vendored.files."""
+        run_installer(mock_fetch, "0.1.0")
+        manifest_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.files"
+        assert manifest_path.is_file()
+        content = manifest_path.read_text()
+        assert ".vendored/install" in content
+        assert ".vendored/check" in content
+        assert ".vendored/remove" in content
+        assert ".vendored/hooks/pre-commit" in content
+        assert ".vendored/.version" in content
+
+    def test_writes_manifest_version(self, mock_fetch, tmp_repo):
+        """install.sh should write .vendored/manifests/git-vendored.version."""
+        run_installer(mock_fetch, "0.1.0")
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.is_file()
+        assert version_path.read_text().strip() == "0.1.0"
+
+    def test_manifest_version_updated_on_rerun(self, mock_fetch, tmp_repo):
+        run_installer(mock_fetch, "0.1.0")
+        run_installer(mock_fetch, "0.2.0")
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.read_text().strip() == "0.2.0"
+
+    def test_manifest_includes_workflow_files(self, mock_fetch, tmp_repo):
+        run_installer(mock_fetch, "0.1.0")
+        manifest_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.files"
+        content = manifest_path.read_text()
+        assert ".github/workflows/install-vendored.yml" in content
+        assert ".github/workflows/check-vendor.yml" in content
+
+    def test_writes_to_vendor_manifest_env(self, mock_fetch, tmp_repo):
+        """When VENDOR_MANIFEST is set, install.sh writes to that path too."""
+        manifest_file = tmp_repo / "vendor_manifest.txt"
+        env = os.environ.copy()
+        env["VENDOR_MANIFEST"] = str(manifest_file)
+        run_installer(mock_fetch, "0.1.0", env=env)
+        assert manifest_file.is_file()
+        content = manifest_file.read_text()
+        assert ".vendored/install" in content
+
+    def test_manifest_files_sorted(self, mock_fetch, tmp_repo):
+        """Manifest file entries should be sorted."""
+        run_installer(mock_fetch, "0.1.0")
+        manifest_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.files"
+        lines = [l.strip() for l in manifest_path.read_text().strip().split("\n") if l.strip()]
+        assert lines == sorted(lines)
 
 
 class TestWorkflowTemplate:
