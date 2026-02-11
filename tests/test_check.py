@@ -16,7 +16,7 @@ ROOT = Path(__file__).parent.parent
 
 
 def _import_check():
-    filepath = str(ROOT / "vendored" / "check")
+    filepath = str(ROOT / "templates" / "check")
     loader = importlib.machinery.SourceFileLoader("vendored_check", filepath)
     spec = importlib.util.spec_from_loader("vendored_check", loader, origin=filepath)
     module = importlib.util.module_from_spec(spec)
@@ -204,6 +204,134 @@ class TestCheckVendor:
             [".anything/file.py"], "feature/something"
         )
         assert violations == []
+
+
+# ── Tests: manifest-based protection ──────────────────────────────────────
+
+class TestManifestProtection:
+    def test_manifest_files_are_protected(self, tmp_repo):
+        """When a manifest exists, its listed files are protected."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "my-tool.files").write_text(
+            ".my-tool/script.sh\n.my-tool/config.json\n"
+        )
+        vendor_config = {
+            "repo": "owner/my-tool",
+            "install_branch": "chore/install-my-tool",
+            "protected": [".my-tool/**"],
+        }
+        violations = check.check_vendor(
+            "my-tool", vendor_config,
+            [".my-tool/script.sh"], "feature/something"
+        )
+        assert ".my-tool/script.sh" in violations
+
+    def test_manifest_allows_unlisted_files(self, tmp_repo):
+        """Files not in manifest are NOT protected, even if inside vendor dir."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "my-tool.files").write_text(
+            ".my-tool/script.sh\n"
+        )
+        vendor_config = {
+            "repo": "owner/my-tool",
+            "install_branch": "chore/install-my-tool",
+            "protected": [".my-tool/**"],
+        }
+        violations = check.check_vendor(
+            "my-tool", vendor_config,
+            [".my-tool/user-config.json"], "feature/something"
+        )
+        assert violations == []
+
+    def test_manifest_protects_manifest_files_themselves(self, tmp_repo):
+        """The manifest files (.files, .version) should be protected."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "my-tool.files").write_text(".my-tool/script.sh\n")
+
+        vendor_config = {
+            "repo": "owner/my-tool",
+            "install_branch": "chore/install-my-tool",
+            "protected": [".my-tool/**"],
+        }
+        violations = check.check_vendor(
+            "my-tool", vendor_config,
+            [".vendored/manifests/my-tool.files"], "feature/something"
+        )
+        assert ".vendored/manifests/my-tool.files" in violations
+
+    def test_manifest_skips_on_install_branch(self, tmp_repo):
+        """Install branch bypass works with manifest-based protection too."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "my-tool.files").write_text(".my-tool/script.sh\n")
+
+        vendor_config = {
+            "repo": "owner/my-tool",
+            "install_branch": "chore/install-my-tool",
+            "protected": [".my-tool/**"],
+        }
+        violations = check.check_vendor(
+            "my-tool", vendor_config,
+            [".my-tool/script.sh"], "chore/install-my-tool-v2.0"
+        )
+        assert violations == []
+
+    def test_no_manifest_falls_back_to_config(self, tmp_repo):
+        """Without a manifest, check uses config 'protected' patterns."""
+        vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        violations = check.check_vendor(
+            "git-vendored", vendor_config,
+            [".vendored/install"], "feature/something"
+        )
+        assert ".vendored/install" in violations
+
+    def test_manifest_with_allowed_exceptions(self, tmp_repo):
+        """Allowed list still applies even with manifest-based protection."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "my-tool.files").write_text(
+            ".my-tool/script.sh\n.my-tool/config.json\n"
+        )
+        vendor_config = {
+            "repo": "owner/my-tool",
+            "install_branch": "chore/install-my-tool",
+            "protected": [".my-tool/**"],
+            "allowed": [".my-tool/config.json"],
+        }
+        violations = check.check_vendor(
+            "my-tool", vendor_config,
+            [".my-tool/config.json", ".my-tool/script.sh"], "feature/something"
+        )
+        # config.json is allowed, script.sh is not
+        assert ".my-tool/config.json" not in violations
+        assert ".my-tool/script.sh" in violations
+
+
+# ── Tests: get_protected_files ────────────────────────────────────────────
+
+class TestGetProtectedFiles:
+    def test_returns_config_patterns_without_manifest(self, tmp_repo):
+        vendor_config = {"protected": [".tool/**", ".github/workflows/tool.yml"]}
+        result = check.get_protected_files("tool", vendor_config)
+        assert result == [".tool/**", ".github/workflows/tool.yml"]
+
+    def test_returns_manifest_files_with_manifest(self, tmp_repo):
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(
+            ".tool/script.sh\n.tool/lib.py\n"
+        )
+        vendor_config = {"protected": [".tool/**"]}
+        result = check.get_protected_files("tool", vendor_config)
+        assert ".tool/script.sh" in result
+        assert ".tool/lib.py" in result
+        assert ".vendored/manifests/tool.files" in result
+        assert ".vendored/manifests/tool.version" in result
+        # Config patterns should NOT be in the result
+        assert ".tool/**" not in result
 
 
 # ── Tests: load_config ─────────────────────────────────────────────────────

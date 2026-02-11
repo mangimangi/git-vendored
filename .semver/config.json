@@ -1,6 +1,6 @@
 {
   "version_file": "VERSION",
-  "files": ["install.sh", "vendored/*", "templates/*"],
+  "files": ["install.sh", "templates/*"],
   "_comment_files": "Glob patterns for files whose changes trigger automatic patch bumps (e.g. 'src/**/*.py')",
   "updates": {},
   "changelog": true

@@ -33,8 +33,12 @@ def mock_fetch(tmp_repo):
 #!/bin/bash
 set -euo pipefail
 
-VERSION="${{1:?}}"
-VENDORED_REPO="${{2:-mangimangi/git-vendored}}"
+# v2 contract: read env vars, fall back to positional args
+VERSION="${{VENDOR_REF:-${{1:?}}}}"
+VENDORED_REPO="${{VENDOR_REPO:-${{2:-mangimangi/git-vendored}}}}"
+
+# Track installed files for manifest
+INSTALLED_FILES=()
 
 # Override fetch_file to copy from source tree
 fetch_file() {{
@@ -49,33 +53,38 @@ fetch_file() {{
     fi
 }}
 
-# Source the rest of install.sh (skip the shebang and function definition)
-# Instead, just inline the logic after fetch_file is defined
-
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
-mkdir -p .vendored .github/workflows
+mkdir -p .vendored .vendored/hooks .vendored/manifests .github/workflows
 
-echo "Downloading .vendored/add..."
-fetch_file "vendored/add" ".vendored/add"
-chmod +x .vendored/add
-
-echo "Downloading .vendored/update..."
-fetch_file "vendored/update" ".vendored/update"
-chmod +x .vendored/update
+echo "Downloading .vendored/install..."
+fetch_file "templates/install" ".vendored/install"
+chmod +x .vendored/install
+INSTALLED_FILES+=(".vendored/install")
 
 echo "Downloading .vendored/check..."
-fetch_file "vendored/check" ".vendored/check"
+fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
+INSTALLED_FILES+=(".vendored/check")
 
-# Clean up old install script (renamed to update)
-rm -f .vendored/install
+echo "Downloading .vendored/remove..."
+fetch_file "templates/remove" ".vendored/remove"
+chmod +x .vendored/remove
+INSTALLED_FILES+=(".vendored/remove")
 
-echo "$VERSION" > .vendored/.version
-echo "Installed git-vendored v$VERSION"
+# Clean up old add/update scripts (merged into install)
+rm -f .vendored/add .vendored/update
+
+echo "Downloading .vendored/hooks/pre-commit..."
+fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
+chmod +x .vendored/hooks/pre-commit
+INSTALLED_FILES+=(".vendored/hooks/pre-commit")
+
+# Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
+rm -f .vendored/.version
 
 if [ ! -f .vendored/config.json ]; then
-    fetch_file "templates/vendored/config.json" ".vendored/config.json"
+    fetch_file "templates/config.json" ".vendored/config.json"
     echo "Created .vendored/config.json"
 fi
 
@@ -83,31 +92,26 @@ install_workflow() {{
     local workflow="$1"
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
+        INSTALLED_FILES+=(".github/workflows/$workflow")
     fi
 }}
 
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
 
-python3 -c "
-import json
-with open('.vendored/config.json') as f:
-    config = json.load(f)
-config.setdefault('vendors', {{}})
-config['vendors']['git-vendored'] = {{
-    'repo': '$VENDORED_REPO',
-    'install_branch': 'chore/install-git-vendored',
-    'protected': [
-        '.vendored/**',
-        '.github/workflows/install-vendored.yml',
-        '.github/workflows/check-vendor.yml'
-    ],
-    'allowed': ['.vendored/config.json', '.vendored/.version']
+# v2 contract: install.sh does NOT self-register in config.json.
+# The framework handles registration after reading the manifest.
+
+# Write manifest (v2 contract)
+write_manifest() {{
+    if [ -n "${{VENDOR_MANIFEST:-}}" ]; then
+        printf '%s\\n' "${{INSTALLED_FILES[@]}}" > "$VENDOR_MANIFEST"
+    fi
+    printf '%s\\n' "${{INSTALLED_FILES[@]}}" | sort > .vendored/manifests/git-vendored.files
+    echo "$VERSION" > .vendored/manifests/git-vendored.version
 }}
-with open('.vendored/config.json', 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\\n')
-"
+
+write_manifest
 
 echo ""
 echo "Done! git-vendored v$VERSION installed."
@@ -116,11 +120,11 @@ echo "Done! git-vendored v$VERSION installed."
     return wrapper
 
 
-def run_installer(wrapper, version="0.1.0"):
+def run_installer(wrapper, version="0.1.0", env=None):
     """Run the mock installer."""
     result = subprocess.run(
         ["bash", str(wrapper), version],
-        capture_output=True, text=True
+        capture_output=True, text=True, env=env
     )
     return result
 
@@ -132,20 +136,23 @@ class TestInstaller:
 
     def test_installs_scripts(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
-        assert (tmp_repo / ".vendored" / "add").is_file()
-        assert (tmp_repo / ".vendored" / "update").is_file()
+        assert (tmp_repo / ".vendored" / "install").is_file()
         assert (tmp_repo / ".vendored" / "check").is_file()
+        assert (tmp_repo / ".vendored" / "remove").is_file()
 
     def test_scripts_are_executable(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
-        assert os.access(tmp_repo / ".vendored" / "add", os.X_OK)
-        assert os.access(tmp_repo / ".vendored" / "update", os.X_OK)
+        assert os.access(tmp_repo / ".vendored" / "install", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "check", os.X_OK)
+        assert os.access(tmp_repo / ".vendored" / "remove", os.X_OK)
 
-    def test_writes_version(self, mock_fetch, tmp_repo):
+    def test_does_not_write_deprecated_version(self, mock_fetch, tmp_repo):
+        """v2 contract: install.sh should NOT write .vendored/.version (uses manifests)."""
         run_installer(mock_fetch, "0.1.0")
-        version = (tmp_repo / ".vendored" / ".version").read_text().strip()
-        assert version == "0.1.0"
+        assert not (tmp_repo / ".vendored" / ".version").exists()
+        # Version should be in manifests instead
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.read_text().strip() == "0.1.0"
 
     def test_creates_config_if_missing(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
@@ -155,27 +162,22 @@ class TestInstaller:
         assert "vendors" in config
 
     def test_preserves_existing_config(self, mock_fetch, tmp_repo):
-        # Pre-create config with existing vendor
+        """install.sh should not modify existing config.json (v2: framework handles registration)."""
         (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
         existing = {"vendors": {"my-tool": {"repo": "me/my-tool"}}}
-        (tmp_repo / ".vendored" / "config.json").write_text(
-            json.dumps(existing, indent=2) + "\n"
-        )
+        original_text = json.dumps(existing, indent=2) + "\n"
+        (tmp_repo / ".vendored" / "config.json").write_text(original_text)
         run_installer(mock_fetch)
-        config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
-        # my-tool should still be present
-        assert "my-tool" in config["vendors"]
-        # git-vendored should be added
-        assert "git-vendored" in config["vendors"]
+        # Config should be unchanged — install.sh does not modify it
+        assert (tmp_repo / ".vendored" / "config.json").read_text() == original_text
 
-    def test_self_registers_in_config(self, mock_fetch, tmp_repo):
+    def test_does_not_self_register_in_config(self, mock_fetch, tmp_repo):
+        """v2 contract: install.sh must NOT self-register in config.json."""
         run_installer(mock_fetch)
         config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
-        gv = config["vendors"]["git-vendored"]
-        assert gv["repo"] == "mangimangi/git-vendored"
-        assert gv["install_branch"] == "chore/install-git-vendored"
-        assert ".vendored/**" in gv["protected"]
-        assert ".vendored/config.json" in gv["allowed"]
+        # The template config.json has an empty vendors dict
+        # install.sh should NOT have added a git-vendored entry
+        assert "git-vendored" not in config.get("vendors", {})
 
     def test_idempotent_reruns(self, mock_fetch, tmp_repo):
         """Running twice should not fail or corrupt state."""
@@ -183,31 +185,29 @@ class TestInstaller:
         assert result1.returncode == 0
         result2 = run_installer(mock_fetch, "0.2.0")
         assert result2.returncode == 0
-        version = (tmp_repo / ".vendored" / ".version").read_text().strip()
-        assert version == "0.2.0"
-
-    def test_version_file_updated_on_rerun(self, mock_fetch, tmp_repo):
-        run_installer(mock_fetch, "0.1.0")
-        run_installer(mock_fetch, "0.2.0")
-        version = (tmp_repo / ".vendored" / ".version").read_text().strip()
+        version = (tmp_repo / ".vendored" / "manifests" / "git-vendored.version").read_text().strip()
         assert version == "0.2.0"
 
     def test_exit_code_zero(self, mock_fetch, tmp_repo):
         result = run_installer(mock_fetch)
         assert result.returncode == 0
 
-    def test_cleans_up_old_install_script(self, mock_fetch, tmp_repo):
-        """rm -f .vendored/install removes the old script."""
+    def test_cleans_up_old_add_and_update(self, mock_fetch, tmp_repo):
+        """rm -f .vendored/add .vendored/update removes old scripts."""
         (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
-        old_install = tmp_repo / ".vendored" / "install"
-        old_install.write_text("#!/bin/bash\n# old install script")
-        assert old_install.is_file()
+        old_add = tmp_repo / ".vendored" / "add"
+        old_update = tmp_repo / ".vendored" / "update"
+        old_add.write_text("#!/usr/bin/env python3\n# old add script")
+        old_update.write_text("#!/usr/bin/env python3\n# old update script")
+        assert old_add.is_file()
+        assert old_update.is_file()
 
         run_installer(mock_fetch)
 
-        assert not old_install.exists()
-        # update should exist instead
-        assert (tmp_repo / ".vendored" / "update").is_file()
+        assert not old_add.exists()
+        assert not old_update.exists()
+        # install should exist instead
+        assert (tmp_repo / ".vendored" / "install").is_file()
 
     def test_updates_existing_workflow_templates(self, mock_fetch, tmp_repo):
         """Workflow templates are always updated, even if they already exist."""
@@ -222,12 +222,98 @@ class TestInstaller:
         content = workflow.read_text()
         # Should be replaced with the template content, not the stale content
         assert "# stale workflow content" not in content
-        assert "python3 .vendored/update" in content
+        assert "python3 .vendored/install" in content
 
-    def test_old_install_not_present_after_fresh_install(self, mock_fetch, tmp_repo):
-        """Fresh install should not have .vendored/install."""
+    def test_no_old_add_or_update_after_fresh_install(self, mock_fetch, tmp_repo):
+        """Fresh install should not have .vendored/add or .vendored/update."""
         run_installer(mock_fetch)
-        assert not (tmp_repo / ".vendored" / "install").exists()
+        assert not (tmp_repo / ".vendored" / "add").exists()
+        assert not (tmp_repo / ".vendored" / "update").exists()
+
+    def test_cleans_up_deprecated_version_file(self, mock_fetch, tmp_repo):
+        """Upgrading from v1 should delete .vendored/.version."""
+        (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
+        deprecated = tmp_repo / ".vendored" / ".version"
+        deprecated.write_text("0.0.1\n")
+        assert deprecated.is_file()
+
+        run_installer(mock_fetch, "0.2.0")
+
+        assert not deprecated.exists()
+        # Version should be in manifests
+        version = (tmp_repo / ".vendored" / "manifests" / "git-vendored.version").read_text().strip()
+        assert version == "0.2.0"
+
+    def test_reads_vendor_ref_env_var(self, mock_fetch, tmp_repo):
+        """VENDOR_REF env var should be used as version when set."""
+        env = os.environ.copy()
+        env["VENDOR_REF"] = "0.5.0"
+        result = run_installer(mock_fetch, "0.1.0", env=env)
+        assert result.returncode == 0
+        # VENDOR_REF takes priority over positional arg
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.read_text().strip() == "0.5.0"
+
+    def test_reads_vendor_repo_env_var(self, mock_fetch, tmp_repo):
+        """VENDOR_REPO env var should be used as repo when set."""
+        env = os.environ.copy()
+        env["VENDOR_REPO"] = "other-org/git-vendored"
+        result = run_installer(mock_fetch, "0.1.0", env=env)
+        assert result.returncode == 0
+
+
+class TestManifest:
+    """Verify v2 manifest contract in install.sh."""
+
+    def test_writes_manifest_files(self, mock_fetch, tmp_repo):
+        """install.sh should write .vendored/manifests/git-vendored.files."""
+        run_installer(mock_fetch, "0.1.0")
+        manifest_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.files"
+        assert manifest_path.is_file()
+        content = manifest_path.read_text()
+        assert ".vendored/install" in content
+        assert ".vendored/check" in content
+        assert ".vendored/remove" in content
+        assert ".vendored/hooks/pre-commit" in content
+        # .vendored/.version should NOT be in manifest (deprecated)
+        assert ".vendored/.version" not in content
+
+    def test_writes_manifest_version(self, mock_fetch, tmp_repo):
+        """install.sh should write .vendored/manifests/git-vendored.version."""
+        run_installer(mock_fetch, "0.1.0")
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.is_file()
+        assert version_path.read_text().strip() == "0.1.0"
+
+    def test_manifest_version_updated_on_rerun(self, mock_fetch, tmp_repo):
+        run_installer(mock_fetch, "0.1.0")
+        run_installer(mock_fetch, "0.2.0")
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.read_text().strip() == "0.2.0"
+
+    def test_manifest_includes_workflow_files(self, mock_fetch, tmp_repo):
+        run_installer(mock_fetch, "0.1.0")
+        manifest_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.files"
+        content = manifest_path.read_text()
+        assert ".github/workflows/install-vendored.yml" in content
+        assert ".github/workflows/check-vendor.yml" in content
+
+    def test_writes_to_vendor_manifest_env(self, mock_fetch, tmp_repo):
+        """When VENDOR_MANIFEST is set, install.sh writes to that path too."""
+        manifest_file = tmp_repo / "vendor_manifest.txt"
+        env = os.environ.copy()
+        env["VENDOR_MANIFEST"] = str(manifest_file)
+        run_installer(mock_fetch, "0.1.0", env=env)
+        assert manifest_file.is_file()
+        content = manifest_file.read_text()
+        assert ".vendored/install" in content
+
+    def test_manifest_files_sorted(self, mock_fetch, tmp_repo):
+        """Manifest file entries should be sorted."""
+        run_installer(mock_fetch, "0.1.0")
+        manifest_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.files"
+        lines = [l.strip() for l in manifest_path.read_text().strip().split("\n") if l.strip()]
+        assert lines == sorted(lines)
 
 
 class TestWorkflowTemplate:
@@ -249,27 +335,27 @@ class TestWorkflowTemplate:
                 return step
         raise KeyError(f"No step starting with {name_prefix!r}")
 
-    def test_update_step_provides_vendor_pat(self):
-        """Update step should expose VENDOR_PAT for private repo downloads."""
-        update_step = self._step("Run vendored update")
-        assert "VENDOR_PAT" in update_step["env"]
+    def test_install_step_provides_vendor_pat(self):
+        """Install step should expose VENDOR_PAT for private repo downloads."""
+        install_step = self._step("Run vendored install")
+        assert "VENDOR_PAT" in install_step["env"]
 
-    def test_update_step_provides_github_token(self):
-        """Update step should expose GITHUB_TOKEN for PR creation."""
-        update_step = self._step("Run vendored update")
-        assert update_step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    def test_install_step_provides_github_token(self):
+        """Install step should expose GITHUB_TOKEN for PR creation."""
+        install_step = self._step("Run vendored install")
+        assert install_step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
 
-    def test_update_step_uses_pr_flag(self):
-        """Update step must pass --pr flag for CI PR creation."""
-        update_step = self._step("Run vendored update")
-        assert "--pr" in update_step["run"]
+    def test_install_step_uses_pr_flag(self):
+        """Install step must pass --pr flag for CI PR creation."""
+        install_step = self._step("Run vendored install")
+        assert "--pr" in install_step["run"]
 
-    def test_update_step_references_vendored_update(self):
-        """Update step must call .vendored/update, not .vendored/install."""
-        update_step = self._step("Run vendored update")
-        run_script = update_step["run"]
-        assert "python3 .vendored/update" in run_script
-        assert "python3 .vendored/install" not in run_script
+    def test_install_step_references_vendored_install(self):
+        """Install step must call .vendored/install, not .vendored/update."""
+        install_step = self._step("Run vendored install")
+        run_script = install_step["run"]
+        assert "python3 .vendored/install" in run_script
+        assert "python3 .vendored/update" not in run_script
 
     def test_no_pr_creation_step(self):
         """PR creation logic is in the script, not a separate workflow step."""
