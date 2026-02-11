@@ -54,22 +54,22 @@ fetch_file() {{
 
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
-mkdir -p .vendored .github/workflows
+mkdir -p .vendored .vendored/hooks .github/workflows
 
-echo "Downloading .vendored/add..."
-fetch_file "templates/add" ".vendored/add"
-chmod +x .vendored/add
-
-echo "Downloading .vendored/update..."
-fetch_file "templates/update" ".vendored/update"
-chmod +x .vendored/update
+echo "Downloading .vendored/install..."
+fetch_file "templates/install" ".vendored/install"
+chmod +x .vendored/install
 
 echo "Downloading .vendored/check..."
 fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
 
-# Clean up old install script (renamed to update)
-rm -f .vendored/install
+# Clean up old add/update scripts (merged into install)
+rm -f .vendored/add .vendored/update
+
+echo "Downloading .vendored/hooks/pre-commit..."
+fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
+chmod +x .vendored/hooks/pre-commit
 
 echo "$VERSION" > .vendored/.version
 echo "Installed git-vendored v$VERSION"
@@ -132,14 +132,12 @@ class TestInstaller:
 
     def test_installs_scripts(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
-        assert (tmp_repo / ".vendored" / "add").is_file()
-        assert (tmp_repo / ".vendored" / "update").is_file()
+        assert (tmp_repo / ".vendored" / "install").is_file()
         assert (tmp_repo / ".vendored" / "check").is_file()
 
     def test_scripts_are_executable(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
-        assert os.access(tmp_repo / ".vendored" / "add", os.X_OK)
-        assert os.access(tmp_repo / ".vendored" / "update", os.X_OK)
+        assert os.access(tmp_repo / ".vendored" / "install", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "check", os.X_OK)
 
     def test_writes_version(self, mock_fetch, tmp_repo):
@@ -196,18 +194,22 @@ class TestInstaller:
         result = run_installer(mock_fetch)
         assert result.returncode == 0
 
-    def test_cleans_up_old_install_script(self, mock_fetch, tmp_repo):
-        """rm -f .vendored/install removes the old script."""
+    def test_cleans_up_old_add_and_update(self, mock_fetch, tmp_repo):
+        """rm -f .vendored/add .vendored/update removes old scripts."""
         (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
-        old_install = tmp_repo / ".vendored" / "install"
-        old_install.write_text("#!/bin/bash\n# old install script")
-        assert old_install.is_file()
+        old_add = tmp_repo / ".vendored" / "add"
+        old_update = tmp_repo / ".vendored" / "update"
+        old_add.write_text("#!/usr/bin/env python3\n# old add script")
+        old_update.write_text("#!/usr/bin/env python3\n# old update script")
+        assert old_add.is_file()
+        assert old_update.is_file()
 
         run_installer(mock_fetch)
 
-        assert not old_install.exists()
-        # update should exist instead
-        assert (tmp_repo / ".vendored" / "update").is_file()
+        assert not old_add.exists()
+        assert not old_update.exists()
+        # install should exist instead
+        assert (tmp_repo / ".vendored" / "install").is_file()
 
     def test_updates_existing_workflow_templates(self, mock_fetch, tmp_repo):
         """Workflow templates are always updated, even if they already exist."""
@@ -222,12 +224,13 @@ class TestInstaller:
         content = workflow.read_text()
         # Should be replaced with the template content, not the stale content
         assert "# stale workflow content" not in content
-        assert "python3 .vendored/update" in content
+        assert "python3 .vendored/install" in content
 
-    def test_old_install_not_present_after_fresh_install(self, mock_fetch, tmp_repo):
-        """Fresh install should not have .vendored/install."""
+    def test_no_old_add_or_update_after_fresh_install(self, mock_fetch, tmp_repo):
+        """Fresh install should not have .vendored/add or .vendored/update."""
         run_installer(mock_fetch)
-        assert not (tmp_repo / ".vendored" / "install").exists()
+        assert not (tmp_repo / ".vendored" / "add").exists()
+        assert not (tmp_repo / ".vendored" / "update").exists()
 
 
 class TestWorkflowTemplate:
@@ -249,27 +252,27 @@ class TestWorkflowTemplate:
                 return step
         raise KeyError(f"No step starting with {name_prefix!r}")
 
-    def test_update_step_provides_vendor_pat(self):
-        """Update step should expose VENDOR_PAT for private repo downloads."""
-        update_step = self._step("Run vendored update")
-        assert "VENDOR_PAT" in update_step["env"]
+    def test_install_step_provides_vendor_pat(self):
+        """Install step should expose VENDOR_PAT for private repo downloads."""
+        install_step = self._step("Run vendored install")
+        assert "VENDOR_PAT" in install_step["env"]
 
-    def test_update_step_provides_github_token(self):
-        """Update step should expose GITHUB_TOKEN for PR creation."""
-        update_step = self._step("Run vendored update")
-        assert update_step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    def test_install_step_provides_github_token(self):
+        """Install step should expose GITHUB_TOKEN for PR creation."""
+        install_step = self._step("Run vendored install")
+        assert install_step["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
 
-    def test_update_step_uses_pr_flag(self):
-        """Update step must pass --pr flag for CI PR creation."""
-        update_step = self._step("Run vendored update")
-        assert "--pr" in update_step["run"]
+    def test_install_step_uses_pr_flag(self):
+        """Install step must pass --pr flag for CI PR creation."""
+        install_step = self._step("Run vendored install")
+        assert "--pr" in install_step["run"]
 
-    def test_update_step_references_vendored_update(self):
-        """Update step must call .vendored/update, not .vendored/install."""
-        update_step = self._step("Run vendored update")
-        run_script = update_step["run"]
-        assert "python3 .vendored/update" in run_script
-        assert "python3 .vendored/install" not in run_script
+    def test_install_step_references_vendored_install(self):
+        """Install step must call .vendored/install, not .vendored/update."""
+        install_step = self._step("Run vendored install")
+        run_script = install_step["run"]
+        assert "python3 .vendored/install" in run_script
+        assert "python3 .vendored/update" not in run_script
 
     def test_no_pr_creation_step(self):
         """PR creation logic is in the script, not a separate workflow step."""

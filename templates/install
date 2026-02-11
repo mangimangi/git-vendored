@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Vendor update script.
+"""Unified vendor install command.
 
-Reads .vendored/config.json, resolves the target version for a vendor,
-downloads and runs its install.sh, and outputs structured results for
-PR creation.
+Idempotent: handles both first-time add and update flows. If the vendor is not
+registered, pre-validates the repo and post-validates the config entry. If
+already registered, resolves the target version and skips if already current.
 
 Usage:
-    python3 .vendored/update <vendor|all> [--version <version>]
+    python3 .vendored/install <owner/repo|vendor|all> [--version <version>]
+                              [--force] [--pr] [--name <name>]
 
 Output (key=value lines for workflow consumption):
     vendor=<name>
@@ -17,9 +18,11 @@ Output (key=value lines for workflow consumption):
 Environment:
     GITHUB_TOKEN - Auth for public repos
     VENDOR_PAT   - Auth for private repos (vendor.private: true)
+    GH_TOKEN     - Fallback auth token
 """
 
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -27,7 +30,12 @@ import sys
 import tempfile
 
 
-def load_config(config_path=".vendored/config.json"):
+CONFIG_PATH = ".vendored/config.json"
+
+
+# ── Config helpers ────────────────────────────────────────────────────────
+
+def load_config(config_path=CONFIG_PATH):
     """Load and return the vendored config."""
     if not os.path.isfile(config_path):
         print(f"::error::Config not found: {config_path}")
@@ -36,9 +44,18 @@ def load_config(config_path=".vendored/config.json"):
         return json.load(f)
 
 
-def get_auth_token(vendor_config):
+def save_config(config):
+    """Write config back to disk."""
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+
+
+# ── Auth helpers ──────────────────────────────────────────────────────────
+
+def get_auth_token(vendor_config=None):
     """Get the appropriate auth token for a vendor."""
-    if vendor_config.get("private"):
+    if vendor_config and vendor_config.get("private"):
         token = os.environ.get("VENDOR_PAT", "")
         if not token:
             print("::error::VENDOR_PAT required for private vendor repos")
@@ -47,7 +64,45 @@ def get_auth_token(vendor_config):
     return os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
 
 
-def resolve_version(vendor_name, vendor_config, requested_version, token):
+def _gh_env(token):
+    """Build environment dict with GH_TOKEN set."""
+    env = os.environ.copy()
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
+# ── Pre-validation (add path) ────────────────────────────────────────────
+
+def check_repo_exists(repo, token):
+    """Check that the GitHub repo exists and is accessible."""
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}", "--jq", ".full_name"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0:
+        print(f"::error::Cannot access repo: {repo}")
+        print("Ensure the repo exists and your GH_TOKEN has access.")
+        sys.exit(1)
+
+
+def check_install_sh(repo, token):
+    """Verify the repo has an install.sh at its root."""
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/install.sh", "--jq", ".name"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"::error::Repo does not implement git-vendored: {repo}")
+        print("Expected install.sh at repository root.")
+        sys.exit(1)
+
+
+# ── Version resolution ────────────────────────────────────────────────────
+
+def resolve_version(vendor_name, repo, requested_version, token):
     """Resolve the target version for a vendor.
 
     Strategy:
@@ -55,17 +110,13 @@ def resolve_version(vendor_name, vendor_config, requested_version, token):
     2. Try GitHub releases API for latest release tag
     3. Fall back to reading VERSION file from default branch
     """
-    repo = vendor_config["repo"]
-
     if requested_version and requested_version != "latest":
         return requested_version
 
-    # Try releases API
     version = _resolve_from_releases(repo, token)
     if version:
         return version
 
-    # Fallback: VERSION file on default branch
     version = _resolve_from_version_file(repo, token)
     if version:
         return version
@@ -82,9 +133,7 @@ def _resolve_from_releases(repo, token):
         capture_output=True, text=True, env=env
     )
     if result.returncode == 0 and result.stdout.strip():
-        tag = result.stdout.strip()
-        # Strip leading 'v' if present
-        return tag.lstrip("v")
+        return result.stdout.strip().lstrip("v")
     return None
 
 
@@ -96,7 +145,6 @@ def _resolve_from_version_file(repo, token):
         capture_output=True, text=True, env=env
     )
     if result.returncode == 0 and result.stdout.strip():
-        import base64
         try:
             content = base64.b64decode(result.stdout.strip()).decode().strip()
             return content
@@ -105,35 +153,20 @@ def _resolve_from_version_file(repo, token):
     return None
 
 
-def _gh_env(token):
-    """Build environment dict with GH_TOKEN set."""
-    env = os.environ.copy()
-    if token:
-        env["GH_TOKEN"] = token
-    return env
-
+# ── Version detection ─────────────────────────────────────────────────────
 
 def get_current_version(vendor_name, vendor_config):
-    """Read the currently installed version for a vendor.
-
-    Checks vendor-specific version file patterns:
-    - .<vendor_dir>/.version (e.g., .vendored/.version, .pearls/.prl-version)
-    """
-    # Common patterns for vendor version files
+    """Read the currently installed version for a vendor."""
     candidates = []
 
-    # Check if vendor has a known version file based on config patterns
     for pattern in vendor_config.get("allowed", []):
         if ".version" in pattern or "prl-version" in pattern:
-            # This is likely a version file
-            # Only use if it's a concrete path (no globs)
             if "*" not in pattern and "?" not in pattern:
                 candidates.append(pattern)
 
-    # Also try standard convention: first protected dir + .version
     for pattern in vendor_config.get("protected", []):
         if pattern.endswith("/**"):
-            base_dir = pattern[:-3]  # strip /**
+            base_dir = pattern[:-3]
             candidates.append(f"{base_dir}/.version")
             break
 
@@ -144,12 +177,12 @@ def get_current_version(vendor_name, vendor_config):
     return None
 
 
-def download_and_run_install(vendor_name, vendor_config, version, token):
+# ── Install execution ─────────────────────────────────────────────────────
+
+def download_and_run_install(repo, version, token):
     """Download the vendor's install.sh and run it."""
-    repo = vendor_config["repo"]
     env = _gh_env(token)
 
-    # Download install.sh at the target version ref
     ref = f"v{version}"
     result = subprocess.run(
         ["gh", "api", f"repos/{repo}/contents/install.sh?ref={ref}",
@@ -158,7 +191,6 @@ def download_and_run_install(vendor_name, vendor_config, version, token):
     )
 
     if result.returncode != 0 or not result.stdout.strip():
-        # Try without v prefix
         result = subprocess.run(
             ["gh", "api", f"repos/{repo}/contents/install.sh?ref={version}",
              "--jq", ".content"],
@@ -167,13 +199,10 @@ def download_and_run_install(vendor_name, vendor_config, version, token):
 
     if result.returncode != 0 or not result.stdout.strip():
         print(f"::error::Failed to download install.sh from {repo} at {ref}")
-        print(f"  stderr: {result.stderr.strip()}")
         sys.exit(1)
 
-    import base64
     install_script = base64.b64decode(result.stdout.strip()).decode()
 
-    # Write to temp file and execute
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(install_script)
         temp_path = f.name
@@ -182,27 +211,109 @@ def download_and_run_install(vendor_name, vendor_config, version, token):
         run_env = env.copy()
         run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
 
-        result = subprocess.run(
+        run_result = subprocess.run(
             ["bash", temp_path, version],
             capture_output=True, text=True, env=run_env
         )
-        print(result.stdout)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-        if result.returncode != 0:
-            print(f"::error::install.sh failed for {vendor_name} (exit {result.returncode})")
+        if run_result.stdout:
+            print(run_result.stdout, end="")
+        if run_result.stderr:
+            print(run_result.stderr, end="", file=sys.stderr)
+        if run_result.returncode != 0:
+            print(f"::error::install.sh failed for {repo} (exit {run_result.returncode})")
             sys.exit(1)
     finally:
         os.unlink(temp_path)
 
 
-def install_vendor(vendor_name, vendor_config, requested_version):
-    """Install or update a single vendor. Returns result dict."""
+# ── Post-validation (add path) ────────────────────────────────────────────
+
+def find_new_entry(before_vendors, after_vendors):
+    """Find the vendor key that was added between before and after configs."""
+    new_keys = set(after_vendors.keys()) - set(before_vendors.keys())
+    if not new_keys:
+        return None, None
+    key = next(iter(new_keys))
+    return key, after_vendors[key]
+
+
+def validate_entry(vendor_name, entry):
+    """Validate that a new vendor entry has all required fields."""
+    required = ["repo", "protected", "install_branch"]
+    missing = [f for f in required if f not in entry]
+    if missing:
+        print(f"::error::Vendor '{vendor_name}' missing required fields: {', '.join(missing)}")
+        print("install.sh must self-register with: repo, protected, install_branch")
+        sys.exit(1)
+
+
+# ── Core install logic ────────────────────────────────────────────────────
+
+def install_new_vendor(repo, version, token, name=None):
+    """First-time add: pre-validate, run install.sh, post-validate."""
+    # Pre-validate
+    check_repo_exists(repo, token)
+    check_install_sh(repo, token)
+    resolved_version = resolve_version(repo, repo, version, token)
+
+    config = load_config()
+    vendors = config.get("vendors", {})
+
+    # Check not already registered
+    if name and name in vendors:
+        print(f"::error::Vendor '{name}' is already registered.")
+        print("Use .vendored/install <vendor> to update existing vendors.")
+        sys.exit(1)
+
+    if not name:
+        for vname, vcfg in vendors.items():
+            if vcfg.get("repo") == repo:
+                print(f"::error::Vendor '{vname}' already registered for {repo}.")
+                print("Use .vendored/install <vendor> to update existing vendors.")
+                sys.exit(1)
+
+    # Snapshot config before
+    before_vendors = dict(vendors)
+
+    # Run install.sh
+    print(f"Adding {repo} v{resolved_version}...")
+    download_and_run_install(repo, resolved_version, token)
+
+    # Post-validate
+    after_config = load_config()
+    after_vendors = after_config.get("vendors", {})
+
+    new_key, new_entry = find_new_entry(before_vendors, after_vendors)
+    if new_key is None:
+        print("::error::install.sh did not register a vendor in config.")
+        print("install.sh must self-register by adding an entry to .vendored/config.json")
+        sys.exit(1)
+
+    validate_entry(new_key, new_entry)
+
+    print(f"\nAdded vendor: {new_key}")
+    print(f"  repo: {new_entry['repo']}")
+    print(f"  version: {resolved_version}")
+    print(f"  protected: {', '.join(new_entry.get('protected', []))}")
+    if new_entry.get("allowed"):
+        print(f"  allowed: {', '.join(new_entry['allowed'])}")
+
+    return {
+        "vendor": new_key,
+        "old_version": "none",
+        "new_version": resolved_version,
+        "changed": True,
+    }
+
+
+def install_existing_vendor(vendor_name, vendor_config, requested_version, force=False):
+    """Update path: resolve version, skip if current, run install.sh."""
     token = get_auth_token(vendor_config)
-    target_version = resolve_version(vendor_name, vendor_config, requested_version, token)
+    repo = vendor_config["repo"]
+    target_version = resolve_version(vendor_name, repo, requested_version, token)
     current_version = get_current_version(vendor_name, vendor_config)
 
-    if current_version == target_version:
+    if current_version == target_version and not force:
         print(f"{vendor_name}: already at v{target_version}, skipping")
         return {
             "vendor": vendor_name,
@@ -212,7 +323,7 @@ def install_vendor(vendor_name, vendor_config, requested_version):
         }
 
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
-    download_and_run_install(vendor_name, vendor_config, target_version, token)
+    download_and_run_install(repo, target_version, token)
 
     return {
         "vendor": vendor_name,
@@ -221,6 +332,8 @@ def install_vendor(vendor_name, vendor_config, requested_version):
         "changed": True,
     }
 
+
+# ── Output ────────────────────────────────────────────────────────────────
 
 def write_github_output(pairs):
     """Write key=value pairs to $GITHUB_OUTPUT file if env var is set."""
@@ -258,7 +371,6 @@ def output_results(results):
     if len(results) == 1:
         output_result(results[0])
     else:
-        # For 'all' mode, output JSON array of changed vendors
         print(f"results={json.dumps(changed)}")
         print(f"changed_count={len(changed)}")
 
@@ -269,12 +381,10 @@ def output_results(results):
         })
 
 
-def get_pr_metadata(results):
-    """Determine PR branch, title, and body from update results.
+# ── PR creation ───────────────────────────────────────────────────────────
 
-    Returns dict with: branch, title, body, automerge.
-    Returns None if no vendors changed.
-    """
+def get_pr_metadata(results):
+    """Determine PR branch, title, and body from install results."""
     changed = [r for r in results if r["changed"]]
     if not changed:
         return None
@@ -283,7 +393,6 @@ def get_pr_metadata(results):
     vendors = config.get("vendors", {})
 
     if len(results) == 1:
-        # Single vendor mode
         r = changed[0]
         vendor_config = vendors.get(r["vendor"], {})
         install_branch = vendor_config.get(
@@ -299,7 +408,6 @@ def get_pr_metadata(results):
             "automerge": vendor_config.get("automerge", False),
         }
     else:
-        # Multi-vendor mode
         vendor_versions = ", ".join(
             f"{r['vendor']} v{r['new_version']}" for r in changed
         )
@@ -312,11 +420,7 @@ def get_pr_metadata(results):
 
 
 def create_pull_request(results):
-    """Create a PR with vendor update changes.
-
-    Handles git branch/commit/push, PR creation via gh CLI, and automerge.
-    Uses GITHUB_TOKEN for repo operations (not vendor-specific PAT).
-    """
+    """Create a PR with vendor install changes."""
     meta = get_pr_metadata(results)
     if meta is None:
         print("No vendor changes to create PR for")
@@ -326,14 +430,11 @@ def create_pull_request(results):
     title = meta["title"]
     body = meta["body"]
 
-    # Environment for gh CLI: prefer GITHUB_TOKEN (repo token) over GH_TOKEN
-    # which may be a vendor-specific PAT
     gh_env = os.environ.copy()
     github_token = os.environ.get("GITHUB_TOKEN", "")
     if github_token:
         gh_env["GH_TOKEN"] = github_token
 
-    # Configure git identity
     subprocess.run(
         ["git", "config", "user.name", "github-actions[bot]"],
         check=True, capture_output=True,
@@ -344,14 +445,12 @@ def create_pull_request(results):
         check=True, capture_output=True,
     )
 
-    # Create branch, stage, commit, push
     subprocess.run(
         ["git", "checkout", "-b", branch],
         check=True, capture_output=True,
     )
     subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
-    # Check if there are actual staged changes
     diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
     if diff_result.returncode == 0:
         print("No changes to commit")
@@ -366,7 +465,6 @@ def create_pull_request(results):
         check=True, capture_output=True,
     )
 
-    # Create PR, handle "already exists" gracefully
     pr_result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body,
          "--head", branch, "--base", "main"],
@@ -384,7 +482,6 @@ def create_pull_request(results):
     pr_url = pr_result.stdout.strip()
     print(f"Created PR: {pr_url}")
 
-    # Automerge when vendor config has "automerge": true (single vendor only)
     if meta["automerge"]:
         subprocess.run(
             ["gh", "pr", "merge", pr_url, "--auto", "--squash"],
@@ -394,39 +491,71 @@ def create_pull_request(results):
     return pr_url
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────
+
+def _is_repo_spec(arg):
+    """Check if an argument looks like owner/repo."""
+    return "/" in arg and not arg.startswith("-")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Install or update vendored tools")
-    parser.add_argument("vendor", help='Vendor name or "all"')
+    parser = argparse.ArgumentParser(
+        description="Install or update vendored tools"
+    )
+    parser.add_argument(
+        "target",
+        help='owner/repo (new vendor), vendor name, or "all"'
+    )
     parser.add_argument(
         "--version", default="latest",
         help="Version to install (default: latest)"
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help="Force reinstall even if already at target version"
+    )
+    parser.add_argument(
         "--pr", action="store_true",
         help="Create a PR with the changes (for CI use)"
+    )
+    parser.add_argument(
+        "--name", default=None,
+        help="Override the vendor key name (new vendor only)"
     )
     args = parser.parse_args()
 
     config = load_config()
     vendors = config.get("vendors", {})
 
-    if not vendors:
-        print("No vendors configured in .vendored/config.json")
-        sys.exit(0)
-
-    if args.vendor == "all":
+    if args.target == "all":
+        # Update all registered vendors
+        if not vendors:
+            print("No vendors configured in .vendored/config.json")
+            sys.exit(0)
         results = []
         for name, vcfg in vendors.items():
-            results.append(install_vendor(name, vcfg, args.version))
+            results.append(
+                install_existing_vendor(name, vcfg, args.version, args.force)
+            )
         output_results(results)
-    else:
-        if args.vendor not in vendors:
-            print(f"::error::Unknown vendor: {args.vendor}")
-            print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
-            sys.exit(1)
-        result = install_vendor(args.vendor, vendors[args.vendor], args.version)
+    elif _is_repo_spec(args.target):
+        # New vendor (owner/repo format) — add path
+        token = get_auth_token()
+        result = install_new_vendor(args.target, args.version, token, args.name)
         output_result(result)
         results = [result]
+    elif args.target in vendors:
+        # Existing vendor by name — update path
+        result = install_existing_vendor(
+            args.target, vendors[args.target], args.version, args.force
+        )
+        output_result(result)
+        results = [result]
+    else:
+        print(f"::error::Unknown vendor: {args.target}")
+        print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
+        print("To add a new vendor, use: .vendored/install owner/repo")
+        sys.exit(1)
 
     if args.pr:
         create_pull_request(results)

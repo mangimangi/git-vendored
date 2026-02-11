@@ -9,12 +9,12 @@
 #              Falls back to curl for public repos when not set.
 #
 # Behavior:
-#   - Always updates: .vendored/add, .vendored/update, .vendored/check,
+#   - Always updates: .vendored/install, .vendored/check,
 #     .vendored/hooks/pre-commit, .vendored/.version
 #   - Always updates: workflow templates in .github/workflows/
 #   - Preserves .vendored/config.json (only creates if missing)
 #   - Self-registers git-vendored as a vendor in .vendored/config.json
-#   - Cleans up old .vendored/install (renamed to .vendored/update)
+#   - Cleans up old .vendored/add and .vendored/update (merged into install)
 #
 set -euo pipefail
 
@@ -41,20 +41,16 @@ echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 mkdir -p .vendored .vendored/hooks .github/workflows
 
 # Download vendored scripts
-echo "Downloading .vendored/add..."
-fetch_file "templates/add" ".vendored/add"
-chmod +x .vendored/add
-
-echo "Downloading .vendored/update..."
-fetch_file "templates/update" ".vendored/update"
-chmod +x .vendored/update
+echo "Downloading .vendored/install..."
+fetch_file "templates/install" ".vendored/install"
+chmod +x .vendored/install
 
 echo "Downloading .vendored/check..."
 fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
 
-# Clean up old install script (renamed to update)
-rm -f .vendored/install
+# Clean up old add/update scripts (merged into install)
+rm -f .vendored/add .vendored/update
 
 echo "Downloading .vendored/hooks/pre-commit..."
 fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
