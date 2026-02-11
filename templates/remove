@@ -3,9 +3,8 @@
 
 Removes a vendored tool by deleting its files and config entry.
 
-If a manifest exists at .vendored/manifests/<vendor>.files, uses exact file
-paths for clean removal. Without a manifest, uses config 'protected' patterns
-to find files to remove (interactive confirmation required).
+Requires a manifest at .vendored/manifests/<vendor>.files for exact file
+tracking. Errors if no manifest exists — pattern-based removal is too risky.
 
 Usage:
     python3 .vendored/remove <vendor> [--force]
@@ -15,7 +14,6 @@ Options:
 """
 
 import argparse
-import fnmatch
 import json
 import os
 import sys
@@ -50,70 +48,26 @@ def read_manifest(vendor_name):
         return [line.strip() for line in f if line.strip()]
 
 
-def find_files_by_patterns(patterns):
-    """Walk the filesystem and find files matching any of the glob patterns.
-
-    Used as a fallback when no manifest exists.
-    """
-    matches = []
-    for root, dirs, files in os.walk("."):
-        for filename in files:
-            filepath = os.path.join(root, filename)
-            # Normalize path: strip leading ./
-            if filepath.startswith("./"):
-                filepath = filepath[2:]
-            for pattern in patterns:
-                if fnmatch.fnmatch(filepath, pattern):
-                    matches.append(filepath)
-                    break
-                # Handle ** patterns
-                if "**" in pattern:
-                    prefix = pattern.split("**")[0]
-                    if filepath.startswith(prefix):
-                        matches.append(filepath)
-                        break
-    return sorted(matches)
-
-
-def get_files_to_remove(vendor_name, vendor_config):
+def get_files_to_remove(vendor_name):
     """Determine which files to remove for a vendor.
 
-    Returns (files, source) where source is 'manifest' or 'patterns'.
+    Requires a manifest. Returns list of files to delete.
+    Exits with error if no manifest exists.
     """
     manifest_files = read_manifest(vendor_name)
-    if manifest_files is not None:
-        # Also include the manifest files themselves
-        extra = [
-            os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"),
-            os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"),
-        ]
-        all_files = manifest_files + [f for f in extra if os.path.isfile(f)]
-        return all_files, "manifest"
+    if manifest_files is None:
+        print(f"::error::No manifest found for vendor '{vendor_name}'")
+        print(f"Expected: {MANIFESTS_DIR}/{vendor_name}.files")
+        print("Cannot safely remove without a manifest. "
+              "Re-install the vendor first to generate a manifest, then remove.")
+        sys.exit(1)
 
-    # Fallback: scan filesystem using protected patterns
-    patterns = vendor_config.get("protected", [])
-    allowed = vendor_config.get("allowed", [])
-    if not patterns:
-        return [], "patterns"
-
-    # Find all files matching protected patterns, excluding allowed
-    found = find_files_by_patterns(patterns)
-    # Exclude allowed files
-    files = []
-    for f in found:
-        is_allowed = False
-        for pattern in allowed:
-            if fnmatch.fnmatch(f, pattern):
-                is_allowed = True
-                break
-            if "**" in pattern:
-                prefix = pattern.split("**")[0]
-                if f.startswith(prefix):
-                    is_allowed = True
-                    break
-        if not is_allowed:
-            files.append(f)
-    return files, "patterns"
+    # Also include the manifest files themselves
+    extra = [
+        os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"),
+        os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"),
+    ]
+    return manifest_files + [f for f in extra if os.path.isfile(f)]
 
 
 def remove_files(files):
@@ -160,19 +114,9 @@ def main():
         print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
         sys.exit(1)
 
-    vendor_config = vendors[args.vendor]
-    files, source = get_files_to_remove(args.vendor, vendor_config)
+    files = get_files_to_remove(args.vendor)
 
-    if not files:
-        print(f"No files found for vendor '{args.vendor}'")
-        # Still remove the config entry
-        del vendors[args.vendor]
-        config["vendors"] = vendors
-        save_config(config)
-        print(f"Removed '{args.vendor}' from config.")
-        return
-
-    print(f"Files to remove for '{args.vendor}' ({source}):")
+    print(f"Files to remove for '{args.vendor}':")
     for f in files:
         exists = os.path.isfile(f)
         print(f"  {'  ' if exists else '? '}{f}")
@@ -194,7 +138,7 @@ def main():
     config["vendors"] = vendors
     save_config(config)
 
-    print(f"\nRemoved {removed} files and unregistered '{args.vendor}'.")
+    print(f"\nRemoved vendor: {args.vendor} ({removed} files deleted)")
 
 
 if __name__ == "__main__":
