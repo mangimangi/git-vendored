@@ -100,25 +100,8 @@ install_workflow() {{
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
 
-python3 -c "
-import json
-with open('.vendored/config.json') as f:
-    config = json.load(f)
-config.setdefault('vendors', {{}})
-config['vendors']['git-vendored'] = {{
-    'repo': '$VENDORED_REPO',
-    'install_branch': 'chore/install-git-vendored',
-    'protected': [
-        '.vendored/**',
-        '.github/workflows/install-vendored.yml',
-        '.github/workflows/check-vendor.yml'
-    ],
-    'allowed': ['.vendored/config.json', '.vendored/.version']
-}}
-with open('.vendored/config.json', 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\\n')
-"
+# v2 contract: install.sh does NOT self-register in config.json.
+# The framework handles registration after reading the manifest.
 
 # Write manifest (v2 contract)
 write_manifest() {{
@@ -177,27 +160,22 @@ class TestInstaller:
         assert "vendors" in config
 
     def test_preserves_existing_config(self, mock_fetch, tmp_repo):
-        # Pre-create config with existing vendor
+        """install.sh should not modify existing config.json (v2: framework handles registration)."""
         (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
         existing = {"vendors": {"my-tool": {"repo": "me/my-tool"}}}
-        (tmp_repo / ".vendored" / "config.json").write_text(
-            json.dumps(existing, indent=2) + "\n"
-        )
+        original_text = json.dumps(existing, indent=2) + "\n"
+        (tmp_repo / ".vendored" / "config.json").write_text(original_text)
         run_installer(mock_fetch)
-        config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
-        # my-tool should still be present
-        assert "my-tool" in config["vendors"]
-        # git-vendored should be added
-        assert "git-vendored" in config["vendors"]
+        # Config should be unchanged — install.sh does not modify it
+        assert (tmp_repo / ".vendored" / "config.json").read_text() == original_text
 
-    def test_self_registers_in_config(self, mock_fetch, tmp_repo):
+    def test_does_not_self_register_in_config(self, mock_fetch, tmp_repo):
+        """v2 contract: install.sh must NOT self-register in config.json."""
         run_installer(mock_fetch)
         config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
-        gv = config["vendors"]["git-vendored"]
-        assert gv["repo"] == "mangimangi/git-vendored"
-        assert gv["install_branch"] == "chore/install-git-vendored"
-        assert ".vendored/**" in gv["protected"]
-        assert ".vendored/config.json" in gv["allowed"]
+        # The template config.json has an empty vendors dict
+        # install.sh should NOT have added a git-vendored entry
+        assert "git-vendored" not in config.get("vendors", {})
 
     def test_idempotent_reruns(self, mock_fetch, tmp_repo):
         """Running twice should not fail or corrupt state."""

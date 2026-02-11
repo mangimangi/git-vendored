@@ -95,26 +95,8 @@ install_workflow() {
 install_workflow "install-vendored.yml"
 install_workflow "check-vendor.yml"
 
-# Self-register git-vendored as a vendor in config.json
-python3 -c "
-import json
-with open('.vendored/config.json') as f:
-    config = json.load(f)
-config.setdefault('vendors', {})
-config['vendors']['git-vendored'] = {
-    'repo': '$VENDORED_REPO',
-    'install_branch': 'chore/install-git-vendored',
-    'protected': [
-        '.vendored/**',
-        '.github/workflows/install-vendored.yml',
-        '.github/workflows/check-vendor.yml'
-    ],
-    'allowed': ['.vendored/config.json', '.vendored/.version']
-}
-with open('.vendored/config.json', 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
-"
+# v2 contract: install.sh does NOT self-register in config.json.
+# The framework handles registration after reading the manifest.
 
 # Write manifest (v2 contract)
 write_manifest() {
