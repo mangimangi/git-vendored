@@ -31,13 +31,34 @@ import tempfile
 
 
 CONFIG_PATH = ".vendored/config.json"
+CONFIGS_DIR = ".vendored/configs"
 MANIFESTS_DIR = ".vendored/manifests"
 
 
 # ── Config helpers ────────────────────────────────────────────────────────
 
 def load_config(config_path=CONFIG_PATH):
-    """Load and return the vendored config."""
+    """Load and return the vendored config.
+
+    Scans .vendored/configs/ for per-vendor <vendor>.json files first.
+    Falls back to monolithic config.json if configs/ dir doesn't exist
+    or has no .json files.
+
+    Return format: {"vendors": {"name": {...}, ...}}
+    """
+    # Try per-vendor configs first
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            vendors = {}
+            for filename in sorted(json_files):
+                vendor_name = filename[:-5]  # strip .json
+                filepath = os.path.join(CONFIGS_DIR, filename)
+                with open(filepath) as f:
+                    vendors[vendor_name] = json.load(f)
+            return {"vendors": vendors}
+
+    # Fallback to monolithic config.json
     if not os.path.isfile(config_path):
         print(f"::error::Config not found: {config_path}")
         sys.exit(1)
@@ -45,8 +66,35 @@ def load_config(config_path=CONFIG_PATH):
         return json.load(f)
 
 
+def save_vendor_config(vendor_name, vendor_config):
+    """Write a single vendor's config to configs/<vendor>.json."""
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    with open(filepath, "w") as f:
+        json.dump(vendor_config, f, indent=2)
+        f.write("\n")
+
+
+def delete_vendor_config(vendor_name):
+    """Delete a vendor's config file from configs/."""
+    filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    if os.path.isfile(filepath):
+        os.remove(filepath)
+
+
 def save_config(config):
-    """Write config back to disk."""
+    """Write config back to disk.
+
+    If per-vendor configs/ is in use, writes individual files.
+    Otherwise writes monolithic config.json.
+    """
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            for vendor_name, vendor_config in config.get("vendors", {}).items():
+                save_vendor_config(vendor_name, vendor_config)
+            return
+
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
@@ -238,11 +286,15 @@ def get_current_version(vendor_name, vendor_config=None):
 
 # ── Install execution ─────────────────────────────────────────────────────
 
-def download_and_run_install(repo, version, token):
+def download_and_run_install(repo, version, token, vendor_name=None, vendor_config=None):
     """Download the vendor's install.sh and run it.
 
-    Sets VENDOR_REPO, VENDOR_REF, and VENDOR_MANIFEST env vars for v2
-    contract. Still passes version as positional arg for v1 backwards compat.
+    Sets VENDOR_REPO, VENDOR_REF, VENDOR_MANIFEST, and VENDOR_INSTALL_DIR
+    env vars for v2 contract. Still passes version as positional arg for
+    v1 backwards compat.
+
+    VENDOR_INSTALL_DIR is set to .vendored/pkg/<vendor>/ unless the vendor
+    has dogfood: true (dogfood vendors install into framework paths).
 
     Returns: list of manifest files if install.sh wrote a manifest, else None.
     """
@@ -276,6 +328,13 @@ def download_and_run_install(repo, version, token):
     manifest_fd, manifest_path = tempfile.mkstemp(suffix=".manifest")
     os.close(manifest_fd)
 
+    # Determine install dir (skip for dogfood vendors)
+    install_dir = None
+    is_dogfood = vendor_config.get("dogfood", False) if vendor_config else False
+    if vendor_name and not is_dogfood:
+        install_dir = f".vendored/pkg/{vendor_name}"
+        os.makedirs(install_dir, exist_ok=True)
+
     try:
         run_env = env.copy()
         run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
@@ -283,6 +342,8 @@ def download_and_run_install(repo, version, token):
         run_env["VENDOR_REPO"] = repo
         run_env["VENDOR_REF"] = ref
         run_env["VENDOR_MANIFEST"] = manifest_path
+        if install_dir:
+            run_env["VENDOR_INSTALL_DIR"] = install_dir
 
         run_result = subprocess.run(
             ["bash", script_path, version],
@@ -358,9 +419,10 @@ def install_new_vendor(repo, version, token, name=None):
     # Snapshot config before
     before_vendors = dict(vendors)
 
-    # Run install.sh
+    # Run install.sh (no vendor_config for new vendors — they don't have one yet)
     print(f"Adding {repo} v{resolved_version}...")
-    manifest_files = download_and_run_install(repo, resolved_version, token)
+    manifest_files = download_and_run_install(repo, resolved_version, token,
+                                              vendor_name=name)
 
     # Post-validate: reload config and find new entry
     after_config = load_config()
@@ -414,7 +476,9 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version, force
         }
 
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
-    manifest_files = download_and_run_install(repo, target_version, token)
+    manifest_files = download_and_run_install(repo, target_version, token,
+                                              vendor_name=vendor_name,
+                                              vendor_config=vendor_config)
 
     # Process manifest if install.sh wrote one
     if manifest_files:
@@ -588,6 +652,51 @@ def create_pull_request(results):
     return pr_url
 
 
+# ── Config migration ──────────────────────────────────────────────────────
+
+def migrate_config(raw_config):
+    """Split monolithic config.json vendors into individual configs/<vendor>.json.
+
+    Called when config.json has a 'vendors' key and configs/ has no .json files.
+    Idempotent: running twice doesn't duplicate or corrupt data.
+    """
+    vendors = raw_config.get("vendors", {})
+    if not vendors:
+        return
+
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    for vendor_name, vendor_config in vendors.items():
+        filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+        with open(filepath, "w") as f:
+            json.dump(vendor_config, f, indent=2)
+            f.write("\n")
+        print(f"  Migrated config: {vendor_name} -> {filepath}", file=sys.stderr)
+
+    # Remove vendors key from config.json (file remains for framework-level use)
+    del raw_config["vendors"]
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(raw_config, f, indent=2)
+        f.write("\n")
+
+    print(f"Config migration complete: {len(vendors)} vendor(s) split into {CONFIGS_DIR}/",
+          file=sys.stderr)
+
+
+def _should_migrate_config():
+    """Check if config migration is needed."""
+    if not os.path.isfile(CONFIG_PATH):
+        return False
+    # Check if configs/ already has .json files
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            return False
+    # Check if monolithic config has vendors
+    with open(CONFIG_PATH) as f:
+        raw = json.load(f)
+    return "vendors" in raw and bool(raw["vendors"])
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def _is_repo_spec(arg):
@@ -620,6 +729,12 @@ def main():
         help="Override the vendor key name (new vendor only)"
     )
     args = parser.parse_args()
+
+    # Migrate monolithic config.json to per-vendor configs/ if needed
+    if _should_migrate_config():
+        with open(CONFIG_PATH) as f:
+            raw = json.load(f)
+        migrate_config(raw)
 
     config = load_config()
     vendors = config.get("vendors", {})

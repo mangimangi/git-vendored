@@ -55,7 +55,7 @@ fetch_file() {{
 
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
-mkdir -p .vendored .vendored/hooks .vendored/manifests .github/workflows
+mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .github/workflows
 
 echo "Downloading .vendored/install..."
 fetch_file "templates/install" ".vendored/install"
@@ -145,6 +145,16 @@ class TestInstaller:
         assert os.access(tmp_repo / ".vendored" / "install", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "check", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "remove", os.X_OK)
+
+    def test_creates_configs_directory(self, mock_fetch, tmp_repo):
+        """install.sh creates .vendored/configs/ directory."""
+        run_installer(mock_fetch)
+        assert (tmp_repo / ".vendored" / "configs").is_dir()
+
+    def test_creates_pkg_directory(self, mock_fetch, tmp_repo):
+        """install.sh creates .vendored/pkg/ directory."""
+        run_installer(mock_fetch)
+        assert (tmp_repo / ".vendored" / "pkg").is_dir()
 
     def test_does_not_write_deprecated_version(self, mock_fetch, tmp_repo):
         """v2 contract: install.sh should NOT write .vendored/.version (uses manifests)."""

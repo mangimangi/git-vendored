@@ -28,8 +28,29 @@ import subprocess
 import sys
 
 
+CONFIGS_DIR = ".vendored/configs"
+
+
 def load_config(config_path=".vendored/config.json"):
-    """Load and return the vendored config."""
+    """Load and return the vendored config.
+
+    Scans .vendored/configs/ for per-vendor <vendor>.json files first.
+    Falls back to monolithic config.json if configs/ dir doesn't exist
+    or has no .json files.
+    """
+    # Try per-vendor configs first
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            vendors = {}
+            for filename in sorted(json_files):
+                vendor_name = filename[:-5]  # strip .json
+                filepath = os.path.join(CONFIGS_DIR, filename)
+                with open(filepath) as f:
+                    vendors[vendor_name] = json.load(f)
+            return {"vendors": vendors}
+
+    # Fallback to monolithic config.json
     if not os.path.isfile(config_path):
         print(f"Config not found: {config_path}")
         sys.exit(0)

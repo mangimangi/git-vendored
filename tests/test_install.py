@@ -83,6 +83,86 @@ class TestLoadConfig:
             inst.load_config("/nonexistent/config.json")
         assert exc_info.value.code == 1
 
+    def test_loads_per_vendor_configs(self, tmp_repo):
+        """load_config() scans configs/ for per-vendor .json files."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        (configs_dir / "other.json").write_text(json.dumps(EXISTING_VENDOR))
+        config = inst.load_config()
+        assert "vendors" in config
+        assert "tool" in config["vendors"]
+        assert "other" in config["vendors"]
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+
+    def test_per_vendor_configs_take_priority(self, tmp_repo, make_config):
+        """Per-vendor configs take priority over monolithic config.json."""
+        make_config({"vendors": {"old": SAMPLE_VENDOR}})
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "new-tool.json").write_text(json.dumps(EXISTING_VENDOR))
+        config = inst.load_config()
+        assert "new-tool" in config["vendors"]
+        assert "old" not in config["vendors"]
+
+    def test_empty_configs_dir_falls_back(self, tmp_repo, make_config):
+        """Empty configs/ dir falls back to monolithic config.json."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        (tmp_repo / ".vendored" / "configs").mkdir(parents=True)
+        config = inst.load_config()
+        assert "tool" in config["vendors"]
+
+    def test_vendor_name_from_filename(self, tmp_repo):
+        """Vendor name is derived from filename (e.g. pearls.json -> pearls)."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "my-vendor.json").write_text(json.dumps(SAMPLE_VENDOR))
+        config = inst.load_config()
+        assert "my-vendor" in config["vendors"]
+
+
+# ── Tests: save_config ────────────────────────────────────────────────────
+
+class TestSaveConfig:
+    def test_saves_monolithic_config(self, tmp_repo, make_config):
+        """save_config writes monolithic config.json when configs/ not in use."""
+        make_config({"vendors": {}})
+        config = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.save_config(config)
+        loaded = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "tool" in loaded["vendors"]
+
+    def test_saves_per_vendor_configs(self, tmp_repo):
+        """save_config writes individual files when configs/ dir is in use."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "existing.json").write_text(json.dumps(EXISTING_VENDOR))
+        config = {"vendors": {"tool": SAMPLE_VENDOR, "existing": EXISTING_VENDOR}}
+        inst.save_config(config)
+        assert (configs_dir / "tool.json").is_file()
+        loaded = json.loads((configs_dir / "tool.json").read_text())
+        assert loaded["repo"] == "owner/tool"
+
+    def test_save_vendor_config(self, tmp_repo):
+        """save_vendor_config writes individual vendor config."""
+        inst.save_vendor_config("tool", SAMPLE_VENDOR)
+        filepath = tmp_repo / ".vendored" / "configs" / "tool.json"
+        assert filepath.is_file()
+        loaded = json.loads(filepath.read_text())
+        assert loaded["repo"] == "owner/tool"
+
+    def test_delete_vendor_config(self, tmp_repo):
+        """delete_vendor_config removes the vendor's config file."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        inst.delete_vendor_config("tool")
+        assert not (configs_dir / "tool.json").exists()
+
+    def test_delete_vendor_config_noop_if_missing(self, tmp_repo):
+        """delete_vendor_config is a no-op if file doesn't exist."""
+        inst.delete_vendor_config("nonexistent")  # should not raise
+
 
 # ── Tests: get_auth_token ─────────────────────────────────────────────────
 
@@ -416,6 +496,21 @@ class TestInstallExistingVendor:
         assert result["changed"] is False
         mock_download.assert_not_called()
 
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token")
+    def test_passes_vendor_name_and_config_to_download(self, mock_token, mock_resolve,
+                                                        mock_download, tmp_repo):
+        """install_existing_vendor passes vendor_name and vendor_config to download."""
+        mock_token.return_value = "token"
+        mock_resolve.return_value = "2.0.0"
+        mock_download.return_value = None
+
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        _, kwargs = mock_download.call_args
+        assert kwargs["vendor_name"] == "tool"
+        assert kwargs["vendor_config"] == SAMPLE_VENDOR
+
 
 # ── Tests: install_new_vendor (add path) ──────────────────────────────────
 
@@ -429,7 +524,7 @@ class TestInstallNewVendor:
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
 
-        def fake_download(repo, version, token):
+        def fake_download(repo, version, token, **kwargs):
             config = inst.load_config()
             config["vendors"]["new-tool"] = {
                 "repo": "owner/new-tool",
@@ -470,7 +565,7 @@ class TestInstallNewVendor:
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
 
-        def fake_download(repo, version, token):
+        def fake_download(repo, version, token, **kwargs):
             config = inst.load_config()
             config["vendors"]["my-custom-name"] = {
                 "repo": "owner/tool",
@@ -499,7 +594,7 @@ class TestInstallNewVendor:
         (tmp_repo / ".new-tool").mkdir()
         (tmp_repo / ".new-tool" / "script.sh").write_text("#!/bin/bash")
 
-        def fake_download(repo, version, token):
+        def fake_download(repo, version, token, **kwargs):
             config = inst.load_config()
             config["vendors"]["new-tool"] = {
                 "repo": "owner/new-tool",
@@ -520,6 +615,80 @@ class TestInstallNewVendor:
 
         out = capsys.readouterr().out
         assert "manifest: 1 files" in out
+
+
+# ── Tests: VENDOR_INSTALL_DIR ─────────────────────────────────────────────
+
+DOGFOOD_VENDOR = {
+    "repo": "mangimangi/git-vendored",
+    "install_branch": "chore/install-git-vendored",
+    "dogfood": True,
+    "protected": [".vendored/**"],
+}
+
+
+class TestVendorInstallDir:
+    @patch("vendored_install.subprocess.run")
+    def test_sets_vendor_install_dir(self, mock_run, tmp_repo, monkeypatch):
+        """VENDOR_INSTALL_DIR is set for non-dogfood vendors."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "owner/tool", "1.0.0", "token",
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+        )
+        # Find the bash call (the one running install.sh)
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert env.get("VENDOR_INSTALL_DIR") == ".vendored/pkg/tool"
+
+    @patch("vendored_install.subprocess.run")
+    def test_creates_pkg_directory(self, mock_run, tmp_repo, monkeypatch):
+        """Framework creates .vendored/pkg/<vendor>/ before running install.sh."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "owner/tool", "1.0.0", "token",
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+        )
+        assert (tmp_repo / ".vendored" / "pkg" / "tool").is_dir()
+
+    @patch("vendored_install.subprocess.run")
+    def test_dogfood_no_install_dir(self, mock_run, tmp_repo, monkeypatch):
+        """Dogfood vendors do NOT get VENDOR_INSTALL_DIR."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "mangimangi/git-vendored", "1.0.0", "token",
+            vendor_name="git-vendored", vendor_config=DOGFOOD_VENDOR
+        )
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert "VENDOR_INSTALL_DIR" not in env
+
+    @patch("vendored_install.subprocess.run")
+    def test_no_vendor_name_no_install_dir(self, mock_run, tmp_repo, monkeypatch):
+        """When vendor_name is None (legacy call), no VENDOR_INSTALL_DIR."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install("owner/tool", "1.0.0", "token")
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert "VENDOR_INSTALL_DIR" not in env
 
 
 # ── Tests: output_result ──────────────────────────────────────────────────
@@ -821,6 +990,84 @@ class TestCreatePullRequest:
         assert len(pr_create_calls) == 1
         env = pr_create_calls[0][1].get("env", {})
         assert env.get("GH_TOKEN") == "repo-token"
+
+
+# ── Tests: config migration ───────────────────────────────────────────────
+
+class TestMigrateConfig:
+    def test_splits_vendors_into_configs_dir(self, tmp_repo, make_config):
+        """migrate_config creates individual files in configs/."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}})
+        raw = {"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}}
+        inst.migrate_config(raw)
+
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        assert (configs_dir / "tool.json").is_file()
+        assert (configs_dir / "other.json").is_file()
+
+        tool_config = json.loads((configs_dir / "tool.json").read_text())
+        assert tool_config["repo"] == "owner/tool"
+
+    def test_removes_vendors_key_from_config(self, tmp_repo, make_config):
+        """migrate_config removes vendors key from config.json."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        raw = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.migrate_config(raw)
+
+        config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "vendors" not in config
+
+    def test_idempotent(self, tmp_repo, make_config):
+        """Running migration twice doesn't corrupt data."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        raw1 = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.migrate_config(raw1)
+
+        # Second run — configs/ already has files, so _should_migrate_config is False
+        assert not inst._should_migrate_config()
+
+    def test_should_migrate_when_monolithic(self, tmp_repo, make_config):
+        """_should_migrate_config returns True when vendors in config.json."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        assert inst._should_migrate_config() is True
+
+    def test_should_not_migrate_when_configs_exist(self, tmp_repo, make_config):
+        """_should_migrate_config returns False when configs/ has .json files."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        assert inst._should_migrate_config() is False
+
+    def test_should_not_migrate_empty_vendors(self, tmp_repo, make_config):
+        """_should_migrate_config returns False when vendors dict is empty."""
+        make_config({"vendors": {}})
+        assert inst._should_migrate_config() is False
+
+    def test_should_not_migrate_no_config(self, tmp_repo):
+        """_should_migrate_config returns False when config.json doesn't exist."""
+        assert inst._should_migrate_config() is False
+
+    def test_preserves_protected_field(self, tmp_repo, make_config):
+        """Protected field is preserved in per-vendor config for v1 fallback."""
+        vendor = dict(SAMPLE_VENDOR, protected=[".tool/**"])
+        make_config({"vendors": {"tool": vendor}})
+        raw = {"vendors": {"tool": vendor}}
+        inst.migrate_config(raw)
+
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        tool_config = json.loads((configs_dir / "tool.json").read_text())
+        assert tool_config["protected"] == [".tool/**"]
+
+    def test_logs_migration(self, tmp_repo, make_config, capsys):
+        """Migration logs to stderr for visibility."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        raw = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.migrate_config(raw)
+
+        err = capsys.readouterr().err
+        assert "Migrated config: tool" in err
+        assert "migration complete" in err.lower()
 
 
 # ── Tests: CLI routing ────────────────────────────────────────────────────
