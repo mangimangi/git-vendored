@@ -15,7 +15,7 @@ ROOT = Path(__file__).parent.parent
 
 
 def _import_update():
-    filepath = str(ROOT / "vendored" / "update")
+    filepath = str(ROOT / "templates" / "update")
     loader = importlib.machinery.SourceFileLoader("vendored_update", filepath)
     spec = importlib.util.spec_from_loader("vendored_update", loader, origin=filepath)
     module = importlib.util.module_from_spec(spec)

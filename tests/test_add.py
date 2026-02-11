@@ -15,7 +15,7 @@ ROOT = Path(__file__).parent.parent
 
 
 def _import_add():
-    filepath = str(ROOT / "vendored" / "add")
+    filepath = str(ROOT / "templates" / "add")
     loader = importlib.machinery.SourceFileLoader("vendored_add", filepath)
     spec = importlib.util.spec_from_loader("vendored_add", loader, origin=filepath)
     module = importlib.util.module_from_spec(spec)

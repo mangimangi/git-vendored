@@ -42,22 +42,22 @@ mkdir -p .vendored .vendored/hooks .github/workflows
 
 # Download vendored scripts
 echo "Downloading .vendored/add..."
-fetch_file "vendored/add" ".vendored/add"
+fetch_file "templates/add" ".vendored/add"
 chmod +x .vendored/add
 
 echo "Downloading .vendored/update..."
-fetch_file "vendored/update" ".vendored/update"
+fetch_file "templates/update" ".vendored/update"
 chmod +x .vendored/update
 
 echo "Downloading .vendored/check..."
-fetch_file "vendored/check" ".vendored/check"
+fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
 
 # Clean up old install script (renamed to update)
 rm -f .vendored/install
 
 echo "Downloading .vendored/hooks/pre-commit..."
-fetch_file "vendored/hooks/pre-commit" ".vendored/hooks/pre-commit"
+fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 
 # Write version
@@ -66,7 +66,7 @@ echo "Installed git-vendored v$VERSION"
 
 # config.json - only create if missing (preserves user settings)
 if [ ! -f .vendored/config.json ]; then
-    fetch_file "templates/vendored/config.json" ".vendored/config.json"
+    fetch_file "templates/config.json" ".vendored/config.json"
     echo "Created .vendored/config.json"
 fi
 
