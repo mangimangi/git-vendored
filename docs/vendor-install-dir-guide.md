@@ -99,19 +99,26 @@ INSTALL_DIR="${VENDOR_INSTALL_DIR:-.my-tool}"
 
 ## Per-Vendor Config Schema
 
-Each vendor gets its own config file at `.vendored/configs/<vendor>.json`:
+Each vendor gets its own config file at `.vendored/configs/<vendor>.json`. The file contains two kinds of data:
+
+- **`_vendor` key** — framework-owned registry fields. Written by `install`/`remove`, read by `check`. The underscore prefix signals "managed by the framework — don't edit."
+- **Top-level keys** — project-owned config, opaque to the framework, read by the vendor tool itself.
 
 ```json
 {
-  "repo": "owner/repo",
-  "install_branch": "chore/install-<name>",
-  "private": false,
-  "dogfood": false,
-  "automerge": false,
-  "protected": [".my-tool/**"],
-  "allowed": [".my-tool/config.json"]
+  "_vendor": {
+    "repo": "owner/my-tool",
+    "install_branch": "chore/install-my-tool",
+    "automerge": true,
+    "protected": [".vendored/pkg/my-tool/**"],
+    "allowed": [".vendored/configs/my-tool.json"]
+  },
+  "setting": "value",
+  "feature_flags": { "new_ui": true }
 }
 ```
+
+### `_vendor` Registry Fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -123,11 +130,69 @@ Each vendor gets its own config file at `.vendored/configs/<vendor>.json`:
 | `protected` | list | yes | Glob patterns of protected files |
 | `allowed` | list | no | Files users can edit (exceptions to protection) |
 
+### Project Config (Top-Level Keys)
+
+Top-level keys (everything except `_vendor`) belong to the vendor tool. The framework never reads, writes, or validates them. Examples:
+
+```json
+{
+  "_vendor": { "repo": "owner/pearls", "install_branch": "chore/install-pearls" },
+  "prefix": "gv",
+  "docs": ["AGENTS.md", "README.md"],
+  "models": { "implementer": "claude-opus-4-6" }
+}
+```
+
+## Reading Project Config from Vendor Tools
+
+Vendor tools should read their project config from `.vendored/configs/<vendor>.json`, filtering out the `_vendor` key. Fall back to the legacy dot-directory config if the vendored config doesn't exist.
+
+### Python Example
+
+```python
+import json
+from pathlib import Path
+
+VENDORED_CONFIG = ".vendored/configs/my-tool.json"
+LEGACY_CONFIG = ".my-tool/config.json"
+
+def load_config():
+    """Load project config, ignoring _vendor key."""
+    # Try vendored config first
+    path = Path(VENDORED_CONFIG)
+    if not path.exists():
+        path = Path(LEGACY_CONFIG)  # fallback
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+    raw = json.loads(path.read_text())
+    return {k: v for k, v in raw.items() if k != "_vendor"}
+```
+
+### Bash Example
+
+```bash
+# Read project config, filter out _vendor with jq
+CONFIG_FILE=".vendored/configs/my-tool.json"
+if [ ! -f "$CONFIG_FILE" ]; then
+    CONFIG_FILE=".my-tool/config.json"  # fallback
+fi
+MY_SETTING=$(jq -r '.my_setting // empty' "$CONFIG_FILE")
+```
+
+### Backwards Compatibility
+
+| Scenario | Behavior |
+|----------|----------|
+| `.vendored/configs/<vendor>.json` exists | Read from vendored config, ignore `_vendor` |
+| `.vendored/configs/<vendor>.json` missing | Fall back to legacy `.<vendor>/config.json` |
+| Pre-`_vendor` flat config (no `_vendor` key) | All keys treated as registry fields by framework |
+
 ## What Vendor Repos Need to Change
 
 1. **Read `VENDOR_INSTALL_DIR`** — use it as the base directory for installed files, with fallback to the original location
 2. **Update manifest paths** — ensure manifest entries reflect the actual install location (which changes when `VENDOR_INSTALL_DIR` is set)
-3. **No other changes required** — the framework handles config migration, directory creation, and cleanup
+3. **Update config loading** — read project config from `.vendored/configs/<vendor>.json` (ignoring `_vendor`), with fallback to the legacy dot-directory config
+4. **No other changes required** — the framework handles config migration, directory creation, and cleanup
 
 ## Fallback Behavior
 
@@ -152,4 +217,7 @@ Consumer repos (repos that have vendors installed) migrate by:
    python3 .vendored/install owner/my-vendor
    ```
 
-The framework handles config migration automatically: when it detects a monolithic `config.json` with a `vendors` key and no per-vendor configs, it splits the config into individual files.
+The framework handles config migration automatically:
+
+1. **Registry migration**: When it detects a monolithic `config.json` with a `vendors` key and no per-vendor configs, it splits the config into individual files with `_vendor` namespace.
+2. **Project config migration**: When legacy project configs exist at `.<vendor>/config.json` and a per-vendor config exists at `.vendored/configs/<vendor>.json`, it merges the project config into the top level of the vendored config and removes the legacy file.
