@@ -84,7 +84,7 @@ class TestLoadConfig:
         assert exc_info.value.code == 1
 
     def test_loads_per_vendor_configs(self, tmp_repo):
-        """load_config() scans configs/ for per-vendor .json files."""
+        """load_config() scans configs/ for per-vendor .json files (flat format)."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
         (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
@@ -94,6 +94,28 @@ class TestLoadConfig:
         assert "tool" in config["vendors"]
         assert "other" in config["vendors"]
         assert config["vendors"]["tool"]["repo"] == "owner/tool"
+
+    def test_loads_per_vendor_configs_with_vendor_key(self, tmp_repo):
+        """load_config() extracts registry from _vendor key."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_file = {"_vendor": SAMPLE_VENDOR, "custom_key": "value"}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_file))
+        config = inst.load_config()
+        assert "vendors" in config
+        assert "tool" in config["vendors"]
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+        # Project config keys should NOT leak into the vendor registry
+        assert "custom_key" not in config["vendors"]["tool"]
+
+    def test_flat_configs_backwards_compat(self, tmp_repo):
+        """Flat configs (no _vendor key) still load correctly."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        config = inst.load_config()
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+        assert config["vendors"]["tool"]["install_branch"] == "chore/install-tool"
 
     def test_per_vendor_configs_take_priority(self, tmp_repo, make_config):
         """Per-vendor configs take priority over monolithic config.json."""
@@ -133,23 +155,41 @@ class TestSaveConfig:
         assert "tool" in loaded["vendors"]
 
     def test_saves_per_vendor_configs(self, tmp_repo):
-        """save_config writes individual files when configs/ dir is in use."""
+        """save_config writes individual files with _vendor key when configs/ in use."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
-        (configs_dir / "existing.json").write_text(json.dumps(EXISTING_VENDOR))
+        (configs_dir / "existing.json").write_text(json.dumps({"_vendor": EXISTING_VENDOR}))
         config = {"vendors": {"tool": SAMPLE_VENDOR, "existing": EXISTING_VENDOR}}
         inst.save_config(config)
         assert (configs_dir / "tool.json").is_file()
         loaded = json.loads((configs_dir / "tool.json").read_text())
-        assert loaded["repo"] == "owner/tool"
+        assert "_vendor" in loaded
+        assert loaded["_vendor"]["repo"] == "owner/tool"
 
     def test_save_vendor_config(self, tmp_repo):
-        """save_vendor_config writes individual vendor config."""
+        """save_vendor_config writes config with _vendor key."""
         inst.save_vendor_config("tool", SAMPLE_VENDOR)
         filepath = tmp_repo / ".vendored" / "configs" / "tool.json"
         assert filepath.is_file()
         loaded = json.loads(filepath.read_text())
-        assert loaded["repo"] == "owner/tool"
+        assert "_vendor" in loaded
+        assert loaded["_vendor"]["repo"] == "owner/tool"
+        # Registry fields should NOT be at top level
+        assert "repo" not in loaded
+
+    def test_save_vendor_config_preserves_project_config(self, tmp_repo):
+        """save_vendor_config preserves existing top-level project config keys."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        existing = {"_vendor": SAMPLE_VENDOR, "prefix": "gv", "docs": ["README.md"]}
+        (configs_dir / "tool.json").write_text(json.dumps(existing))
+        # Update registry
+        new_registry = dict(SAMPLE_VENDOR, automerge=True)
+        inst.save_vendor_config("tool", new_registry)
+        loaded = json.loads((configs_dir / "tool.json").read_text())
+        assert loaded["_vendor"]["automerge"] is True
+        assert loaded["prefix"] == "gv"
+        assert loaded["docs"] == ["README.md"]
 
     def test_delete_vendor_config(self, tmp_repo):
         """delete_vendor_config removes the vendor's config file."""
@@ -617,10 +657,10 @@ class TestInstallNewVendor:
         assert result["vendor"] == "new-tool"
         assert result["changed"] is True
 
-        # New entry should be migrated to per-vendor config
+        # New entry should be migrated to per-vendor config with _vendor key
         assert (configs_dir / "new-tool.json").is_file()
         migrated = json.loads((configs_dir / "new-tool.json").read_text())
-        assert migrated["repo"] == "owner/new-tool"
+        assert migrated["_vendor"]["repo"] == "owner/new-tool"
 
         # config.json should be cleaned up
         raw = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
@@ -1044,7 +1084,7 @@ class TestCreatePullRequest:
 
 class TestMigrateConfig:
     def test_splits_vendors_into_configs_dir(self, tmp_repo, make_config):
-        """migrate_config creates individual files in configs/."""
+        """migrate_config creates individual files in configs/ with _vendor key."""
         make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}})
         raw = {"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}}
         inst.migrate_config(raw)
@@ -1054,7 +1094,8 @@ class TestMigrateConfig:
         assert (configs_dir / "other.json").is_file()
 
         tool_config = json.loads((configs_dir / "tool.json").read_text())
-        assert tool_config["repo"] == "owner/tool"
+        assert "_vendor" in tool_config
+        assert tool_config["_vendor"]["repo"] == "owner/tool"
 
     def test_removes_vendors_key_from_config(self, tmp_repo, make_config):
         """migrate_config removes vendors key from config.json."""
@@ -1097,7 +1138,7 @@ class TestMigrateConfig:
         assert inst._should_migrate_config() is False
 
     def test_preserves_protected_field(self, tmp_repo, make_config):
-        """Protected field is preserved in per-vendor config for v1 fallback."""
+        """Protected field is preserved under _vendor key for v1 fallback."""
         vendor = dict(SAMPLE_VENDOR, protected=[".tool/**"])
         make_config({"vendors": {"tool": vendor}})
         raw = {"vendors": {"tool": vendor}}
@@ -1105,7 +1146,7 @@ class TestMigrateConfig:
 
         configs_dir = tmp_repo / ".vendored" / "configs"
         tool_config = json.loads((configs_dir / "tool.json").read_text())
-        assert tool_config["protected"] == [".tool/**"]
+        assert tool_config["_vendor"]["protected"] == [".tool/**"]
 
     def test_logs_migration(self, tmp_repo, make_config, capsys):
         """Migration logs to stderr for visibility."""

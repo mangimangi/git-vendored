@@ -349,7 +349,7 @@ class TestLoadConfig:
         assert exc_info.value.code == 0
 
     def test_loads_per_vendor_configs(self, tmp_repo):
-        """load_config() scans configs/ for per-vendor .json files."""
+        """load_config() scans configs/ for per-vendor .json files (flat format)."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
         gv_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
@@ -358,6 +358,18 @@ class TestLoadConfig:
         assert "vendors" in config
         assert "git-vendored" in config["vendors"]
         assert config["vendors"]["git-vendored"]["repo"] == "mangimangi/git-vendored"
+
+    def test_loads_per_vendor_configs_with_vendor_key(self, tmp_repo):
+        """load_config() extracts registry from _vendor key."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        gv_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        vendor_file = {"_vendor": gv_config, "project_setting": True}
+        (configs_dir / "git-vendored.json").write_text(json.dumps(vendor_file))
+        config = check.load_config()
+        assert config["vendors"]["git-vendored"]["repo"] == "mangimangi/git-vendored"
+        # Project config should not leak into vendor registry
+        assert "project_setting" not in config["vendors"]["git-vendored"]
 
     def test_empty_configs_dir_falls_back(self, tmp_repo, make_config):
         """Empty configs/ dir falls back to monolithic config.json."""

@@ -24,12 +24,26 @@ CONFIGS_DIR = ".vendored/configs"
 MANIFESTS_DIR = ".vendored/manifests"
 
 
+def _extract_vendor_registry(raw):
+    """Extract registry fields from a per-vendor config file's contents.
+
+    If the file has a _vendor key, use that. Otherwise treat all top-level
+    keys as registry fields (backwards compat with pre-_vendor configs).
+    """
+    if "_vendor" in raw:
+        return dict(raw["_vendor"])
+    return dict(raw)
+
+
 def load_config(config_path=CONFIG_PATH):
     """Load and return the vendored config.
 
     Scans .vendored/configs/ for per-vendor <vendor>.json files first.
     Falls back to monolithic config.json if configs/ dir doesn't exist
     or has no .json files.
+
+    When reading per-vendor configs with a _vendor key, extracts registry
+    fields from _vendor so callers see the same flat shape.
     """
     # Try per-vendor configs first
     if os.path.isdir(CONFIGS_DIR):
@@ -40,7 +54,8 @@ def load_config(config_path=CONFIG_PATH):
                 vendor_name = filename[:-5]  # strip .json
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
-                    vendors[vendor_name] = json.load(f)
+                    raw = json.load(f)
+                vendors[vendor_name] = _extract_vendor_registry(raw)
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json
@@ -61,19 +76,15 @@ def delete_vendor_config(vendor_name):
 def save_config(config):
     """Write config back to disk.
 
-    If per-vendor configs/ is in use, writes individual files and
-    deletes removed vendors. Otherwise writes monolithic config.json.
+    If per-vendor configs/ is in use, deletes removed vendors' config
+    files (remaining vendors are left as-is on disk to preserve their
+    _vendor structure and project config). Otherwise writes monolithic
+    config.json.
     """
     if os.path.isdir(CONFIGS_DIR):
         json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
         if json_files:
             vendors = config.get("vendors", {})
-            # Write updated vendor configs
-            for vendor_name, vendor_config in vendors.items():
-                filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
-                with open(filepath, "w") as f:
-                    json.dump(vendor_config, f, indent=2)
-                    f.write("\n")
             # Delete configs for vendors that were removed
             for filename in json_files:
                 vendor_name = filename[:-5]
