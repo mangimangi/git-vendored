@@ -288,6 +288,26 @@ class TestMain:
         out = capsys.readouterr().out
         assert "Removed" in out
 
+    def test_cleans_up_pkg_directory(self, make_config, tmp_repo, capsys):
+        """Remove cleans up .vendored/pkg/<vendor>/ directory."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        pkg_dir = tmp_repo / ".vendored" / "pkg" / "tool"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "script.sh").write_text("#!/bin/bash")
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".vendored/pkg/tool/script.sh\n")
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+
+        # Verify pkg directory cleaned up
+        assert not (tmp_repo / ".vendored" / "pkg" / "tool").exists()
+        # pkg/ parent should be cleaned up if empty
+        assert not (tmp_repo / ".vendored" / "pkg").exists()
+
     def test_cleans_up_empty_directories(self, make_config, tmp_repo, capsys):
         make_config({"vendors": {"tool": SAMPLE_VENDOR}})
 

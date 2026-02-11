@@ -496,6 +496,21 @@ class TestInstallExistingVendor:
         assert result["changed"] is False
         mock_download.assert_not_called()
 
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token")
+    def test_passes_vendor_name_and_config_to_download(self, mock_token, mock_resolve,
+                                                        mock_download, tmp_repo):
+        """install_existing_vendor passes vendor_name and vendor_config to download."""
+        mock_token.return_value = "token"
+        mock_resolve.return_value = "2.0.0"
+        mock_download.return_value = None
+
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        _, kwargs = mock_download.call_args
+        assert kwargs["vendor_name"] == "tool"
+        assert kwargs["vendor_config"] == SAMPLE_VENDOR
+
 
 # ── Tests: install_new_vendor (add path) ──────────────────────────────────
 
@@ -509,7 +524,7 @@ class TestInstallNewVendor:
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
 
-        def fake_download(repo, version, token):
+        def fake_download(repo, version, token, **kwargs):
             config = inst.load_config()
             config["vendors"]["new-tool"] = {
                 "repo": "owner/new-tool",
@@ -550,7 +565,7 @@ class TestInstallNewVendor:
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
 
-        def fake_download(repo, version, token):
+        def fake_download(repo, version, token, **kwargs):
             config = inst.load_config()
             config["vendors"]["my-custom-name"] = {
                 "repo": "owner/tool",
@@ -579,7 +594,7 @@ class TestInstallNewVendor:
         (tmp_repo / ".new-tool").mkdir()
         (tmp_repo / ".new-tool" / "script.sh").write_text("#!/bin/bash")
 
-        def fake_download(repo, version, token):
+        def fake_download(repo, version, token, **kwargs):
             config = inst.load_config()
             config["vendors"]["new-tool"] = {
                 "repo": "owner/new-tool",
@@ -600,6 +615,80 @@ class TestInstallNewVendor:
 
         out = capsys.readouterr().out
         assert "manifest: 1 files" in out
+
+
+# ── Tests: VENDOR_INSTALL_DIR ─────────────────────────────────────────────
+
+DOGFOOD_VENDOR = {
+    "repo": "mangimangi/git-vendored",
+    "install_branch": "chore/install-git-vendored",
+    "dogfood": True,
+    "protected": [".vendored/**"],
+}
+
+
+class TestVendorInstallDir:
+    @patch("vendored_install.subprocess.run")
+    def test_sets_vendor_install_dir(self, mock_run, tmp_repo, monkeypatch):
+        """VENDOR_INSTALL_DIR is set for non-dogfood vendors."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "owner/tool", "1.0.0", "token",
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+        )
+        # Find the bash call (the one running install.sh)
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert env.get("VENDOR_INSTALL_DIR") == ".vendored/pkg/tool"
+
+    @patch("vendored_install.subprocess.run")
+    def test_creates_pkg_directory(self, mock_run, tmp_repo, monkeypatch):
+        """Framework creates .vendored/pkg/<vendor>/ before running install.sh."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "owner/tool", "1.0.0", "token",
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+        )
+        assert (tmp_repo / ".vendored" / "pkg" / "tool").is_dir()
+
+    @patch("vendored_install.subprocess.run")
+    def test_dogfood_no_install_dir(self, mock_run, tmp_repo, monkeypatch):
+        """Dogfood vendors do NOT get VENDOR_INSTALL_DIR."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "mangimangi/git-vendored", "1.0.0", "token",
+            vendor_name="git-vendored", vendor_config=DOGFOOD_VENDOR
+        )
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert "VENDOR_INSTALL_DIR" not in env
+
+    @patch("vendored_install.subprocess.run")
+    def test_no_vendor_name_no_install_dir(self, mock_run, tmp_repo, monkeypatch):
+        """When vendor_name is None (legacy call), no VENDOR_INSTALL_DIR."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install("owner/tool", "1.0.0", "token")
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert "VENDOR_INSTALL_DIR" not in env
 
 
 # ── Tests: output_result ──────────────────────────────────────────────────

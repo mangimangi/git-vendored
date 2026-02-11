@@ -286,11 +286,15 @@ def get_current_version(vendor_name, vendor_config=None):
 
 # ── Install execution ─────────────────────────────────────────────────────
 
-def download_and_run_install(repo, version, token):
+def download_and_run_install(repo, version, token, vendor_name=None, vendor_config=None):
     """Download the vendor's install.sh and run it.
 
-    Sets VENDOR_REPO, VENDOR_REF, and VENDOR_MANIFEST env vars for v2
-    contract. Still passes version as positional arg for v1 backwards compat.
+    Sets VENDOR_REPO, VENDOR_REF, VENDOR_MANIFEST, and VENDOR_INSTALL_DIR
+    env vars for v2 contract. Still passes version as positional arg for
+    v1 backwards compat.
+
+    VENDOR_INSTALL_DIR is set to .vendored/pkg/<vendor>/ unless the vendor
+    has dogfood: true (dogfood vendors install into framework paths).
 
     Returns: list of manifest files if install.sh wrote a manifest, else None.
     """
@@ -324,6 +328,13 @@ def download_and_run_install(repo, version, token):
     manifest_fd, manifest_path = tempfile.mkstemp(suffix=".manifest")
     os.close(manifest_fd)
 
+    # Determine install dir (skip for dogfood vendors)
+    install_dir = None
+    is_dogfood = vendor_config.get("dogfood", False) if vendor_config else False
+    if vendor_name and not is_dogfood:
+        install_dir = f".vendored/pkg/{vendor_name}"
+        os.makedirs(install_dir, exist_ok=True)
+
     try:
         run_env = env.copy()
         run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
@@ -331,6 +342,8 @@ def download_and_run_install(repo, version, token):
         run_env["VENDOR_REPO"] = repo
         run_env["VENDOR_REF"] = ref
         run_env["VENDOR_MANIFEST"] = manifest_path
+        if install_dir:
+            run_env["VENDOR_INSTALL_DIR"] = install_dir
 
         run_result = subprocess.run(
             ["bash", script_path, version],
@@ -406,9 +419,10 @@ def install_new_vendor(repo, version, token, name=None):
     # Snapshot config before
     before_vendors = dict(vendors)
 
-    # Run install.sh
+    # Run install.sh (no vendor_config for new vendors — they don't have one yet)
     print(f"Adding {repo} v{resolved_version}...")
-    manifest_files = download_and_run_install(repo, resolved_version, token)
+    manifest_files = download_and_run_install(repo, resolved_version, token,
+                                              vendor_name=name)
 
     # Post-validate: reload config and find new entry
     after_config = load_config()
@@ -462,7 +476,9 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version, force
         }
 
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
-    manifest_files = download_and_run_install(repo, target_version, token)
+    manifest_files = download_and_run_install(repo, target_version, token,
+                                              vendor_name=vendor_name,
+                                              vendor_config=vendor_config)
 
     # Process manifest if install.sh wrote one
     if manifest_files:
