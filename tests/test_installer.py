@@ -64,6 +64,10 @@ echo "Downloading .vendored/check..."
 fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
 
+echo "Downloading .vendored/remove..."
+fetch_file "templates/remove" ".vendored/remove"
+chmod +x .vendored/remove
+
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
 
@@ -134,11 +138,13 @@ class TestInstaller:
         run_installer(mock_fetch)
         assert (tmp_repo / ".vendored" / "install").is_file()
         assert (tmp_repo / ".vendored" / "check").is_file()
+        assert (tmp_repo / ".vendored" / "remove").is_file()
 
     def test_scripts_are_executable(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
         assert os.access(tmp_repo / ".vendored" / "install", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "check", os.X_OK)
+        assert os.access(tmp_repo / ".vendored" / "remove", os.X_OK)
 
     def test_writes_version(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch, "0.1.0")

@@ -9,7 +9,7 @@
 #              Falls back to curl for public repos when not set.
 #
 # Behavior:
-#   - Always updates: .vendored/install, .vendored/check,
+#   - Always updates: .vendored/install, .vendored/check, .vendored/remove,
 #     .vendored/hooks/pre-commit, .vendored/.version
 #   - Always updates: workflow templates in .github/workflows/
 #   - Preserves .vendored/config.json (only creates if missing)
@@ -48,6 +48,10 @@ chmod +x .vendored/install
 echo "Downloading .vendored/check..."
 fetch_file "templates/check" ".vendored/check"
 chmod +x .vendored/check
+
+echo "Downloading .vendored/remove..."
+fetch_file "templates/remove" ".vendored/remove"
+chmod +x .vendored/remove
 
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
