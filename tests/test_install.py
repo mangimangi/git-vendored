@@ -1159,6 +1159,126 @@ class TestMigrateConfig:
         assert "migration complete" in err.lower()
 
 
+# ── Tests: project config migration ──────────────────────────────────────
+
+class TestMigrateProjectConfigs:
+    def test_merges_legacy_project_config(self, tmp_repo):
+        """Legacy .<vendor>/config.json is merged into configs/<vendor>.json."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_data = {"_vendor": SAMPLE_VENDOR}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_data))
+
+        # Legacy project config
+        (tmp_repo / ".tool").mkdir()
+        project = {"setting": "value", "flag": True}
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps(project))
+
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged["_vendor"] == SAMPLE_VENDOR
+        assert merged["setting"] == "value"
+        assert merged["flag"] is True
+
+    def test_does_not_overwrite_vendor_key(self, tmp_repo):
+        """_vendor key is never overwritten by project config."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_data = {"_vendor": SAMPLE_VENDOR}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_data))
+
+        # Legacy config that happens to have a _vendor key
+        (tmp_repo / ".tool").mkdir()
+        project = {"_vendor": {"repo": "evil/override"}, "setting": "ok"}
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps(project))
+
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged["_vendor"]["repo"] == "owner/tool"
+        assert merged["setting"] == "ok"
+
+    def test_removes_legacy_config_after_merge(self, tmp_repo):
+        """Legacy config file is deleted after successful merge."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        assert not (tmp_repo / ".tool" / "config.json").exists()
+
+    def test_idempotent(self, tmp_repo):
+        """Running migration twice doesn't duplicate or corrupt."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+        # Second run: legacy file is gone, no-op
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged["x"] == 1
+        assert merged["_vendor"] == SAMPLE_VENDOR
+
+    def test_no_legacy_config_is_noop(self, tmp_repo):
+        """No legacy config files means migration is a no-op."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged == {"_vendor": SAMPLE_VENDOR}
+
+    def test_should_migrate_detects_legacy(self, tmp_repo):
+        """_should_migrate_project_configs returns True when legacy configs exist."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text("{}")
+
+        assert inst._should_migrate_project_configs() is True
+
+    def test_should_migrate_false_when_no_legacy(self, tmp_repo):
+        """_should_migrate_project_configs returns False when no legacy configs."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        assert inst._should_migrate_project_configs() is False
+
+    def test_should_migrate_false_when_no_configs_dir(self, tmp_repo):
+        """_should_migrate_project_configs returns False when no configs/ dir."""
+        assert inst._should_migrate_project_configs() is False
+
+    def test_logs_migration(self, tmp_repo, capsys):
+        """Migration logs to stderr for visibility."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        err = capsys.readouterr().err
+        assert "Merged project config" in err
+        assert ".tool/config.json" in err
+
+
 # ── Tests: CLI routing ────────────────────────────────────────────────────
 
 class TestCLIRouting:

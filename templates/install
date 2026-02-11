@@ -761,6 +761,74 @@ def _should_migrate_config():
     return "vendors" in raw and bool(raw["vendors"])
 
 
+def migrate_project_configs():
+    """Merge legacy per-vendor project configs into configs/<vendor>.json.
+
+    For each vendor with a per-vendor config file, checks if a legacy project
+    config exists at .<vendor-name>/config.json. If found, merges its contents
+    into the top level of configs/<vendor>.json (never overwrites _vendor key).
+    Removes the old config file after successful merge.
+
+    Idempotent: if top-level project keys already exist and legacy file is gone,
+    this is a no-op.
+    """
+    if not os.path.isdir(CONFIGS_DIR):
+        return
+
+    json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+    if not json_files:
+        return
+
+    for filename in sorted(json_files):
+        vendor_name = filename[:-5]  # strip .json
+        # Look for legacy project config at .<vendor>/config.json
+        legacy_path = os.path.join(f".{vendor_name}", "config.json")
+        if not os.path.isfile(legacy_path):
+            continue
+
+        # Read legacy project config
+        with open(legacy_path) as f:
+            try:
+                project_config = json.load(f)
+            except json.JSONDecodeError:
+                print(f"  Warning: could not parse {legacy_path}, skipping",
+                      file=sys.stderr)
+                continue
+
+        # Read current vendor config
+        vendor_filepath = os.path.join(CONFIGS_DIR, filename)
+        with open(vendor_filepath) as f:
+            vendor_data = json.load(f)
+
+        # Merge: project config keys go to top level, never overwrite _vendor
+        for key, value in project_config.items():
+            if key != "_vendor":
+                vendor_data[key] = value
+
+        # Write merged config back
+        with open(vendor_filepath, "w") as f:
+            json.dump(vendor_data, f, indent=2)
+            f.write("\n")
+
+        # Remove legacy config file
+        os.remove(legacy_path)
+        print(f"  Merged project config: {legacy_path} -> {vendor_filepath}",
+              file=sys.stderr)
+
+
+def _should_migrate_project_configs():
+    """Check if any legacy project configs need migrating."""
+    if not os.path.isdir(CONFIGS_DIR):
+        return False
+    json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+    for filename in json_files:
+        vendor_name = filename[:-5]
+        legacy_path = os.path.join(f".{vendor_name}", "config.json")
+        if os.path.isfile(legacy_path):
+            return True
+    return False
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def _is_repo_spec(arg):
@@ -799,6 +867,10 @@ def main():
         with open(CONFIG_PATH) as f:
             raw = json.load(f)
         migrate_config(raw)
+
+    # Merge legacy project configs (.<vendor>/config.json) into configs/
+    if _should_migrate_project_configs():
+        migrate_project_configs()
 
     config = load_config()
     vendors = config.get("vendors", {})
