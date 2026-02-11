@@ -31,6 +31,7 @@ import tempfile
 
 
 CONFIG_PATH = ".vendored/config.json"
+MANIFESTS_DIR = ".vendored/manifests"
 
 
 # ── Config helpers ────────────────────────────────────────────────────────
@@ -153,10 +154,68 @@ def _resolve_from_version_file(repo, token):
     return None
 
 
+# ── Manifest helpers ──────────────────────────────────────────────────────
+
+def read_manifest(vendor_name):
+    """Read a vendor's manifest file. Returns list of paths, or None if missing."""
+    manifest_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.files")
+    if not os.path.isfile(manifest_path):
+        return None
+    with open(manifest_path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def write_manifest(vendor_name, files):
+    """Write a vendor's manifest file (one path per line)."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    manifest_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.files")
+    with open(manifest_path, "w") as f:
+        for path in sorted(files):
+            f.write(f"{path}\n")
+
+
+def read_manifest_version(vendor_name):
+    """Read a vendor's version from manifest storage."""
+    version_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.version")
+    if os.path.isfile(version_path):
+        return open(version_path).read().strip()
+    return None
+
+
+def write_manifest_version(vendor_name, version):
+    """Write a vendor's version to manifest storage."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    version_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.version")
+    with open(version_path, "w") as f:
+        f.write(f"{version}\n")
+
+
+def validate_manifest(files):
+    """Validate that all files listed in manifest exist on disk."""
+    missing = [f for f in files if not os.path.isfile(f)]
+    if missing:
+        print("::error::Manifest lists files that don't exist on disk:")
+        for f in missing:
+            print(f"  - {f}")
+        sys.exit(1)
+
+
 # ── Version detection ─────────────────────────────────────────────────────
 
-def get_current_version(vendor_name, vendor_config):
-    """Read the currently installed version for a vendor."""
+def get_current_version(vendor_name, vendor_config=None):
+    """Read the currently installed version for a vendor.
+
+    Checks manifest storage first, then falls back to legacy detection.
+    """
+    # Check manifest storage first
+    version = read_manifest_version(vendor_name)
+    if version:
+        return version
+
+    # Legacy fallback: scan config patterns
+    if not vendor_config:
+        return None
+
     candidates = []
 
     for pattern in vendor_config.get("allowed", []):
@@ -180,7 +239,13 @@ def get_current_version(vendor_name, vendor_config):
 # ── Install execution ─────────────────────────────────────────────────────
 
 def download_and_run_install(repo, version, token):
-    """Download the vendor's install.sh and run it."""
+    """Download the vendor's install.sh and run it.
+
+    Sets VENDOR_REPO, VENDOR_REF, and VENDOR_MANIFEST env vars for v2
+    contract. Still passes version as positional arg for v1 backwards compat.
+
+    Returns: list of manifest files if install.sh wrote a manifest, else None.
+    """
     env = _gh_env(token)
 
     ref = f"v{version}"
@@ -205,14 +270,22 @@ def download_and_run_install(repo, version, token):
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
         f.write(install_script)
-        temp_path = f.name
+        script_path = f.name
+
+    # Create a temp file for the manifest
+    manifest_fd, manifest_path = tempfile.mkstemp(suffix=".manifest")
+    os.close(manifest_fd)
 
     try:
         run_env = env.copy()
         run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
+        # v2 contract env vars
+        run_env["VENDOR_REPO"] = repo
+        run_env["VENDOR_REF"] = ref
+        run_env["VENDOR_MANIFEST"] = manifest_path
 
         run_result = subprocess.run(
-            ["bash", temp_path, version],
+            ["bash", script_path, version],
             capture_output=True, text=True, env=run_env
         )
         if run_result.stdout:
@@ -222,8 +295,18 @@ def download_and_run_install(repo, version, token):
         if run_result.returncode != 0:
             print(f"::error::install.sh failed for {repo} (exit {run_result.returncode})")
             sys.exit(1)
+
+        # Read manifest if install.sh wrote one
+        manifest_files = None
+        if os.path.isfile(manifest_path) and os.path.getsize(manifest_path) > 0:
+            with open(manifest_path) as mf:
+                manifest_files = [line.strip() for line in mf if line.strip()]
+
+        return manifest_files
     finally:
-        os.unlink(temp_path)
+        os.unlink(script_path)
+        if os.path.isfile(manifest_path):
+            os.unlink(manifest_path)
 
 
 # ── Post-validation (add path) ────────────────────────────────────────────
@@ -277,9 +360,9 @@ def install_new_vendor(repo, version, token, name=None):
 
     # Run install.sh
     print(f"Adding {repo} v{resolved_version}...")
-    download_and_run_install(repo, resolved_version, token)
+    manifest_files = download_and_run_install(repo, resolved_version, token)
 
-    # Post-validate
+    # Post-validate: reload config and find new entry
     after_config = load_config()
     after_vendors = after_config.get("vendors", {})
 
@@ -291,9 +374,17 @@ def install_new_vendor(repo, version, token, name=None):
 
     validate_entry(new_key, new_entry)
 
+    # Process manifest if install.sh wrote one
+    if manifest_files:
+        validate_manifest(manifest_files)
+        write_manifest(new_key, manifest_files)
+        write_manifest_version(new_key, resolved_version)
+
     print(f"\nAdded vendor: {new_key}")
     print(f"  repo: {new_entry['repo']}")
     print(f"  version: {resolved_version}")
+    if manifest_files:
+        print(f"  manifest: {len(manifest_files)} files")
     print(f"  protected: {', '.join(new_entry.get('protected', []))}")
     if new_entry.get("allowed"):
         print(f"  allowed: {', '.join(new_entry['allowed'])}")
@@ -323,7 +414,13 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version, force
         }
 
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
-    download_and_run_install(repo, target_version, token)
+    manifest_files = download_and_run_install(repo, target_version, token)
+
+    # Process manifest if install.sh wrote one
+    if manifest_files:
+        validate_manifest(manifest_files)
+        write_manifest(vendor_name, manifest_files)
+        write_manifest_version(vendor_name, target_version)
 
     return {
         "vendor": vendor_name,

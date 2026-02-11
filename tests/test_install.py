@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -193,6 +194,58 @@ class TestGetCurrentVersion:
         version = inst.get_current_version("tool", SAMPLE_VENDOR)
         assert version is None
 
+    def test_prefers_manifest_version(self, tmp_repo):
+        """Manifest version takes priority over legacy version files."""
+        (tmp_repo / ".vendored" / "manifests").mkdir(parents=True)
+        (tmp_repo / ".vendored" / "manifests" / "tool.version").write_text("3.0.0\n")
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / ".version").write_text("1.0.0\n")
+        version = inst.get_current_version("tool", SAMPLE_VENDOR)
+        assert version == "3.0.0"
+
+
+# ── Tests: Manifest helpers ───────────────────────────────────────────────
+
+class TestManifestHelpers:
+    def test_write_and_read_manifest(self, tmp_repo):
+        files = [".tool/script.sh", ".tool/config.json"]
+        inst.write_manifest("tool", files)
+        result = inst.read_manifest("tool")
+        assert sorted(result) == sorted(files)
+
+    def test_read_missing_manifest_returns_none(self, tmp_repo):
+        assert inst.read_manifest("nonexistent") is None
+
+    def test_write_and_read_manifest_version(self, tmp_repo):
+        inst.write_manifest_version("tool", "1.2.3")
+        assert inst.read_manifest_version("tool") == "1.2.3"
+
+    def test_read_missing_manifest_version_returns_none(self, tmp_repo):
+        assert inst.read_manifest_version("nonexistent") is None
+
+    def test_validate_manifest_passes(self, tmp_repo):
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+        inst.validate_manifest([".tool/script.sh"])
+
+    def test_validate_manifest_fails_for_missing_files(self, tmp_repo):
+        with pytest.raises(SystemExit) as exc_info:
+            inst.validate_manifest([".tool/nonexistent.sh"])
+        assert exc_info.value.code == 1
+
+    def test_manifest_creates_directory(self, tmp_repo):
+        """write_manifest creates .vendored/manifests/ if it doesn't exist."""
+        inst.write_manifest("tool", [".tool/script.sh"])
+        assert (tmp_repo / ".vendored" / "manifests" / "tool.files").is_file()
+
+    def test_manifest_files_sorted(self, tmp_repo):
+        """Manifest files are written in sorted order."""
+        files = [".tool/z.sh", ".tool/a.sh", ".tool/m.sh"]
+        inst.write_manifest("tool", files)
+        content = (tmp_repo / ".vendored" / "manifests" / "tool.files").read_text()
+        lines = [l for l in content.strip().split("\n") if l]
+        assert lines == sorted(files)
+
 
 # ── Tests: SnapshotAndDiff (post-validation) ──────────────────────────────
 
@@ -293,6 +346,7 @@ class TestInstallExistingVendor:
     def test_installs_new_version(self, mock_token, mock_resolve, mock_download, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "2.0.0"
+        mock_download.return_value = None  # v1 compat: no manifest
         (tmp_repo / ".tool").mkdir()
         (tmp_repo / ".tool" / ".version").write_text("1.0.0")
 
@@ -308,6 +362,7 @@ class TestInstallExistingVendor:
     def test_fresh_install(self, mock_token, mock_resolve, mock_download, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "1.0.0"
+        mock_download.return_value = None
 
         result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
         assert result["changed"] is True
@@ -321,12 +376,45 @@ class TestInstallExistingVendor:
         """--force should reinstall even when at target version."""
         mock_token.return_value = "token"
         mock_resolve.return_value = "1.0.0"
+        mock_download.return_value = None
         (tmp_repo / ".tool").mkdir()
         (tmp_repo / ".tool" / ".version").write_text("1.0.0")
 
         result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest", force=True)
         assert result["changed"] is True
         mock_download.assert_called_once()
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token")
+    def test_manifest_stored_on_update(self, mock_token, mock_resolve, mock_download, tmp_repo):
+        """When install.sh emits a manifest, it should be stored."""
+        mock_token.return_value = "token"
+        mock_resolve.return_value = "2.0.0"
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+        mock_download.return_value = [".tool/script.sh"]
+
+        result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        assert result["changed"] is True
+
+        # Verify manifest was stored
+        manifest = inst.read_manifest("tool")
+        assert manifest == [".tool/script.sh"]
+        assert inst.read_manifest_version("tool") == "2.0.0"
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token")
+    def test_skip_when_current_via_manifest(self, mock_token, mock_resolve, mock_download, tmp_repo):
+        """Version from manifest storage used for skip check."""
+        mock_token.return_value = "token"
+        mock_resolve.return_value = "1.0.0"
+        inst.write_manifest_version("tool", "1.0.0")
+
+        result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        assert result["changed"] is False
+        mock_download.assert_not_called()
 
 
 # ── Tests: install_new_vendor (add path) ──────────────────────────────────
@@ -349,6 +437,7 @@ class TestInstallNewVendor:
                 "install_branch": "chore/install-new-tool",
             }
             inst.save_config(config)
+            return None  # v1 compat: no manifest
 
         mock_download.side_effect = fake_download
 
@@ -389,12 +478,48 @@ class TestInstallNewVendor:
                 "install_branch": "chore/install-tool",
             }
             inst.save_config(config)
+            return None
 
         mock_download.side_effect = fake_download
 
         result = inst.install_new_vendor("owner/tool", "latest", "token", name="my-custom-name")
         out = capsys.readouterr().out
         assert "Added vendor: my-custom-name" in out
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.check_repo_exists")
+    def test_add_with_manifest(self, mock_exists, mock_install_sh,
+                                mock_version, mock_download, make_config, tmp_repo, capsys):
+        """When install.sh emits a manifest, it should be stored on add."""
+        mock_version.return_value = "1.0.0"
+        make_config({"vendors": {}})
+
+        (tmp_repo / ".new-tool").mkdir()
+        (tmp_repo / ".new-tool" / "script.sh").write_text("#!/bin/bash")
+
+        def fake_download(repo, version, token):
+            config = inst.load_config()
+            config["vendors"]["new-tool"] = {
+                "repo": "owner/new-tool",
+                "protected": [".new-tool/**"],
+                "install_branch": "chore/install-new-tool",
+            }
+            inst.save_config(config)
+            return [".new-tool/script.sh"]
+
+        mock_download.side_effect = fake_download
+
+        result = inst.install_new_vendor("owner/new-tool", "latest", "token")
+        assert result["changed"] is True
+
+        manifest = inst.read_manifest("new-tool")
+        assert manifest == [".new-tool/script.sh"]
+        assert inst.read_manifest_version("new-tool") == "1.0.0"
+
+        out = capsys.readouterr().out
+        assert "manifest: 1 files" in out
 
 
 # ── Tests: output_result ──────────────────────────────────────────────────
