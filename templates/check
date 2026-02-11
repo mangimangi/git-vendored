@@ -108,6 +108,36 @@ def matches_any_pattern(filepath, patterns):
     return False
 
 
+MANIFESTS_DIR = ".vendored/manifests"
+
+
+def read_manifest(vendor_name):
+    """Read a vendor's manifest file. Returns list of paths, or None if missing."""
+    manifest_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.files")
+    if not os.path.isfile(manifest_path):
+        return None
+    with open(manifest_path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def get_protected_files(vendor_name, vendor_config):
+    """Get protected file patterns for a vendor.
+
+    If a manifest exists, use exact file paths from the manifest plus the
+    manifest file itself. Falls back to config 'protected' patterns for v1
+    vendors without manifests.
+    """
+    manifest_files = read_manifest(vendor_name)
+    if manifest_files is not None:
+        # Manifest-driven: exact paths from manifest + the manifest files themselves
+        protected = list(manifest_files)
+        protected.append(os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"))
+        protected.append(os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"))
+        return protected
+    # v1 fallback: glob patterns from config
+    return vendor_config.get("protected", [])
+
+
 def check_vendor(vendor_name, vendor_config, changed_files, branch):
     """Check a single vendor's protection rules. Returns list of violations."""
     # Skip if branch matches this vendor's install_branch prefix
@@ -115,7 +145,7 @@ def check_vendor(vendor_name, vendor_config, changed_files, branch):
     if install_branch and branch.startswith(install_branch):
         return []
 
-    protected = vendor_config.get("protected", [])
+    protected = get_protected_files(vendor_name, vendor_config)
     allowed = vendor_config.get("allowed", [])
     violations = []
 
