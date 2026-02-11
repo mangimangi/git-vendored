@@ -72,10 +72,8 @@ fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 INSTALLED_FILES+=(".vendored/hooks/pre-commit")
 
-# Write version
-echo "$VERSION" > .vendored/.version
-echo "Installed git-vendored v$VERSION"
-INSTALLED_FILES+=(".vendored/.version")
+# Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
+rm -f .vendored/.version
 
 # config.json - only create if missing (preserves user settings)
 if [ ! -f .vendored/config.json ]; then

@@ -80,9 +80,8 @@ fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 INSTALLED_FILES+=(".vendored/hooks/pre-commit")
 
-echo "$VERSION" > .vendored/.version
-echo "Installed git-vendored v$VERSION"
-INSTALLED_FILES+=(".vendored/.version")
+# Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
+rm -f .vendored/.version
 
 if [ ! -f .vendored/config.json ]; then
     fetch_file "templates/config.json" ".vendored/config.json"
@@ -147,10 +146,13 @@ class TestInstaller:
         assert os.access(tmp_repo / ".vendored" / "check", os.X_OK)
         assert os.access(tmp_repo / ".vendored" / "remove", os.X_OK)
 
-    def test_writes_version(self, mock_fetch, tmp_repo):
+    def test_does_not_write_deprecated_version(self, mock_fetch, tmp_repo):
+        """v2 contract: install.sh should NOT write .vendored/.version (uses manifests)."""
         run_installer(mock_fetch, "0.1.0")
-        version = (tmp_repo / ".vendored" / ".version").read_text().strip()
-        assert version == "0.1.0"
+        assert not (tmp_repo / ".vendored" / ".version").exists()
+        # Version should be in manifests instead
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.read_text().strip() == "0.1.0"
 
     def test_creates_config_if_missing(self, mock_fetch, tmp_repo):
         run_installer(mock_fetch)
@@ -183,13 +185,7 @@ class TestInstaller:
         assert result1.returncode == 0
         result2 = run_installer(mock_fetch, "0.2.0")
         assert result2.returncode == 0
-        version = (tmp_repo / ".vendored" / ".version").read_text().strip()
-        assert version == "0.2.0"
-
-    def test_version_file_updated_on_rerun(self, mock_fetch, tmp_repo):
-        run_installer(mock_fetch, "0.1.0")
-        run_installer(mock_fetch, "0.2.0")
-        version = (tmp_repo / ".vendored" / ".version").read_text().strip()
+        version = (tmp_repo / ".vendored" / "manifests" / "git-vendored.version").read_text().strip()
         assert version == "0.2.0"
 
     def test_exit_code_zero(self, mock_fetch, tmp_repo):
@@ -234,6 +230,20 @@ class TestInstaller:
         assert not (tmp_repo / ".vendored" / "add").exists()
         assert not (tmp_repo / ".vendored" / "update").exists()
 
+    def test_cleans_up_deprecated_version_file(self, mock_fetch, tmp_repo):
+        """Upgrading from v1 should delete .vendored/.version."""
+        (tmp_repo / ".vendored").mkdir(parents=True, exist_ok=True)
+        deprecated = tmp_repo / ".vendored" / ".version"
+        deprecated.write_text("0.0.1\n")
+        assert deprecated.is_file()
+
+        run_installer(mock_fetch, "0.2.0")
+
+        assert not deprecated.exists()
+        # Version should be in manifests
+        version = (tmp_repo / ".vendored" / "manifests" / "git-vendored.version").read_text().strip()
+        assert version == "0.2.0"
+
     def test_reads_vendor_ref_env_var(self, mock_fetch, tmp_repo):
         """VENDOR_REF env var should be used as version when set."""
         env = os.environ.copy()
@@ -265,7 +275,8 @@ class TestManifest:
         assert ".vendored/check" in content
         assert ".vendored/remove" in content
         assert ".vendored/hooks/pre-commit" in content
-        assert ".vendored/.version" in content
+        # .vendored/.version should NOT be in manifest (deprecated)
+        assert ".vendored/.version" not in content
 
     def test_writes_manifest_version(self, mock_fetch, tmp_repo):
         """install.sh should write .vendored/manifests/git-vendored.version."""
