@@ -616,6 +616,52 @@ class TestInstallNewVendor:
         out = capsys.readouterr().out
         assert "manifest: 1 files" in out
 
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.check_repo_exists")
+    def test_add_when_per_vendor_configs_active(self, mock_exists, mock_install_sh,
+                                                 mock_version, mock_download,
+                                                 make_config, tmp_repo, capsys):
+        """v1 install.sh self-registers in config.json while per-vendor configs are active."""
+        mock_version.return_value = "1.0.0"
+        # Set up existing per-vendor config (activates per-vendor mode)
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "existing.json").write_text(json.dumps(EXISTING_VENDOR))
+        # config.json still present (post-migration, no vendors key)
+        make_config({})
+
+        def fake_download(repo, version, token, **kwargs):
+            # v1 install.sh writes directly to config.json
+            config_path = tmp_repo / ".vendored" / "config.json"
+            raw = json.loads(config_path.read_text())
+            raw.setdefault("vendors", {})["new-tool"] = {
+                "repo": "owner/new-tool",
+                "protected": [".new-tool/**"],
+                "install_branch": "chore/install-new-tool",
+            }
+            config_path.write_text(json.dumps(raw, indent=2) + "\n")
+            return None
+
+        mock_download.side_effect = fake_download
+
+        result = inst.install_new_vendor("owner/new-tool", "latest", "token")
+        assert result["vendor"] == "new-tool"
+        assert result["changed"] is True
+
+        # Entry should have been migrated to per-vendor config
+        assert (configs_dir / "new-tool.json").is_file()
+        migrated = json.loads((configs_dir / "new-tool.json").read_text())
+        assert migrated["repo"] == "owner/new-tool"
+
+        # config.json should have been cleaned up
+        raw = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "vendors" not in raw
+
+        out = capsys.readouterr().out
+        assert "Added vendor: new-tool" in out
+
 
 # ── Tests: VENDOR_INSTALL_DIR ─────────────────────────────────────────────
 

@@ -429,6 +429,26 @@ def install_new_vendor(repo, version, token, name=None):
     after_vendors = after_config.get("vendors", {})
 
     new_key, new_entry = find_new_entry(before_vendors, after_vendors)
+
+    # v1 compat: when per-vendor configs are active, install.sh may have
+    # self-registered in config.json directly (which load_config skips).
+    # Check config.json and migrate the entry if found.
+    if new_key is None and os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files and os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH) as f:
+                raw = json.load(f)
+            raw_vendors = raw.get("vendors", {})
+            new_key, new_entry = find_new_entry(before_vendors, raw_vendors)
+            if new_key is not None:
+                save_vendor_config(new_key, new_entry)
+                del raw["vendors"][new_key]
+                if not raw["vendors"]:
+                    del raw["vendors"]
+                with open(CONFIG_PATH, "w") as f:
+                    json.dump(raw, f, indent=2)
+                    f.write("\n")
+
     if new_key is None:
         print("::error::install.sh did not register a vendor in config.")
         print("install.sh must self-register by adding an entry to .vendored/config.json")
