@@ -652,6 +652,51 @@ def create_pull_request(results):
     return pr_url
 
 
+# ── Config migration ──────────────────────────────────────────────────────
+
+def migrate_config(raw_config):
+    """Split monolithic config.json vendors into individual configs/<vendor>.json.
+
+    Called when config.json has a 'vendors' key and configs/ has no .json files.
+    Idempotent: running twice doesn't duplicate or corrupt data.
+    """
+    vendors = raw_config.get("vendors", {})
+    if not vendors:
+        return
+
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    for vendor_name, vendor_config in vendors.items():
+        filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+        with open(filepath, "w") as f:
+            json.dump(vendor_config, f, indent=2)
+            f.write("\n")
+        print(f"  Migrated config: {vendor_name} -> {filepath}", file=sys.stderr)
+
+    # Remove vendors key from config.json (file remains for framework-level use)
+    del raw_config["vendors"]
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(raw_config, f, indent=2)
+        f.write("\n")
+
+    print(f"Config migration complete: {len(vendors)} vendor(s) split into {CONFIGS_DIR}/",
+          file=sys.stderr)
+
+
+def _should_migrate_config():
+    """Check if config migration is needed."""
+    if not os.path.isfile(CONFIG_PATH):
+        return False
+    # Check if configs/ already has .json files
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            return False
+    # Check if monolithic config has vendors
+    with open(CONFIG_PATH) as f:
+        raw = json.load(f)
+    return "vendors" in raw and bool(raw["vendors"])
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def _is_repo_spec(arg):
@@ -684,6 +729,12 @@ def main():
         help="Override the vendor key name (new vendor only)"
     )
     args = parser.parse_args()
+
+    # Migrate monolithic config.json to per-vendor configs/ if needed
+    if _should_migrate_config():
+        with open(CONFIG_PATH) as f:
+            raw = json.load(f)
+        migrate_config(raw)
 
     config = load_config()
     vendors = config.get("vendors", {})

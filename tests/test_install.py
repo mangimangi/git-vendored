@@ -992,6 +992,84 @@ class TestCreatePullRequest:
         assert env.get("GH_TOKEN") == "repo-token"
 
 
+# ── Tests: config migration ───────────────────────────────────────────────
+
+class TestMigrateConfig:
+    def test_splits_vendors_into_configs_dir(self, tmp_repo, make_config):
+        """migrate_config creates individual files in configs/."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}})
+        raw = {"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}}
+        inst.migrate_config(raw)
+
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        assert (configs_dir / "tool.json").is_file()
+        assert (configs_dir / "other.json").is_file()
+
+        tool_config = json.loads((configs_dir / "tool.json").read_text())
+        assert tool_config["repo"] == "owner/tool"
+
+    def test_removes_vendors_key_from_config(self, tmp_repo, make_config):
+        """migrate_config removes vendors key from config.json."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        raw = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.migrate_config(raw)
+
+        config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "vendors" not in config
+
+    def test_idempotent(self, tmp_repo, make_config):
+        """Running migration twice doesn't corrupt data."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        raw1 = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.migrate_config(raw1)
+
+        # Second run — configs/ already has files, so _should_migrate_config is False
+        assert not inst._should_migrate_config()
+
+    def test_should_migrate_when_monolithic(self, tmp_repo, make_config):
+        """_should_migrate_config returns True when vendors in config.json."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        assert inst._should_migrate_config() is True
+
+    def test_should_not_migrate_when_configs_exist(self, tmp_repo, make_config):
+        """_should_migrate_config returns False when configs/ has .json files."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        assert inst._should_migrate_config() is False
+
+    def test_should_not_migrate_empty_vendors(self, tmp_repo, make_config):
+        """_should_migrate_config returns False when vendors dict is empty."""
+        make_config({"vendors": {}})
+        assert inst._should_migrate_config() is False
+
+    def test_should_not_migrate_no_config(self, tmp_repo):
+        """_should_migrate_config returns False when config.json doesn't exist."""
+        assert inst._should_migrate_config() is False
+
+    def test_preserves_protected_field(self, tmp_repo, make_config):
+        """Protected field is preserved in per-vendor config for v1 fallback."""
+        vendor = dict(SAMPLE_VENDOR, protected=[".tool/**"])
+        make_config({"vendors": {"tool": vendor}})
+        raw = {"vendors": {"tool": vendor}}
+        inst.migrate_config(raw)
+
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        tool_config = json.loads((configs_dir / "tool.json").read_text())
+        assert tool_config["protected"] == [".tool/**"]
+
+    def test_logs_migration(self, tmp_repo, make_config, capsys):
+        """Migration logs to stderr for visibility."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        raw = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.migrate_config(raw)
+
+        err = capsys.readouterr().err
+        assert "Migrated config: tool" in err
+        assert "migration complete" in err.lower()
+
+
 # ── Tests: CLI routing ────────────────────────────────────────────────────
 
 class TestCLIRouting:
