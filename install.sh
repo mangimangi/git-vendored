@@ -46,7 +46,7 @@ fetch_file() {
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
 # Create directories
-mkdir -p .vendored .vendored/hooks .vendored/manifests .github/workflows
+mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .github/workflows
 
 # Download vendored scripts
 echo "Downloading .vendored/install..."
