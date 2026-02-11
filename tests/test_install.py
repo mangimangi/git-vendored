@@ -585,6 +585,54 @@ class TestInstallNewVendor:
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
     @patch("vendored_install.check_repo_exists")
+    def test_add_new_vendor_with_per_vendor_configs_active(
+            self, mock_exists, mock_install_sh, mock_version, mock_download,
+            make_config, tmp_repo, capsys):
+        """install.sh writes to config.json but per-vendor configs are active."""
+        mock_version.return_value = "1.0.0"
+        # Existing vendor in per-vendor config (makes load_config read from configs/)
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "existing.json").write_text(json.dumps(EXISTING_VENDOR))
+        # Empty config.json (vendors key removed after migration)
+        make_config({})
+
+        new_entry = {
+            "repo": "owner/new-tool",
+            "protected": [".new-tool/**"],
+            "install_branch": "chore/install-new-tool",
+        }
+
+        def fake_download(repo, version, token, **kwargs):
+            # install.sh writes to monolithic config.json (as real install.sh would)
+            config_path = tmp_repo / ".vendored" / "config.json"
+            raw = json.loads(config_path.read_text())
+            raw.setdefault("vendors", {})["new-tool"] = new_entry
+            config_path.write_text(json.dumps(raw, indent=2) + "\n")
+            return None
+
+        mock_download.side_effect = fake_download
+
+        result = inst.install_new_vendor("owner/new-tool", "latest", "token")
+        assert result["vendor"] == "new-tool"
+        assert result["changed"] is True
+
+        # New entry should be migrated to per-vendor config
+        assert (configs_dir / "new-tool.json").is_file()
+        migrated = json.loads((configs_dir / "new-tool.json").read_text())
+        assert migrated["repo"] == "owner/new-tool"
+
+        # config.json should be cleaned up
+        raw = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "vendors" not in raw or "new-tool" not in raw.get("vendors", {})
+
+        out = capsys.readouterr().out
+        assert "Added vendor: new-tool" in out
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.check_repo_exists")
     def test_add_with_manifest(self, mock_exists, mock_install_sh,
                                 mock_version, mock_download, make_config, tmp_repo, capsys):
         """When install.sh emits a manifest, it should be stored on add."""
