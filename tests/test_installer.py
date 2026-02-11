@@ -33,8 +33,9 @@ def mock_fetch(tmp_repo):
 #!/bin/bash
 set -euo pipefail
 
-VERSION="${{1:?}}"
-VENDORED_REPO="${{2:-mangimangi/git-vendored}}"
+# v2 contract: read env vars, fall back to positional args
+VERSION="${{VENDOR_REF:-${{1:?}}}}"
+VENDORED_REPO="${{VENDOR_REPO:-${{2:-mangimangi/git-vendored}}}}"
 
 # Track installed files for manifest
 INSTALLED_FILES=()
@@ -254,6 +255,23 @@ class TestInstaller:
         run_installer(mock_fetch)
         assert not (tmp_repo / ".vendored" / "add").exists()
         assert not (tmp_repo / ".vendored" / "update").exists()
+
+    def test_reads_vendor_ref_env_var(self, mock_fetch, tmp_repo):
+        """VENDOR_REF env var should be used as version when set."""
+        env = os.environ.copy()
+        env["VENDOR_REF"] = "0.5.0"
+        result = run_installer(mock_fetch, "0.1.0", env=env)
+        assert result.returncode == 0
+        # VENDOR_REF takes priority over positional arg
+        version_path = tmp_repo / ".vendored" / "manifests" / "git-vendored.version"
+        assert version_path.read_text().strip() == "0.5.0"
+
+    def test_reads_vendor_repo_env_var(self, mock_fetch, tmp_repo):
+        """VENDOR_REPO env var should be used as repo when set."""
+        env = os.environ.copy()
+        env["VENDOR_REPO"] = "other-org/git-vendored"
+        result = run_installer(mock_fetch, "0.1.0", env=env)
+        assert result.returncode == 0
 
 
 class TestManifest:

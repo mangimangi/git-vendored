@@ -4,24 +4,27 @@
 # Usage:
 #   install.sh <version> [<repo>]
 #
-# Environment:
+# Environment (v2 contract — preferred):
+#   VENDOR_REF       - Git ref (version) to install at. Falls back to $1.
+#   VENDOR_REPO      - owner/repo for API calls. Falls back to $2 / default.
 #   GH_TOKEN         - Used for gh api downloads (required for private repos).
 #                      Falls back to curl for public repos when not set.
 #   VENDOR_MANIFEST  - Path to write manifest of installed files (v2 contract).
 #
 # Behavior:
 #   - Always updates: .vendored/install, .vendored/check, .vendored/remove,
-#     .vendored/hooks/pre-commit, .vendored/.version
+#     .vendored/hooks/pre-commit
 #   - Always updates: workflow templates in .github/workflows/
 #   - Preserves .vendored/config.json (only creates if missing)
-#   - Self-registers git-vendored as a vendor in .vendored/config.json
 #   - Writes manifest to $VENDOR_MANIFEST and .vendored/manifests/ (v2 contract)
 #   - Cleans up old .vendored/add and .vendored/update (merged into install)
+#   - Cleans up deprecated .vendored/.version (replaced by manifests)
 #
 set -euo pipefail
 
-VERSION="${1:?Usage: install.sh <version> [<repo>]}"
-VENDORED_REPO="${2:-mangimangi/git-vendored}"
+# v2 contract: read env vars, fall back to positional args for backwards compat
+VERSION="${VENDOR_REF:-${1:?Usage: install.sh <version> [<repo>]}}"
+VENDORED_REPO="${VENDOR_REPO:-${2:-mangimangi/git-vendored}}"
 
 # Track installed files for manifest
 INSTALLED_FILES=()
