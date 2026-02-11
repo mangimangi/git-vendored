@@ -348,6 +348,24 @@ class TestLoadConfig:
             check.load_config("/nonexistent/config.json")
         assert exc_info.value.code == 0
 
+    def test_loads_per_vendor_configs(self, tmp_repo):
+        """load_config() scans configs/ for per-vendor .json files."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        gv_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        (configs_dir / "git-vendored.json").write_text(json.dumps(gv_config))
+        config = check.load_config()
+        assert "vendors" in config
+        assert "git-vendored" in config["vendors"]
+        assert config["vendors"]["git-vendored"]["repo"] == "mangimangi/git-vendored"
+
+    def test_empty_configs_dir_falls_back(self, tmp_repo, make_config):
+        """Empty configs/ dir falls back to monolithic config.json."""
+        make_config(SAMPLE_CONFIG)
+        (tmp_repo / ".vendored" / "configs").mkdir(parents=True)
+        config = check.load_config()
+        assert "git-vendored" in config["vendors"]
+
 
 # ── Tests: get_branch_name ─────────────────────────────────────────────────
 

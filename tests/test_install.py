@@ -83,6 +83,86 @@ class TestLoadConfig:
             inst.load_config("/nonexistent/config.json")
         assert exc_info.value.code == 1
 
+    def test_loads_per_vendor_configs(self, tmp_repo):
+        """load_config() scans configs/ for per-vendor .json files."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        (configs_dir / "other.json").write_text(json.dumps(EXISTING_VENDOR))
+        config = inst.load_config()
+        assert "vendors" in config
+        assert "tool" in config["vendors"]
+        assert "other" in config["vendors"]
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+
+    def test_per_vendor_configs_take_priority(self, tmp_repo, make_config):
+        """Per-vendor configs take priority over monolithic config.json."""
+        make_config({"vendors": {"old": SAMPLE_VENDOR}})
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "new-tool.json").write_text(json.dumps(EXISTING_VENDOR))
+        config = inst.load_config()
+        assert "new-tool" in config["vendors"]
+        assert "old" not in config["vendors"]
+
+    def test_empty_configs_dir_falls_back(self, tmp_repo, make_config):
+        """Empty configs/ dir falls back to monolithic config.json."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        (tmp_repo / ".vendored" / "configs").mkdir(parents=True)
+        config = inst.load_config()
+        assert "tool" in config["vendors"]
+
+    def test_vendor_name_from_filename(self, tmp_repo):
+        """Vendor name is derived from filename (e.g. pearls.json -> pearls)."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "my-vendor.json").write_text(json.dumps(SAMPLE_VENDOR))
+        config = inst.load_config()
+        assert "my-vendor" in config["vendors"]
+
+
+# ── Tests: save_config ────────────────────────────────────────────────────
+
+class TestSaveConfig:
+    def test_saves_monolithic_config(self, tmp_repo, make_config):
+        """save_config writes monolithic config.json when configs/ not in use."""
+        make_config({"vendors": {}})
+        config = {"vendors": {"tool": SAMPLE_VENDOR}}
+        inst.save_config(config)
+        loaded = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "tool" in loaded["vendors"]
+
+    def test_saves_per_vendor_configs(self, tmp_repo):
+        """save_config writes individual files when configs/ dir is in use."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "existing.json").write_text(json.dumps(EXISTING_VENDOR))
+        config = {"vendors": {"tool": SAMPLE_VENDOR, "existing": EXISTING_VENDOR}}
+        inst.save_config(config)
+        assert (configs_dir / "tool.json").is_file()
+        loaded = json.loads((configs_dir / "tool.json").read_text())
+        assert loaded["repo"] == "owner/tool"
+
+    def test_save_vendor_config(self, tmp_repo):
+        """save_vendor_config writes individual vendor config."""
+        inst.save_vendor_config("tool", SAMPLE_VENDOR)
+        filepath = tmp_repo / ".vendored" / "configs" / "tool.json"
+        assert filepath.is_file()
+        loaded = json.loads(filepath.read_text())
+        assert loaded["repo"] == "owner/tool"
+
+    def test_delete_vendor_config(self, tmp_repo):
+        """delete_vendor_config removes the vendor's config file."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        inst.delete_vendor_config("tool")
+        assert not (configs_dir / "tool.json").exists()
+
+    def test_delete_vendor_config_noop_if_missing(self, tmp_repo):
+        """delete_vendor_config is a no-op if file doesn't exist."""
+        inst.delete_vendor_config("nonexistent")  # should not raise
+
 
 # ── Tests: get_auth_token ─────────────────────────────────────────────────
 

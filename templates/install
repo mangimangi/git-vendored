@@ -31,13 +31,34 @@ import tempfile
 
 
 CONFIG_PATH = ".vendored/config.json"
+CONFIGS_DIR = ".vendored/configs"
 MANIFESTS_DIR = ".vendored/manifests"
 
 
 # ── Config helpers ────────────────────────────────────────────────────────
 
 def load_config(config_path=CONFIG_PATH):
-    """Load and return the vendored config."""
+    """Load and return the vendored config.
+
+    Scans .vendored/configs/ for per-vendor <vendor>.json files first.
+    Falls back to monolithic config.json if configs/ dir doesn't exist
+    or has no .json files.
+
+    Return format: {"vendors": {"name": {...}, ...}}
+    """
+    # Try per-vendor configs first
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            vendors = {}
+            for filename in sorted(json_files):
+                vendor_name = filename[:-5]  # strip .json
+                filepath = os.path.join(CONFIGS_DIR, filename)
+                with open(filepath) as f:
+                    vendors[vendor_name] = json.load(f)
+            return {"vendors": vendors}
+
+    # Fallback to monolithic config.json
     if not os.path.isfile(config_path):
         print(f"::error::Config not found: {config_path}")
         sys.exit(1)
@@ -45,8 +66,35 @@ def load_config(config_path=CONFIG_PATH):
         return json.load(f)
 
 
+def save_vendor_config(vendor_name, vendor_config):
+    """Write a single vendor's config to configs/<vendor>.json."""
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
+    filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    with open(filepath, "w") as f:
+        json.dump(vendor_config, f, indent=2)
+        f.write("\n")
+
+
+def delete_vendor_config(vendor_name):
+    """Delete a vendor's config file from configs/."""
+    filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    if os.path.isfile(filepath):
+        os.remove(filepath)
+
+
 def save_config(config):
-    """Write config back to disk."""
+    """Write config back to disk.
+
+    If per-vendor configs/ is in use, writes individual files.
+    Otherwise writes monolithic config.json.
+    """
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            for vendor_name, vendor_config in config.get("vendors", {}).items():
+                save_vendor_config(vendor_name, vendor_config)
+            return
+
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
