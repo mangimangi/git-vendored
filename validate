@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Validate that a GitHub repo implements the git-vendored vendor contract.
+
+Checks whether a repo properly implements the vendor contract by verifying
+install.sh exists, follows conventions, and produces a valid manifest
+when run in a sandbox.
+
+Usage:
+    python3 validate <owner/repo> [--version <version>]
+
+Environment:
+    GH_TOKEN - Auth token for GitHub API access
+
+Checks performed:
+    1. Repo exists and is accessible
+    2. install.sh exists at repo root
+    3. install.sh has valid bash shebang
+    4. install.sh passes syntax check (bash -n)
+    5. Version is resolvable (releases or VERSION file)
+    6. Dry-run: install.sh runs successfully
+    7. Dry-run: manifest is written to $VENDOR_MANIFEST
+    8. Dry-run: all manifest files exist on disk
+
+Exit codes:
+    0 - All checks passed
+    1 - One or more checks failed
+"""
+
+import argparse
+import base64
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+# ── Utilities ────────────────────────────────────────────────────────────
+
+
+def _gh_env(token=None):
+    """Build env dict with GH_TOKEN for gh CLI calls."""
+    env = dict(os.environ)
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
+class ValidationResult:
+    """Collects pass/fail results for each check."""
+
+    def __init__(self):
+        self.checks = []
+
+    def passed(self, name, detail=None):
+        msg = f"  [PASS] {name}"
+        if detail:
+            msg += f" ({detail})"
+        self.checks.append((True, msg))
+        print(msg)
+
+    def failed(self, name, detail=None):
+        msg = f"  [FAIL] {name}"
+        if detail:
+            msg += f" -- {detail}"
+        self.checks.append((False, msg))
+        print(msg)
+
+    @property
+    def all_passed(self):
+        return all(ok for ok, _ in self.checks)
+
+    def summary(self):
+        total = len(self.checks)
+        passed = sum(1 for ok, _ in self.checks if ok)
+        failed = total - passed
+        print()
+        if failed == 0:
+            print(f"Result: PASS ({passed}/{total} checks passed)")
+        else:
+            print(f"Result: FAIL ({failed}/{total} checks failed)")
+        return failed == 0
+
+
+# ── Check functions ──────────────────────────────────────────────────────
+
+
+def check_repo_exists(repo, token):
+    """Check that the GitHub repo exists and is accessible."""
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}", "--jq", ".full_name"],
+        capture_output=True, text=True, env=env
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def check_install_sh_exists(repo, token):
+    """Check that install.sh exists at the repo root."""
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/install.sh", "--jq", ".name"],
+        capture_output=True, text=True, env=env
+    )
+    return result.returncode == 0 and result.stdout.strip() == "install.sh"
+
+
+def download_install_sh(repo, token, ref=None):
+    """Download install.sh content from the repo."""
+    env = _gh_env(token)
+    endpoint = f"repos/{repo}/contents/install.sh"
+    if ref:
+        endpoint += f"?ref={ref}"
+    result = subprocess.run(
+        ["gh", "api", endpoint, "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return base64.b64decode(result.stdout.strip()).decode()
+
+
+def check_shebang(script_content):
+    """Check that install.sh has a valid bash shebang."""
+    first_line = script_content.split("\n")[0].strip()
+    valid_shebangs = ["#!/bin/bash", "#!/usr/bin/env bash"]
+    return first_line in valid_shebangs, first_line
+
+
+def check_syntax(script_content):
+    """Check that install.sh is syntactically valid bash."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+        f.write(script_content)
+        path = f.name
+    try:
+        result = subprocess.run(
+            ["bash", "-n", path],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0, result.stderr.strip()
+    finally:
+        os.unlink(path)
+
+
+def resolve_version(repo, token):
+    """Resolve the latest version from releases or VERSION file."""
+    env = _gh_env(token)
+
+    # Try releases first
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().lstrip("v")
+
+    # Fall back to VERSION file
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/VERSION", "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return base64.b64decode(result.stdout.strip()).decode().strip()
+
+    return None
+
+
+def dry_run_install(repo, version, token, script_content):
+    """Run install.sh in a temporary directory and validate manifest output."""
+    workdir = tempfile.mkdtemp(prefix="gv-validate-")
+    manifest_path = os.path.join(workdir, ".manifest")
+    vendor_name = repo.split("/")[-1]
+    install_dir = os.path.join(".vendored", "pkg", vendor_name)
+
+    # Write script to temp file
+    script_path = os.path.join(workdir, "install.sh")
+    with open(script_path, "w") as f:
+        f.write(script_content)
+
+    ref = f"v{version}"
+
+    env = _gh_env(token)
+    # v2 contract env vars
+    env["VENDOR_REPO"] = repo
+    env["VENDOR_REF"] = ref
+    env["VENDOR_MANIFEST"] = manifest_path
+    env["VENDOR_INSTALL_DIR"] = install_dir
+
+    result = subprocess.run(
+        ["bash", script_path, version],
+        capture_output=True, text=True, env=env,
+        cwd=workdir
+    )
+
+    run_ok = result.returncode == 0
+    run_output = ""
+    if result.stderr.strip():
+        run_output = result.stderr.strip()
+    elif result.stdout.strip():
+        run_output = result.stdout.strip()
+
+    # Check manifest
+    manifest_written = (os.path.isfile(manifest_path)
+                        and os.path.getsize(manifest_path) > 0)
+    manifest_files = []
+    if manifest_written:
+        with open(manifest_path) as mf:
+            manifest_files = [line.strip() for line in mf if line.strip()]
+
+    # Check all manifest files exist on disk (relative to workdir)
+    missing = [f for f in manifest_files
+               if not os.path.isfile(os.path.join(workdir, f))]
+
+    # Cleanup
+    shutil.rmtree(workdir, ignore_errors=True)
+
+    return {
+        "run_ok": run_ok,
+        "run_output": run_output,
+        "manifest_written": manifest_written,
+        "manifest_files": manifest_files,
+        "missing_files": missing,
+    }
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Validate that a repo implements the git-vendored vendor contract."
+    )
+    parser.add_argument("repo", help="GitHub repo to validate (owner/repo)")
+    parser.add_argument("--version", default="latest",
+                        help="Version to validate (default: latest)")
+    args = parser.parse_args()
+
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    repo = args.repo
+    requested_version = args.version
+
+    print(f"Validating vendor contract: {repo}")
+    print()
+
+    result = ValidationResult()
+
+    # 1. Repo exists
+    if not check_repo_exists(repo, token):
+        result.failed("Repo exists", f"cannot access {repo}")
+        result.summary()
+        sys.exit(1)
+    result.passed("Repo exists")
+
+    # 2. install.sh exists
+    if not check_install_sh_exists(repo, token):
+        result.failed("install.sh exists", "not found at repository root")
+        result.summary()
+        sys.exit(1)
+    result.passed("install.sh exists")
+
+    # 3. Resolve version
+    if requested_version and requested_version != "latest":
+        version = requested_version
+        result.passed("Version specified", version)
+    else:
+        version = resolve_version(repo, token)
+        if version:
+            result.passed("Version resolvable", version)
+        else:
+            result.failed("Version resolvable",
+                          "no releases or VERSION file found")
+            result.summary()
+            sys.exit(1)
+
+    # 4. Download install.sh at resolved version
+    ref = f"v{version}"
+    script_content = download_install_sh(repo, token, ref=ref)
+    if not script_content:
+        # Try without v prefix
+        script_content = download_install_sh(repo, token, ref=version)
+    if not script_content:
+        # Try default branch
+        script_content = download_install_sh(repo, token)
+    if not script_content:
+        result.failed("Download install.sh", f"failed at ref {ref}")
+        result.summary()
+        sys.exit(1)
+
+    # 5. Shebang check
+    shebang_ok, first_line = check_shebang(script_content)
+    if shebang_ok:
+        result.passed("Valid shebang", first_line)
+    else:
+        result.failed("Valid shebang",
+                      f"expected #!/bin/bash or #!/usr/bin/env bash, "
+                      f"got: {first_line}")
+
+    # 6. Syntax check
+    syntax_ok, syntax_err = check_syntax(script_content)
+    if syntax_ok:
+        result.passed("Syntax valid", "bash -n passed")
+    else:
+        result.failed("Syntax valid", syntax_err)
+
+    # 7-9. Dry-run install in sandbox
+    dry = dry_run_install(repo, version, token, script_content)
+
+    if dry["run_ok"]:
+        result.passed("Dry-run install", "exit code 0")
+    else:
+        detail = dry["run_output"][:200] if dry["run_output"] else "non-zero exit"
+        result.failed("Dry-run install", detail)
+
+    if dry["manifest_written"]:
+        result.passed("Manifest written",
+                      f"{len(dry['manifest_files'])} files")
+    else:
+        result.failed("Manifest written",
+                      "install.sh did not write to $VENDOR_MANIFEST")
+
+    if dry["manifest_written"] and dry["manifest_files"]:
+        if not dry["missing_files"]:
+            result.passed("Manifest files exist", "all files found on disk")
+        else:
+            missing_preview = ", ".join(dry["missing_files"][:5])
+            result.failed("Manifest files exist",
+                          f"{len(dry['missing_files'])} missing: "
+                          f"{missing_preview}")
+
+    all_passed = result.summary()
+    sys.exit(0 if all_passed else 1)
+
+
+if __name__ == "__main__":
+    main()
