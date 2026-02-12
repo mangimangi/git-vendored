@@ -20,40 +20,19 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = ".semver/config.json"
-VENDORED_CONFIG_PATH = ".vendored/configs/semver.json"
 DEFAULT_VERSION_FILE = "VERSION"
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-def _find_config_path(config_path=None):
-    """Find the config file path.
-
-    Tries .vendored/configs/semver.json first, falls back to .semver/config.json.
-    Explicit config_path overrides both.
-    """
-    if config_path:
-        return Path(config_path)
-    vendored = Path(VENDORED_CONFIG_PATH)
-    if vendored.exists():
-        return vendored
-    return Path(DEFAULT_CONFIG_PATH)
-
-
 def load_config(config_path=None):
-    """Load and validate semver config.
-
-    Tries .vendored/configs/semver.json first, falls back to .semver/config.json.
-    When loading from vendored config, ignores the _vendor key.
-    """
-    path = _find_config_path(config_path)
+    """Load and validate .semver/config.json."""
+    path = Path(config_path or DEFAULT_CONFIG_PATH)
     if not path.exists():
         print(f"Error: config not found: {path}", file=sys.stderr)
         sys.exit(1)
     with open(path) as f:
-        raw = json.load(f)
-    # Filter out _vendor key (framework-managed registry fields)
-    config = {k: v for k, v in raw.items() if k != "_vendor"}
+        config = json.load(f)
     if "files" not in config:
         print("Error: 'files' key required in config", file=sys.stderr)
         sys.exit(1)
