@@ -1,0 +1,38 @@
+# .github/workflows/validate-vendor.yml
+# Validates whether a repo implements the git-vendored vendor contract.
+#
+# Runs the validate script against a target repo without installing it.
+# Limited to public repos (or repos accessible via github.token).
+# For private repos, run python3 validate locally with GH_TOKEN set.
+#
+# Trigger: workflow_dispatch with repo and optional version inputs.
+
+name: Validate Vendor
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'GitHub repo to validate (owner/repo)'
+        required: true
+      version:
+        description: 'Version to validate against (default: latest)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate vendor contract
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VALIDATE_REPO: ${{ inputs.repo }}
+          VALIDATE_VERSION: ${{ inputs.version }}
+        run: python3 validate "$VALIDATE_REPO" --version "$VALIDATE_VERSION"
