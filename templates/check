@@ -31,12 +31,26 @@ import sys
 CONFIGS_DIR = ".vendored/configs"
 
 
+def _extract_vendor_registry(raw):
+    """Extract registry fields from a per-vendor config file's contents.
+
+    If the file has a _vendor key, use that. Otherwise treat all top-level
+    keys as registry fields (backwards compat with pre-_vendor configs).
+    """
+    if "_vendor" in raw:
+        return dict(raw["_vendor"])
+    return dict(raw)
+
+
 def load_config(config_path=".vendored/config.json"):
     """Load and return the vendored config.
 
     Scans .vendored/configs/ for per-vendor <vendor>.json files first.
     Falls back to monolithic config.json if configs/ dir doesn't exist
     or has no .json files.
+
+    When reading per-vendor configs with a _vendor key, extracts registry
+    fields from _vendor so callers see the same flat shape.
     """
     # Try per-vendor configs first
     if os.path.isdir(CONFIGS_DIR):
@@ -47,7 +61,8 @@ def load_config(config_path=".vendored/config.json"):
                 vendor_name = filename[:-5]  # strip .json
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
-                    vendors[vendor_name] = json.load(f)
+                    raw = json.load(f)
+                vendors[vendor_name] = _extract_vendor_registry(raw)
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json

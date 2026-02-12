@@ -84,7 +84,7 @@ class TestLoadConfig:
         assert exc_info.value.code == 1
 
     def test_loads_per_vendor_configs(self, tmp_repo):
-        """load_config() scans configs/ for per-vendor .json files."""
+        """load_config() scans configs/ for per-vendor .json files (flat format)."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
         (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
@@ -94,6 +94,28 @@ class TestLoadConfig:
         assert "tool" in config["vendors"]
         assert "other" in config["vendors"]
         assert config["vendors"]["tool"]["repo"] == "owner/tool"
+
+    def test_loads_per_vendor_configs_with_vendor_key(self, tmp_repo):
+        """load_config() extracts registry from _vendor key."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_file = {"_vendor": SAMPLE_VENDOR, "custom_key": "value"}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_file))
+        config = inst.load_config()
+        assert "vendors" in config
+        assert "tool" in config["vendors"]
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+        # Project config keys should NOT leak into the vendor registry
+        assert "custom_key" not in config["vendors"]["tool"]
+
+    def test_flat_configs_backwards_compat(self, tmp_repo):
+        """Flat configs (no _vendor key) still load correctly."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        config = inst.load_config()
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+        assert config["vendors"]["tool"]["install_branch"] == "chore/install-tool"
 
     def test_per_vendor_configs_take_priority(self, tmp_repo, make_config):
         """Per-vendor configs take priority over monolithic config.json."""
@@ -133,23 +155,41 @@ class TestSaveConfig:
         assert "tool" in loaded["vendors"]
 
     def test_saves_per_vendor_configs(self, tmp_repo):
-        """save_config writes individual files when configs/ dir is in use."""
+        """save_config writes individual files with _vendor key when configs/ in use."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
-        (configs_dir / "existing.json").write_text(json.dumps(EXISTING_VENDOR))
+        (configs_dir / "existing.json").write_text(json.dumps({"_vendor": EXISTING_VENDOR}))
         config = {"vendors": {"tool": SAMPLE_VENDOR, "existing": EXISTING_VENDOR}}
         inst.save_config(config)
         assert (configs_dir / "tool.json").is_file()
         loaded = json.loads((configs_dir / "tool.json").read_text())
-        assert loaded["repo"] == "owner/tool"
+        assert "_vendor" in loaded
+        assert loaded["_vendor"]["repo"] == "owner/tool"
 
     def test_save_vendor_config(self, tmp_repo):
-        """save_vendor_config writes individual vendor config."""
+        """save_vendor_config writes config with _vendor key."""
         inst.save_vendor_config("tool", SAMPLE_VENDOR)
         filepath = tmp_repo / ".vendored" / "configs" / "tool.json"
         assert filepath.is_file()
         loaded = json.loads(filepath.read_text())
-        assert loaded["repo"] == "owner/tool"
+        assert "_vendor" in loaded
+        assert loaded["_vendor"]["repo"] == "owner/tool"
+        # Registry fields should NOT be at top level
+        assert "repo" not in loaded
+
+    def test_save_vendor_config_preserves_project_config(self, tmp_repo):
+        """save_vendor_config preserves existing top-level project config keys."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        existing = {"_vendor": SAMPLE_VENDOR, "prefix": "gv", "docs": ["README.md"]}
+        (configs_dir / "tool.json").write_text(json.dumps(existing))
+        # Update registry
+        new_registry = dict(SAMPLE_VENDOR, automerge=True)
+        inst.save_vendor_config("tool", new_registry)
+        loaded = json.loads((configs_dir / "tool.json").read_text())
+        assert loaded["_vendor"]["automerge"] is True
+        assert loaded["prefix"] == "gv"
+        assert loaded["docs"] == ["README.md"]
 
     def test_delete_vendor_config(self, tmp_repo):
         """delete_vendor_config removes the vendor's config file."""
@@ -617,10 +657,10 @@ class TestInstallNewVendor:
         assert result["vendor"] == "new-tool"
         assert result["changed"] is True
 
-        # New entry should be migrated to per-vendor config
+        # New entry should be migrated to per-vendor config with _vendor key
         assert (configs_dir / "new-tool.json").is_file()
         migrated = json.loads((configs_dir / "new-tool.json").read_text())
-        assert migrated["repo"] == "owner/new-tool"
+        assert migrated["_vendor"]["repo"] == "owner/new-tool"
 
         # config.json should be cleaned up
         raw = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
@@ -1044,7 +1084,7 @@ class TestCreatePullRequest:
 
 class TestMigrateConfig:
     def test_splits_vendors_into_configs_dir(self, tmp_repo, make_config):
-        """migrate_config creates individual files in configs/."""
+        """migrate_config creates individual files in configs/ with _vendor key."""
         make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}})
         raw = {"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}}
         inst.migrate_config(raw)
@@ -1054,7 +1094,8 @@ class TestMigrateConfig:
         assert (configs_dir / "other.json").is_file()
 
         tool_config = json.loads((configs_dir / "tool.json").read_text())
-        assert tool_config["repo"] == "owner/tool"
+        assert "_vendor" in tool_config
+        assert tool_config["_vendor"]["repo"] == "owner/tool"
 
     def test_removes_vendors_key_from_config(self, tmp_repo, make_config):
         """migrate_config removes vendors key from config.json."""
@@ -1097,7 +1138,7 @@ class TestMigrateConfig:
         assert inst._should_migrate_config() is False
 
     def test_preserves_protected_field(self, tmp_repo, make_config):
-        """Protected field is preserved in per-vendor config for v1 fallback."""
+        """Protected field is preserved under _vendor key for v1 fallback."""
         vendor = dict(SAMPLE_VENDOR, protected=[".tool/**"])
         make_config({"vendors": {"tool": vendor}})
         raw = {"vendors": {"tool": vendor}}
@@ -1105,7 +1146,7 @@ class TestMigrateConfig:
 
         configs_dir = tmp_repo / ".vendored" / "configs"
         tool_config = json.loads((configs_dir / "tool.json").read_text())
-        assert tool_config["protected"] == [".tool/**"]
+        assert tool_config["_vendor"]["protected"] == [".tool/**"]
 
     def test_logs_migration(self, tmp_repo, make_config, capsys):
         """Migration logs to stderr for visibility."""
@@ -1116,6 +1157,195 @@ class TestMigrateConfig:
         err = capsys.readouterr().err
         assert "Migrated config: tool" in err
         assert "migration complete" in err.lower()
+
+
+# ── Tests: project config migration ──────────────────────────────────────
+
+class TestMigrateProjectConfigs:
+    def test_merges_legacy_project_config(self, tmp_repo):
+        """Legacy .<vendor>/config.json is merged into configs/<vendor>.json."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_data = {"_vendor": SAMPLE_VENDOR}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_data))
+
+        # Legacy project config
+        (tmp_repo / ".tool").mkdir()
+        project = {"setting": "value", "flag": True}
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps(project))
+
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged["_vendor"] == SAMPLE_VENDOR
+        assert merged["setting"] == "value"
+        assert merged["flag"] is True
+
+    def test_does_not_overwrite_vendor_key(self, tmp_repo):
+        """_vendor key is never overwritten by project config."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_data = {"_vendor": SAMPLE_VENDOR}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_data))
+
+        # Legacy config that happens to have a _vendor key
+        (tmp_repo / ".tool").mkdir()
+        project = {"_vendor": {"repo": "evil/override"}, "setting": "ok"}
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps(project))
+
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged["_vendor"]["repo"] == "owner/tool"
+        assert merged["setting"] == "ok"
+
+    def test_removes_legacy_config_after_merge(self, tmp_repo):
+        """Legacy config file is deleted after successful merge."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        assert not (tmp_repo / ".tool" / "config.json").exists()
+
+    def test_idempotent(self, tmp_repo):
+        """Running migration twice doesn't duplicate or corrupt."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+        # Second run: legacy file is gone, no-op
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged["x"] == 1
+        assert merged["_vendor"] == SAMPLE_VENDOR
+
+    def test_no_legacy_config_is_noop(self, tmp_repo):
+        """No legacy config files means migration is a no-op."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        inst.migrate_project_configs()
+
+        merged = json.loads((configs_dir / "tool.json").read_text())
+        assert merged == {"_vendor": SAMPLE_VENDOR}
+
+    def test_should_migrate_detects_legacy(self, tmp_repo):
+        """_should_migrate_project_configs returns True when legacy configs exist."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text("{}")
+
+        assert inst._should_migrate_project_configs() is True
+
+    def test_should_migrate_false_when_no_legacy(self, tmp_repo):
+        """_should_migrate_project_configs returns False when no legacy configs."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        assert inst._should_migrate_project_configs() is False
+
+    def test_should_migrate_false_when_no_configs_dir(self, tmp_repo):
+        """_should_migrate_project_configs returns False when no configs/ dir."""
+        assert inst._should_migrate_project_configs() is False
+
+    def test_logs_migration(self, tmp_repo, capsys):
+        """Migration logs to stderr for visibility."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        err = capsys.readouterr().err
+        assert "Merged project config" in err
+        assert ".tool/config.json" in err
+
+    def test_removes_empty_dotdir(self, tmp_repo):
+        """Empty dot-directory is cleaned up after config migration."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Dot-directory with only config.json
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        assert not (tmp_repo / ".tool").exists()
+
+    def test_preserves_non_empty_dotdir(self, tmp_repo):
+        """Dot-directory with other files is NOT removed."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Dot-directory with config.json AND other files
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+        (tmp_repo / ".tool" / "data.db").write_text("data")
+
+        inst.migrate_project_configs()
+
+        # config.json removed but dir preserved because of data.db
+        assert not (tmp_repo / ".tool" / "config.json").exists()
+        assert (tmp_repo / ".tool").exists()
+        assert (tmp_repo / ".tool" / "data.db").exists()
+
+    def test_preserves_dotdir_with_data_and_git_infra(self, tmp_repo):
+        """Dot-directory with data files and git infrastructure is retained as data zone."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Simulate a vendor dot-dir with data files and git infrastructure
+        dotdir = tmp_repo / ".tool"
+        dotdir.mkdir()
+        (dotdir / "config.json").write_text(json.dumps({"x": 1}))
+        (dotdir / "issues.jsonl").write_text('{"id":"t-1"}\n')
+        (dotdir / ".gitattributes").write_text("*.jsonl merge=custom\n")
+        (dotdir / ".gitignore").write_text("*.lock\n")
+
+        inst.migrate_project_configs()
+
+        # config.json migrated away, but data + git infra preserved
+        assert not (dotdir / "config.json").exists()
+        assert dotdir.exists()
+        assert (dotdir / "issues.jsonl").exists()
+        assert (dotdir / ".gitattributes").exists()
+        assert (dotdir / ".gitignore").exists()
+
+    def test_logs_empty_dir_removal(self, tmp_repo, capsys):
+        """Cleanup of empty dot-directory is logged."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text(json.dumps({"x": 1}))
+
+        inst.migrate_project_configs()
+
+        err = capsys.readouterr().err
+        assert "Removed empty directory" in err
 
 
 # ── Tests: CLI routing ────────────────────────────────────────────────────

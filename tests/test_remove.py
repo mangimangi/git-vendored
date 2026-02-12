@@ -72,13 +72,23 @@ class TestLoadConfig:
         assert exc_info.value.code == 1
 
     def test_loads_per_vendor_configs(self, tmp_repo):
-        """load_config() scans configs/ for per-vendor .json files."""
+        """load_config() scans configs/ for per-vendor .json files (flat format)."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
         (configs_dir / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
         config = rem.load_config()
         assert "vendors" in config
         assert "tool" in config["vendors"]
+
+    def test_loads_per_vendor_configs_with_vendor_key(self, tmp_repo):
+        """load_config() extracts registry from _vendor key."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        vendor_file = {"_vendor": SAMPLE_VENDOR, "custom": "data"}
+        (configs_dir / "tool.json").write_text(json.dumps(vendor_file))
+        config = rem.load_config()
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+        assert "custom" not in config["vendors"]["tool"]
 
     def test_empty_configs_dir_falls_back(self, tmp_repo, make_config):
         """Empty configs/ dir falls back to monolithic config.json."""

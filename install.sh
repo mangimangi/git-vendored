@@ -72,6 +72,24 @@ fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 INSTALLED_FILES+=(".vendored/hooks/pre-commit")
 
+# Install pre-commit hook into .git/hooks/ (symlink, idempotent)
+if [ -d .git/hooks ]; then
+    HOOK_DST=".git/hooks/pre-commit"
+    HOOK_REL="../../.vendored/hooks/pre-commit"
+    if [ -L "$HOOK_DST" ]; then
+        # Already a symlink — update if it points elsewhere
+        if [ "$(readlink "$HOOK_DST")" != "$HOOK_REL" ]; then
+            ln -sf "$HOOK_REL" "$HOOK_DST"
+            echo "Updated .git/hooks/pre-commit symlink"
+        fi
+    elif [ -f "$HOOK_DST" ]; then
+        echo "Warning: .git/hooks/pre-commit already exists (not a symlink), skipping" >&2
+    else
+        ln -s "$HOOK_REL" "$HOOK_DST"
+        echo "Installed .git/hooks/pre-commit"
+    fi
+fi
+
 # Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
 rm -f .vendored/.version
 
