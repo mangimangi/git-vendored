@@ -43,37 +43,58 @@ if [ -f "$MERGE_DRIVER" ]; then
     git config merge.prl-jsonl.driver "python3 \"$MERGE_DRIVER\" %O %A %B"
 fi
 
-# Install pre-commit hook (symlink to .pearls/hooks/pre-commit)
-PRE_COMMIT_SRC="$PROJECT_DIR/.pearls/hooks/pre-commit"
+# Install pre-commit hook
+# Try .vendored/hooks/pre-commit first (vendor file protection check),
+# fall back to .pearls/hooks/pre-commit (legacy location)
 PRE_COMMIT_DST="$PROJECT_DIR/.git/hooks/pre-commit"
-if [ -f "$PRE_COMMIT_SRC" ]; then
+PRE_COMMIT_SRC=""
+PRE_COMMIT_REL=""
+if [ -f "$PROJECT_DIR/.vendored/hooks/pre-commit" ]; then
+    PRE_COMMIT_SRC="$PROJECT_DIR/.vendored/hooks/pre-commit"
+    PRE_COMMIT_REL="../../.vendored/hooks/pre-commit"
+elif [ -f "$PROJECT_DIR/.pearls/hooks/pre-commit" ]; then
+    PRE_COMMIT_SRC="$PROJECT_DIR/.pearls/hooks/pre-commit"
+    PRE_COMMIT_REL="../../.pearls/hooks/pre-commit"
+fi
+if [ -n "$PRE_COMMIT_SRC" ]; then
     if [ -L "$PRE_COMMIT_DST" ]; then
-        # Already a symlink — verify it points to our hook
+        # Already a symlink — verify it points to a known hook
         LINK_TARGET=$(readlink "$PRE_COMMIT_DST")
-        if [[ "$LINK_TARGET" != *".pearls/hooks/pre-commit"* ]]; then
-            echo "Warning: .git/hooks/pre-commit is a symlink to $LINK_TARGET, skipping prl pre-commit hook" >&2
+        if [[ "$LINK_TARGET" != *".vendored/hooks/pre-commit"* ]] && \
+           [[ "$LINK_TARGET" != *".pearls/hooks/pre-commit"* ]]; then
+            echo "Warning: .git/hooks/pre-commit is a symlink to $LINK_TARGET, skipping hook install" >&2
         fi
     elif [ -f "$PRE_COMMIT_DST" ]; then
-        echo "Warning: .git/hooks/pre-commit already exists, skipping prl pre-commit hook" >&2
+        echo "Warning: .git/hooks/pre-commit already exists, skipping hook install" >&2
     else
-        ln -s "../../.pearls/hooks/pre-commit" "$PRE_COMMIT_DST"
+        ln -s "$PRE_COMMIT_REL" "$PRE_COMMIT_DST"
     fi
 fi
 
-# Install pre-push hook (symlink to .pearls/hooks/pre-push)
-PRE_PUSH_SRC="$PROJECT_DIR/.pearls/hooks/pre-push"
+# Install pre-push hook
+# Try .vendored/hooks/pre-push first, fall back to .pearls/hooks/pre-push
 PRE_PUSH_DST="$PROJECT_DIR/.git/hooks/pre-push"
-if [ -f "$PRE_PUSH_SRC" ]; then
+PRE_PUSH_SRC=""
+PRE_PUSH_REL=""
+if [ -f "$PROJECT_DIR/.vendored/hooks/pre-push" ]; then
+    PRE_PUSH_SRC="$PROJECT_DIR/.vendored/hooks/pre-push"
+    PRE_PUSH_REL="../../.vendored/hooks/pre-push"
+elif [ -f "$PROJECT_DIR/.pearls/hooks/pre-push" ]; then
+    PRE_PUSH_SRC="$PROJECT_DIR/.pearls/hooks/pre-push"
+    PRE_PUSH_REL="../../.pearls/hooks/pre-push"
+fi
+if [ -n "$PRE_PUSH_SRC" ]; then
     if [ -L "$PRE_PUSH_DST" ]; then
-        # Already a symlink — verify it points to our hook
+        # Already a symlink — verify it points to a known hook
         LINK_TARGET=$(readlink "$PRE_PUSH_DST")
-        if [[ "$LINK_TARGET" != *".pearls/hooks/pre-push"* ]]; then
-            echo "Warning: .git/hooks/pre-push is a symlink to $LINK_TARGET, skipping prl pre-push hook" >&2
+        if [[ "$LINK_TARGET" != *".vendored/hooks/pre-push"* ]] && \
+           [[ "$LINK_TARGET" != *".pearls/hooks/pre-push"* ]]; then
+            echo "Warning: .git/hooks/pre-push is a symlink to $LINK_TARGET, skipping hook install" >&2
         fi
     elif [ -f "$PRE_PUSH_DST" ]; then
-        echo "Warning: .git/hooks/pre-push already exists, skipping prl pre-push hook" >&2
+        echo "Warning: .git/hooks/pre-push already exists, skipping hook install" >&2
     else
-        ln -s "../../.pearls/hooks/pre-push" "$PRE_PUSH_DST"
+        ln -s "$PRE_PUSH_REL" "$PRE_PUSH_DST"
     fi
 fi
 
