@@ -108,55 +108,26 @@ def find_issues_file() -> Path:
     return issues_path
 
 
-def _find_project_config() -> Path:
-    """Find the project config file for pearls.
-
-    Tries .vendored/configs/pearls.json first (reads top-level keys,
-    ignores _vendor). Falls back to .pearls/config.json.
-    """
-    pearls_dir = find_pearls_dir()
-    repo_root = pearls_dir.parent
-
-    # Try vendored config first
-    vendored_config = repo_root / ".vendored" / "configs" / "pearls.json"
-    if vendored_config.exists():
-        return vendored_config
-
-    # Fallback to legacy location
-    legacy_config = pearls_dir / "config.json"
-    if legacy_config.exists():
-        return legacy_config
-
-    return legacy_config  # Return legacy path for error messages
-
-
-def _load_project_config_from_file(config_path: Path) -> dict:
-    """Load project config from a config file, ignoring _vendor key."""
+def load_prefix() -> str:
+    """Load ID prefix from .pearls/config.json. Requires config file with "prefix" key."""
+    config_path = find_pearls_dir() / "config.json"
     if not config_path.exists():
         print(
-            f"Error: {config_path} not found.\n"
+            "Error: .pearls/config.json not found.\n"
             'Create it with: {"prefix": "your-project"}',
             file=sys.stderr,
         )
         sys.exit(1)
     try:
         with open(config_path, "r") as f:
-            raw = json.load(f)
+            config = json.load(f)
     except json.JSONDecodeError as e:
-        print(f"Error: {config_path} is not valid JSON: {e}", file=sys.stderr)
+        print(f"Error: .pearls/config.json is not valid JSON: {e}", file=sys.stderr)
         sys.exit(1)
-    # Filter out _vendor key (framework-managed registry fields)
-    return {k: v for k, v in raw.items() if k != "_vendor"}
-
-
-def load_prefix() -> str:
-    """Load ID prefix from project config. Requires "prefix" key."""
-    config_path = _find_project_config()
-    config = _load_project_config_from_file(config_path)
     prefix = config.get("prefix")
     if not prefix:
         print(
-            f'Error: "prefix" key missing or empty in {config_path}.',
+            'Error: "prefix" key missing or empty in .pearls/config.json.',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -164,10 +135,7 @@ def load_prefix() -> str:
 
 
 def load_config() -> dict:
-    """Load full project config.
-
-    Tries .vendored/configs/pearls.json first, falls back to .pearls/config.json.
-    Ignores _vendor key when loading from vendored config.
+    """Load full config from .pearls/config.json.
 
     Returns dict with keys:
         - prefix (str, required): Issue ID prefix
@@ -175,12 +143,24 @@ def load_config() -> dict:
         - docs (list[str], optional): Paths to reference docs
         - epics (list[str], optional): First-class epic slugs (e.g. ["1shots", "enhncmnts"])
     """
-    config_path = _find_project_config()
-    config = _load_project_config_from_file(config_path)
+    config_path = find_pearls_dir() / "config.json"
+    if not config_path.exists():
+        print(
+            "Error: .pearls/config.json not found.\n"
+            'Create it with: {"prefix": "your-project"}',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: .pearls/config.json is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
     prefix = config.get("prefix")
     if not prefix:
         print(
-            f'Error: "prefix" key missing or empty in {config_path}.',
+            'Error: "prefix" key missing or empty in .pearls/config.json.',
             file=sys.stderr,
         )
         sys.exit(1)
