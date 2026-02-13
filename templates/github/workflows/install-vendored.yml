@@ -61,4 +61,4 @@ jobs:
         run: |
           VENDOR="${{ inputs.vendor || 'all' }}"
           VERSION="${{ inputs.version || 'latest' }}"
-          python3 .vendored/install "$VENDOR" --version "$VERSION" --pr
+          python3 .vendored/install "$VENDOR" --version "$VERSION" --pr --deps=install

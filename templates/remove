@@ -106,6 +106,29 @@ def read_manifest(vendor_name):
         return [line.strip() for line in f if line.strip()]
 
 
+def check_reverse_deps(vendor_name):
+    """Check if any installed vendors depend on the given vendor.
+
+    Scans .vendored/manifests/*.deps files for references.
+    Returns list of vendor names that depend on the given vendor.
+    """
+    dependents = []
+    if not os.path.isdir(MANIFESTS_DIR):
+        return dependents
+    for filename in os.listdir(MANIFESTS_DIR):
+        if not filename.endswith(".deps"):
+            continue
+        dep_vendor = filename[:-5]  # strip .deps
+        if dep_vendor == vendor_name:
+            continue  # skip self
+        filepath = os.path.join(MANIFESTS_DIR, filename)
+        with open(filepath) as f:
+            deps = [line.strip() for line in f if line.strip()]
+        if vendor_name in deps:
+            dependents.append(dep_vendor)
+    return sorted(dependents)
+
+
 def get_files_to_remove(vendor_name):
     """Determine which files to remove for a vendor.
 
@@ -124,6 +147,7 @@ def get_files_to_remove(vendor_name):
     extra = [
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"),
+        os.path.join(MANIFESTS_DIR, f"{vendor_name}.deps"),
     ]
     return manifest_files + [f for f in extra if os.path.isfile(f)]
 
@@ -171,6 +195,21 @@ def main():
         print(f"::error::Unknown vendor: {args.vendor}")
         print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
         sys.exit(1)
+
+    # Reverse dependency check
+    dependents = check_reverse_deps(args.vendor)
+    if dependents:
+        print(f"Warning: The following vendors depend on {args.vendor}:")
+        for d in dependents:
+            print(f"  - {d}")
+        if not args.force:
+            try:
+                answer = input(f"\nRemove anyway? [y/N] ")
+            except EOFError:
+                answer = ""
+            if answer.lower() not in ("y", "yes"):
+                print("Aborted.")
+                sys.exit(0)
 
     files = get_files_to_remove(args.vendor)
 

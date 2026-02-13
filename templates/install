@@ -279,6 +279,191 @@ def write_manifest_version(vendor_name, version):
         f.write(f"{version}\n")
 
 
+def write_deps(vendor_name, dep_names):
+    """Write a vendor's resolved dependency list to manifest storage."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    deps_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.deps")
+    with open(deps_path, "w") as f:
+        for name in sorted(dep_names):
+            f.write(f"{name}\n")
+
+
+def read_deps(vendor_name):
+    """Read a vendor's resolved dependency list from manifest storage."""
+    deps_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.deps")
+    if not os.path.isfile(deps_path):
+        return None
+    with open(deps_path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+# ── Dependency helpers ─────────────────────────────────────────────────────
+
+def download_deps(repo, ref, token):
+    """Download and parse deps.json from a vendor repo.
+
+    Returns parsed dict or None if no deps.json exists.
+    """
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/deps.json?ref={ref}",
+         "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        content = base64.b64decode(result.stdout.strip()).decode()
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def check_deps(deps, config):
+    """Check which declared deps are satisfied.
+
+    Matches deps by repo field against installed vendors' configs.
+    Returns (satisfied, missing) where each is a list of (dep_name, dep_info).
+    """
+    vendors = config.get("vendors", {})
+    installed_repos = {}
+    for vname, vcfg in vendors.items():
+        r = vcfg.get("repo")
+        if r:
+            installed_repos[r] = vname
+
+    satisfied = []
+    missing = []
+    for dep_name, dep_info in deps.items():
+        dep_repo = dep_info.get("repo", "")
+        if dep_repo in installed_repos:
+            satisfied.append((dep_name, dep_info))
+        else:
+            missing.append((dep_name, dep_info))
+    return satisfied, missing
+
+
+def resolve_deps(deps, config, token, mode, installing_set=None):
+    """Apply dependency mode logic.
+
+    Modes:
+      - "error": fail with list of missing deps
+      - "warn": log warnings, continue
+      - "skip": no-op
+      - "install": auto-install missing deps (recursive)
+    """
+    if mode == "skip" or deps is None:
+        return
+
+    satisfied, missing = check_deps(deps, config)
+
+    if not missing:
+        return
+
+    if mode == "error":
+        print("::error::Missing required vendor dependencies:")
+        for dep_name, dep_info in missing:
+            print(f"  - {dep_name} ({dep_info.get('repo', '?')})")
+        print("\nInstall missing deps first:")
+        for dep_name, dep_info in missing:
+            repo = dep_info.get("repo", "")
+            print(f"  python3 .vendored/install {repo}")
+        print("Or use --deps=install to auto-install.")
+        sys.exit(1)
+
+    if mode == "warn":
+        for dep_name, dep_info in missing:
+            print(f"  Warning: missing dependency {dep_name} ({dep_info.get('repo', '?')})")
+        return
+
+    if mode == "install":
+        if installing_set is None:
+            installing_set = set()
+        for dep_name, dep_info in missing:
+            dep_repo = dep_info.get("repo", "")
+            print(f"  {dep_name}: not installed, auto-installing...")
+            install_new_vendor(dep_repo, "latest", token,
+                               installing_set=installing_set)
+        # Reload config after auto-installs
+        return
+
+
+def _get_dep_mode(args_deps, config):
+    """Resolve dependency mode from CLI flag, config, or default."""
+    if args_deps:
+        return args_deps
+    if os.path.isfile(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            try:
+                raw = json.load(f)
+                mode = raw.get("dependency_mode")
+                if mode:
+                    return mode
+            except (json.JSONDecodeError, KeyError):
+                pass
+    return "error"
+
+
+def topological_sort(vendors):
+    """Sort vendors by dependency graph (deps first).
+
+    Reads cached .vendored/manifests/<vendor>.deps for each vendor.
+    Returns sorted list of vendor names.
+    Falls back to alphabetical order if no deps exist.
+    Detects cycles and exits with error.
+    """
+    # Build adjacency: for each vendor, which other vendors must come before it
+    all_names = sorted(vendors.keys())
+    # Map repo -> vendor name for installed vendors
+    repo_to_name = {}
+    for vname, vcfg in vendors.items():
+        r = vcfg.get("repo")
+        if r:
+            repo_to_name[r] = vname
+
+    # Build edges: dep_name -> [vendors that depend on it]
+    in_degree = {name: 0 for name in all_names}
+    graph = {name: [] for name in all_names}  # name -> list of dependents
+
+    for vname in all_names:
+        dep_names = read_deps(vname)
+        if not dep_names:
+            continue
+        for dep in dep_names:
+            # Resolve dep name to installed vendor name
+            resolved = None
+            if dep in vendors:
+                resolved = dep
+            else:
+                # Try matching by scanning configs for repo
+                for other_name, other_cfg in vendors.items():
+                    if other_cfg.get("repo", "").endswith(f"/{dep}"):
+                        resolved = other_name
+                        break
+            if resolved and resolved in in_degree:
+                graph[resolved].append(vname)
+                in_degree[vname] += 1
+
+    # Kahn's algorithm
+    queue = sorted([n for n in all_names if in_degree[n] == 0])
+    result = []
+    while queue:
+        node = queue.pop(0)
+        result.append(node)
+        for dependent in sorted(graph[node]):
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+        queue.sort()
+
+    if len(result) != len(all_names):
+        remaining = set(all_names) - set(result)
+        print(f"::error::Circular dependency detected among vendors: {', '.join(sorted(remaining))}")
+        sys.exit(1)
+
+    return result
+
+
 def validate_manifest(files):
     """Validate that all files listed in manifest exist on disk."""
     missing = [f for f in files if not os.path.isfile(f)]
@@ -434,8 +619,18 @@ def validate_entry(vendor_name, entry):
 
 # ── Core install logic ────────────────────────────────────────────────────
 
-def install_new_vendor(repo, version, token, name=None):
+def install_new_vendor(repo, version, token, name=None, installing_set=None,
+                       dep_mode="error"):
     """First-time add: pre-validate, run install.sh, post-validate."""
+    # Cycle detection
+    if installing_set is None:
+        installing_set = set()
+    if repo in installing_set:
+        chain = " -> ".join(sorted(installing_set)) + f" -> {repo}"
+        print(f"::error::Circular dependency detected: {chain}")
+        sys.exit(1)
+    installing_set.add(repo)
+
     # Pre-validate
     check_repo_exists(repo, token)
     check_install_sh(repo, token)
@@ -456,6 +651,18 @@ def install_new_vendor(repo, version, token, name=None):
                 print(f"::error::Vendor '{vname}' already registered for {repo}.")
                 print("Use .vendored/install <vendor> to update existing vendors.")
                 sys.exit(1)
+
+    # Check dependencies before install
+    ref = f"v{resolved_version}"
+    deps = download_deps(repo, ref, token)
+    dep_names = []
+    if deps:
+        print("Checking dependencies...")
+        resolve_deps(deps, config, token, dep_mode, installing_set)
+        dep_names = list(deps.keys())
+        # Reload config after potential auto-installs
+        config = load_config()
+        vendors = config.get("vendors", {})
 
     # Snapshot config before
     before_vendors = dict(vendors)
@@ -502,6 +709,10 @@ def install_new_vendor(repo, version, token, name=None):
         write_manifest(new_key, manifest_files)
         write_manifest_version(new_key, resolved_version)
 
+    # Cache resolved deps
+    if dep_names:
+        write_deps(new_key, dep_names)
+
     print(f"\nAdded vendor: {new_key}")
     print(f"  repo: {new_entry['repo']}")
     print(f"  version: {resolved_version}")
@@ -519,7 +730,8 @@ def install_new_vendor(repo, version, token, name=None):
     }
 
 
-def install_existing_vendor(vendor_name, vendor_config, requested_version, force=False):
+def install_existing_vendor(vendor_name, vendor_config, requested_version,
+                            force=False, dep_mode="error", installing_set=None):
     """Update path: resolve version, skip if current, run install.sh."""
     token = get_auth_token(vendor_config)
     repo = vendor_config["repo"]
@@ -535,6 +747,16 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version, force
             "changed": False,
         }
 
+    # Check dependencies for the target version
+    ref = f"v{target_version}"
+    deps = download_deps(repo, ref, token)
+    dep_names = []
+    if deps:
+        print(f"  Checking dependencies...")
+        config = load_config()
+        resolve_deps(deps, config, token, dep_mode, installing_set)
+        dep_names = list(deps.keys())
+
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
     manifest_files = download_and_run_install(repo, target_version, token,
                                               vendor_name=vendor_name,
@@ -545,6 +767,10 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version, force
         validate_manifest(manifest_files)
         write_manifest(vendor_name, manifest_files)
         write_manifest_version(vendor_name, target_version)
+
+    # Cache resolved deps
+    if dep_names:
+        write_deps(vendor_name, dep_names)
 
     return {
         "vendor": vendor_name,
@@ -874,6 +1100,11 @@ def main():
         "--name", default=None,
         help="Override the vendor key name (new vendor only)"
     )
+    parser.add_argument(
+        "--deps", default=None,
+        choices=["error", "warn", "install", "skip"],
+        help="Dependency handling mode (default: from config or 'error')"
+    )
     args = parser.parse_args()
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
@@ -888,28 +1119,34 @@ def main():
 
     config = load_config()
     vendors = config.get("vendors", {})
+    dep_mode = _get_dep_mode(args.deps, config)
 
     if args.target == "all":
         # Update all registered vendors
         if not vendors:
             print("No vendors configured in .vendored/config.json")
             sys.exit(0)
+        sorted_names = topological_sort(vendors)
         results = []
-        for name, vcfg in vendors.items():
+        for name in sorted_names:
+            vcfg = vendors[name]
             results.append(
-                install_existing_vendor(name, vcfg, args.version, args.force)
+                install_existing_vendor(name, vcfg, args.version, args.force,
+                                        dep_mode=dep_mode)
             )
         output_results(results)
     elif _is_repo_spec(args.target):
         # New vendor (owner/repo format) — add path
         token = get_auth_token()
-        result = install_new_vendor(args.target, args.version, token, args.name)
+        result = install_new_vendor(args.target, args.version, token, args.name,
+                                    dep_mode=dep_mode)
         output_result(result)
         results = [result]
     elif args.target in vendors:
         # Existing vendor by name — update path
         result = install_existing_vendor(
-            args.target, vendors[args.target], args.version, args.force
+            args.target, vendors[args.target], args.version, args.force,
+            dep_mode=dep_mode
         )
         output_result(result)
         results = [result]
