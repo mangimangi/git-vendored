@@ -7,6 +7,13 @@ install_branch prefix.
 
 Usage:
     python3 .vendored/check [--base <ref>]
+    python3 .vendored/check --staged
+    python3 .vendored/check --install-hook
+
+Modes:
+    (default)       Diff against base ref (for CI / PR checks)
+    --staged        Check staged files only (for pre-commit hook)
+    --install-hook  Install pre-commit hook into .git/hooks/
 
 Exit codes:
     0 - No violations (or all changes are allowed)
@@ -21,8 +28,44 @@ import subprocess
 import sys
 
 
+CONFIGS_DIR = ".vendored/configs"
+
+
+def _extract_vendor_registry(raw):
+    """Extract registry fields from a per-vendor config file's contents.
+
+    If the file has a _vendor key, use that. Otherwise treat all top-level
+    keys as registry fields (backwards compat with pre-_vendor configs).
+    """
+    if "_vendor" in raw:
+        return dict(raw["_vendor"])
+    return dict(raw)
+
+
 def load_config(config_path=".vendored/config.json"):
-    """Load and return the vendored config."""
+    """Load and return the vendored config.
+
+    Scans .vendored/configs/ for per-vendor <vendor>.json files first.
+    Falls back to monolithic config.json if configs/ dir doesn't exist
+    or has no .json files.
+
+    When reading per-vendor configs with a _vendor key, extracts registry
+    fields from _vendor so callers see the same flat shape.
+    """
+    # Try per-vendor configs first
+    if os.path.isdir(CONFIGS_DIR):
+        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
+        if json_files:
+            vendors = {}
+            for filename in sorted(json_files):
+                vendor_name = filename[:-5]  # strip .json
+                filepath = os.path.join(CONFIGS_DIR, filename)
+                with open(filepath) as f:
+                    raw = json.load(f)
+                vendors[vendor_name] = _extract_vendor_registry(raw)
+            return {"vendors": vendors}
+
+    # Fallback to monolithic config.json
     if not os.path.isfile(config_path):
         print(f"Config not found: {config_path}")
         sys.exit(0)
@@ -45,6 +88,18 @@ def get_changed_files(base_ref):
         if result.returncode != 0:
             print(f"Failed to get changed files: {result.stderr.strip()}")
             sys.exit(1)
+    return [f for f in result.stdout.strip().split("\n") if f]
+
+
+def get_staged_files():
+    """Get list of files staged for commit."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"Failed to get staged files: {result.stderr.strip()}")
+        sys.exit(1)
     return [f for f in result.stdout.strip().split("\n") if f]
 
 
@@ -89,6 +144,36 @@ def matches_any_pattern(filepath, patterns):
     return False
 
 
+MANIFESTS_DIR = ".vendored/manifests"
+
+
+def read_manifest(vendor_name):
+    """Read a vendor's manifest file. Returns list of paths, or None if missing."""
+    manifest_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.files")
+    if not os.path.isfile(manifest_path):
+        return None
+    with open(manifest_path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def get_protected_files(vendor_name, vendor_config):
+    """Get protected file patterns for a vendor.
+
+    If a manifest exists, use exact file paths from the manifest plus the
+    manifest file itself. Falls back to config 'protected' patterns for v1
+    vendors without manifests.
+    """
+    manifest_files = read_manifest(vendor_name)
+    if manifest_files is not None:
+        # Manifest-driven: exact paths from manifest + the manifest files themselves
+        protected = list(manifest_files)
+        protected.append(os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"))
+        protected.append(os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"))
+        return protected
+    # v1 fallback: glob patterns from config
+    return vendor_config.get("protected", [])
+
+
 def check_vendor(vendor_name, vendor_config, changed_files, branch):
     """Check a single vendor's protection rules. Returns list of violations."""
     # Skip if branch matches this vendor's install_branch prefix
@@ -96,7 +181,7 @@ def check_vendor(vendor_name, vendor_config, changed_files, branch):
     if install_branch and branch.startswith(install_branch):
         return []
 
-    protected = vendor_config.get("protected", [])
+    protected = get_protected_files(vendor_name, vendor_config)
     allowed = vendor_config.get("allowed", [])
     violations = []
 
@@ -108,6 +193,25 @@ def check_vendor(vendor_name, vendor_config, changed_files, branch):
     return violations
 
 
+def install_hook():
+    """Install the pre-commit hook by symlinking into .git/hooks/."""
+    hook_src = os.path.join(".vendored", "hooks", "pre-commit")
+    hook_dst = os.path.join(".git", "hooks", "pre-commit")
+
+    if not os.path.isfile(hook_src):
+        print(f"Error: {hook_src} not found. Run the install-vendored workflow first.")
+        sys.exit(1)
+
+    os.makedirs(os.path.join(".git", "hooks"), exist_ok=True)
+
+    # Force-overwrite any existing hook (file or symlink)
+    if os.path.islink(hook_dst) or os.path.isfile(hook_dst):
+        os.remove(hook_dst)
+
+    os.symlink(os.path.join("..", "..", ".vendored", "hooks", "pre-commit"), hook_dst)
+    print(f"Installed pre-commit hook: {hook_dst} -> {hook_src}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check for unauthorized vendor file modifications"
@@ -116,17 +220,20 @@ def main():
         "--base", default=None,
         help="Base ref to diff against (default: origin/<base_branch> from env)"
     )
+    parser.add_argument(
+        "--staged", action="store_true",
+        help="Check staged files only (for pre-commit hook)"
+    )
+    parser.add_argument(
+        "--install-hook", action="store_true",
+        help="Install pre-commit hook into .git/hooks/"
+    )
     args = parser.parse_args()
 
-    # Determine base ref
-    base_ref = args.base
-    if not base_ref:
-        # GitHub Actions sets GITHUB_BASE_REF for PRs
-        github_base = os.environ.get("GITHUB_BASE_REF", "")
-        if github_base:
-            base_ref = f"origin/{github_base}"
-        else:
-            base_ref = "origin/main"
+    # --install-hook mode: just install and exit
+    if args.install_hook:
+        install_hook()
+        sys.exit(0)
 
     config = load_config()
     vendors = config.get("vendors", {})
@@ -135,7 +242,21 @@ def main():
         print("No vendors configured")
         sys.exit(0)
 
-    changed_files = get_changed_files(base_ref)
+    # Get files to check
+    if args.staged:
+        changed_files = get_staged_files()
+    else:
+        # Determine base ref
+        base_ref = args.base
+        if not base_ref:
+            # GitHub Actions sets GITHUB_BASE_REF for PRs
+            github_base = os.environ.get("GITHUB_BASE_REF", "")
+            if github_base:
+                base_ref = f"origin/{github_base}"
+            else:
+                base_ref = "origin/main"
+        changed_files = get_changed_files(base_ref)
+
     if not changed_files:
         print("No changed files")
         sys.exit(0)

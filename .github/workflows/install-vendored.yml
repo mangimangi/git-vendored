@@ -2,7 +2,7 @@
 # Installs or updates vendored tools via .vendored/config.json.
 #
 # Handles all vendors from a single workflow — no per-vendor workflow files.
-# All logic lives in .vendored/update; this workflow just provides triggers.
+# All logic lives in .vendored/install; this workflow just provides triggers.
 #
 # Triggers:
 #   - schedule: weekly check for all vendors
@@ -53,7 +53,7 @@ jobs:
         with:
           token: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
 
-      - name: Run vendored update
+      - name: Run vendored install
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VENDOR_PAT: ${{ secrets.token || secrets.VENDOR_PAT || '' }}
@@ -61,4 +61,4 @@ jobs:
         run: |
           VENDOR="${{ inputs.vendor || 'all' }}"
           VERSION="${{ inputs.version || 'latest' }}"
-          python3 .vendored/update "$VENDOR" --version "$VERSION" --pr
+          python3 .vendored/install "$VENDOR" --version "$VERSION" --pr

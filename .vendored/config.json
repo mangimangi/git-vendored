@@ -3,7 +3,6 @@
     "git-vendored": {
       "repo": "mangimangi/git-vendored",
       "install_branch": "chore/install-git-vendored",
-      "dogfood": true,
       "protected": [
         ".vendored/**",
         ".github/workflows/install-vendored.yml",

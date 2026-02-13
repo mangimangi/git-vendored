@@ -1,0 +1,6 @@
+.github/workflows/check-vendor.yml
+.github/workflows/install-vendored.yml
+.vendored/check
+.vendored/hooks/pre-commit
+.vendored/install
+.vendored/remove

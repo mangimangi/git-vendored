@@ -1,0 +1,10 @@
+#!/bin/bash
+# .vendored/hooks/pre-commit
+# Pre-commit hook that prevents committing changes to protected vendor files.
+# Same check as the check-vendor GitHub Actions workflow, but for staged files.
+#
+# Install:  python3 .vendored/check --install-hook
+# Bypass:   git commit --no-verify
+set -euo pipefail
+
+exec python3 .vendored/check --staged
