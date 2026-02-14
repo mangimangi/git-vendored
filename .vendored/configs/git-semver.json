@@ -1,0 +1,14 @@
+{
+  "_vendor": {
+    "repo": "mangimangi/git-semver",
+    "install_branch": "chore/install-git-semver",
+    "protected": [
+      ".semver/**",
+      ".github/workflows/version-bump.yml",
+      ".github/workflows/release.yml"
+    ],
+    "allowed": [
+      ".semver/config.json"
+    ]
+  }
+}

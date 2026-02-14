@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Dogfood resolver — finds the git-dogfood vendor by key convention.
+
+Reads .vendored/config.json and outputs the vendor name if a
+"git-dogfood" key exists, in GITHUB_OUTPUT format (vendor=<name>).
+
+Usage:
+    python3 .dogfood/resolve
+
+Exit codes:
+    0 - Always (outputs vendor=<name> if found, empty otherwise)
+"""
+
+import json
+import os
+import sys
+
+
+def load_vendor_config(config_path=".vendored/config.json"):
+    """Load the vendored config."""
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path) as f:
+        return json.load(f)
+
+
+VENDOR_KEY = "git-dogfood"
+
+
+def find_dogfood_vendor(config):
+    """Find the git-dogfood vendor entry. Returns key or None."""
+    vendors = config.get("vendors", {})
+    if VENDOR_KEY in vendors:
+        return VENDOR_KEY
+    return None
+
+
+def main():
+    config = load_vendor_config()
+    if config is None:
+        print("No .vendored/config.json found", file=sys.stderr)
+        return
+
+    vendor = find_dogfood_vendor(config)
+    if vendor:
+        print(f"vendor={vendor}")
+    else:
+        print("No git-dogfood vendor key found", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

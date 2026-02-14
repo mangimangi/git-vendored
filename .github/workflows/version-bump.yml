@@ -1,0 +1,67 @@
+# .github/workflows/version-bump.yml
+# Bumps version and creates GitHub Releases when implementation files change
+# on merge to main (patch), or when triggered manually via workflow_dispatch
+# (major|minor|patch).
+#
+# All logic lives in .semver/bump-and-release (updated via vendor install).
+# This workflow is a thin shell: triggers, permissions, and context passing.
+#
+# Skips automated commits (chore: bump version, chore: install).
+# Uses GITHUB_TOKEN — no PAT required.
+
+name: Bump & Release
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      subdirectory:
+        description: 'Subdirectory to bump (leave empty for root)'
+        required: false
+        type: string
+      changelog_description:
+        description: 'Changelog entry (what changed in this release)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: push-to-main
+  cancel-in-progress: false
+
+jobs:
+  bump-and-release:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       !startsWith(github.event.head_commit.message, 'chore: bump version') &&
+       !startsWith(github.event.head_commit.message, 'chore: install'))
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Bump & Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          INPUT_BUMP_TYPE: ${{ inputs.bump_type || '' }}
+          INPUT_SUBDIRECTORY: ${{ inputs.subdirectory || '' }}
+          INPUT_CHANGELOG_DESCRIPTION: ${{ inputs.changelog_description || '' }}
+        run: python3 .semver/bump-and-release

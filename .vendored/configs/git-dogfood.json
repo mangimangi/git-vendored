@@ -1,0 +1,10 @@
+{
+  "_vendor": {
+    "repo": "mangimangi/git-dogfood",
+    "install_branch": "chore/install-git-dogfood",
+    "protected": [
+      ".dogfood/**",
+      ".github/workflows/dogfood.yml"
+    ]
+  }
+}

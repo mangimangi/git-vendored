@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""bump-and-release — CI orchestration for git-semver.
+
+Called by the version-bump.yml workflow. Reads GitHub Actions context from
+environment variables and orchestrates version bumps, PR creation, and
+GitHub Release creation.
+
+Environment variables (set by the workflow or GitHub Actions):
+    GITHUB_EVENT_NAME           "push" or "workflow_dispatch"
+    GITHUB_EVENT_BEFORE         Before-SHA for push events
+    GITHUB_SHA                  Current commit SHA
+    INPUT_BUMP_TYPE             patch|minor|major (dispatch only)
+    INPUT_SUBDIRECTORY          Subdirectory to bump (dispatch only, optional)
+    INPUT_CHANGELOG_DESCRIPTION Changelog entry text (dispatch only, optional)
+    GH_TOKEN                    GitHub token (for gh CLI)
+    GITHUB_REPOSITORY           owner/repo (for gh release create)
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SEMVER_SCRIPT = ".semver/git-semver"
+CONFIG_PATH = ".semver/config.json"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def run(*cmd, check=True, capture=True):
+    """Run a command and return the CompletedProcess."""
+    result = subprocess.run(
+        list(cmd), capture_output=capture, text=True, check=False,
+    )
+    if check and result.returncode != 0:
+        stderr = result.stderr.strip() if capture else ""
+        print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
+        if stderr:
+            print(stderr, file=sys.stderr)
+        sys.exit(1)
+    return result
+
+
+def read_config():
+    """Read install settings from .semver/config.json.
+
+    Returns (on_merge: bool, automerge: bool).
+    """
+    path = Path(CONFIG_PATH)
+    if not path.exists():
+        return True, True
+    try:
+        config = json.loads(path.read_text())
+        install = config.get("install", {})
+        return bool(install.get("on_merge", True)), bool(install.get("automerge", True))
+    except (json.JSONDecodeError, AttributeError):
+        return True, True
+
+
+def configure_git():
+    """Set git user for automated commits."""
+    run("git", "config", "user.name", "github-actions[bot]")
+    run("git", "config", "user.email", "github-actions[bot]@users.noreply.github.com")
+
+
+def sync_branch():
+    """Fast-forward to latest remote to pick up version bumps from queued runs.
+
+    When multiple pushes trigger queued workflow runs (concurrency group with
+    cancel-in-progress: false), each run checks out the SHA from event creation
+    time. A prior run may have already bumped the version and pushed. Without
+    syncing, this run would read a stale VERSION file and try to create a tag
+    that already exists.
+    """
+    ref = os.environ.get("GITHUB_REF", "refs/heads/main")
+    branch = ref.split("/", 2)[-1] if ref.startswith("refs/heads/") else "main"
+    result = run("git", "pull", "--ff-only", "origin", branch, check=False, capture=True)
+    if result.returncode != 0:
+        print(f"Warning: could not fast-forward to latest {branch}, "
+              "proceeding with current checkout")
+
+
+def semver(*args):
+    """Call .semver/git-semver with arguments."""
+    return run(SEMVER_SCRIPT, *args)
+
+
+def create_pr(branch, title, body, base="main"):
+    """Create a branch, push it, and open a GitHub PR."""
+    run("git", "checkout", "-b", branch)
+    run("git", "push", "-u", "origin", branch)
+    run("gh", "pr", "create", "--title", title, "--body", body, "--base", base)
+
+
+def create_releases():
+    """Create GitHub Releases for tags pointing at HEAD."""
+    result = run("git", "tag", "--points-at", "HEAD", capture=True)
+    tags = [t for t in result.stdout.strip().split("\n") if t and t != "latest"]
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    for tag in tags:
+        print(f"Creating release for {tag}")
+        run("gh", "release", "create", tag,
+            "--repo", repo, "--title", tag, "--generate-notes")
+
+
+# ── Event handlers ─────────────────────────────────────────────────────────
+
+def handle_push(automerge):
+    """Handle push-to-main event."""
+    before = os.environ.get("GITHUB_EVENT_BEFORE", "")
+    if not before:
+        print("Error: GITHUB_EVENT_BEFORE not set", file=sys.stderr)
+        sys.exit(1)
+
+    configure_git()
+    sync_branch()
+
+    if automerge:
+        semver("bump-all", "--since", before)
+        create_releases()
+    else:
+        pre_bump_sha = run("git", "rev-parse", "HEAD", capture=True).stdout.strip()
+        semver("bump-all", "--since", before, "--no-push")
+        result = run("git", "rev-parse", "HEAD", capture=True)
+        head_sha = result.stdout.strip()
+        if head_sha != pre_bump_sha:
+            title_result = run("git", "log", "-1", "--pretty=%s", capture=True)
+            branch = f"chore/bump-version-{int(time.time())}"
+            create_pr(branch, title_result.stdout.strip(), "Automated version bump")
+
+
+def handle_dispatch(automerge):
+    """Handle workflow_dispatch event."""
+    bump_type = os.environ.get("INPUT_BUMP_TYPE", "patch")
+    subdirectory = os.environ.get("INPUT_SUBDIRECTORY", "")
+    description = os.environ.get("INPUT_CHANGELOG_DESCRIPTION", "")
+
+    configure_git()
+
+    args = [bump_type]
+    if subdirectory:
+        args += ["--subdir", subdirectory]
+    if description:
+        args += ["--description", description]
+
+    if automerge:
+        semver("bump", *args)
+        create_releases()
+    else:
+        semver("bump", *args, "--no-push")
+        result = run("git", "describe", "--tags", "--exact-match", "HEAD",
+                     check=False, capture=True)
+        tag = result.stdout.strip() if result.returncode == 0 else "unknown"
+        branch = f"chore/bump-version-{tag.replace('/', '-')}"
+        create_pr(
+            branch,
+            f"chore: bump version to {tag}",
+            f"Automated version bump to {tag}",
+        )
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+
+    on_merge, automerge = read_config()
+
+    if event_name == "push":
+        if not on_merge:
+            print("on_merge is false, skipping")
+            return
+        handle_push(automerge)
+    elif event_name == "workflow_dispatch":
+        handle_dispatch(automerge)
+    else:
+        print(f"Unknown event: {event_name}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

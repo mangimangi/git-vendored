@@ -1,0 +1,3 @@
+.github/workflows/version-bump.yml
+.vendored/pkg/git-semver/bump-and-release
+.vendored/pkg/git-semver/git-semver

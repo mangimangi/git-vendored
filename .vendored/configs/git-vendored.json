@@ -1,0 +1,14 @@
+{
+  "_vendor": {
+    "repo": "mangimangi/git-vendored",
+    "install_branch": "chore/install-git-vendored",
+    "protected": [
+      ".vendored/**",
+      ".github/workflows/install-vendored.yml",
+      ".github/workflows/check-vendor.yml"
+    ],
+    "allowed": [
+      ".vendored/config.json"
+    ]
+  }
+}

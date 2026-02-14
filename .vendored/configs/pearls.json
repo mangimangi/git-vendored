@@ -1,0 +1,27 @@
+{
+  "_vendor": {
+    "repo": "mangimangi/pearls",
+    "private": true,
+    "install_branch": "chore/install-pearls",
+    "automerge": true,
+    "protected": [
+      ".pearls/**"
+    ],
+    "allowed": [
+      ".pearls/issues.jsonl",
+      ".pearls/config.json",
+      ".pearls/archive/*.jsonl"
+    ]
+  },
+  "prefix": "gv",
+  "description": "git-vendored: automated vendor install control for repo-embedded tools via GitHub workflows",
+  "docs": [
+    "AGENTS.md",
+    ".pearls/AGENTS.md",
+    "README.md",
+    "docs/"
+  ],
+  "models": {
+    "implementer": "claude-opus-4-6"
+  }
+}

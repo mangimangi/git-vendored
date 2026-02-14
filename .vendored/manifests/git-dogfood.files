@@ -1,0 +1,2 @@
+.github/workflows/dogfood.yml
+.vendored/pkg/git-dogfood/resolve
