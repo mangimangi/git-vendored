@@ -24,6 +24,7 @@ set -euo pipefail
 
 # v2 contract: read env vars, fall back to positional args for backwards compat
 VERSION="${VENDOR_REF:-${1:?Usage: install.sh <version> [<repo>]}}"
+VERSION="${VERSION#v}"  # strip v prefix if present (VENDOR_REF includes it)
 VENDORED_REPO="${VENDOR_REPO:-${2:-mangimangi/git-vendored}}"
 
 # Track installed files for manifest
