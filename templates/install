@@ -681,10 +681,15 @@ def create_pull_request(results):
         ["git", "commit", "-m", title],
         check=True, capture_output=True,
     )
-    subprocess.run(
+    push_result = subprocess.run(
         ["git", "push", "-u", "origin", branch],
-        check=True, capture_output=True,
+        capture_output=True, text=True,
     )
+    if push_result.returncode != 0:
+        print(f"git push failed (exit {push_result.returncode}):")
+        print(f"  stdout: {push_result.stdout.strip()}")
+        print(f"  stderr: {push_result.stderr.strip()}")
+        sys.exit(1)
 
     pr_result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body,
