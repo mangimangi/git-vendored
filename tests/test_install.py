@@ -1597,32 +1597,48 @@ class TestAutoInstallAndCycleDetection:
         assert call_args[0][0] == "mangimangi/git-semver"
         assert call_args[0][1] == "latest"
 
-    @patch("vendored_install.install_new_vendor")
-    def test_auto_install_recursive(self, mock_install_new, tmp_repo, capsys):
-        """dep A depends on dep B, both get auto-installed."""
-        call_count = [0]
-
-        def fake_install(repo, version, token, **kwargs):
-            call_count[0] += 1
-            return {"changed": True}
-
-        mock_install_new.side_effect = fake_install
-
-        deps = {
-            "dep-a": {"repo": "owner/dep-a"},
-            "dep-b": {"repo": "owner/dep-b"},
+    @patch("vendored_install.check_repo_exists")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    def test_auto_install_recursive(self, mock_ver, mock_check_sh,
+                                    mock_check_repo, tmp_repo, capsys):
+        """dep A depends on dep B: installing A auto-installs B first."""
+        dep_graph = {
+            "owner/dep-a": {"dep-b": "owner/dep-b"},
+            "owner/dep-b": None,
         }
-        inst.resolve_deps(deps, "token", "install")
-        assert call_count[0] == 2
+        fake_deps, fake_install = _make_fake_install_env(tmp_repo, dep_graph)
 
-    def test_circular_dependency_detected(self, tmp_repo):
-        """Circular dep A -> B -> A detected with sys.exit(1)."""
-        installing_set = ["owner/vendor-a"]
-        deps = {"vendor-a": {"repo": "owner/vendor-a"}}
+        with patch("vendored_install.download_deps", side_effect=fake_deps), \
+             patch("vendored_install.download_and_run_install", side_effect=fake_install):
+            result = inst.install_new_vendor(
+                "owner/dep-a", "latest", "token", deps_mode="install"
+            )
 
-        with pytest.raises(SystemExit) as exc_info:
-            inst.resolve_deps(deps, "token", "install",
-                              installing_set=installing_set)
+        assert result["changed"] is True
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        for name in ["dep-a", "dep-b"]:
+            assert (manifests_dir / f"{name}.version").is_file(), \
+                f"{name} not installed"
+
+    @patch("vendored_install.check_repo_exists")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    def test_circular_dependency_detected(self, mock_ver, mock_check_sh,
+                                          mock_check_repo, tmp_repo):
+        """Circular dep A -> B -> A detected via real recursive path."""
+        dep_graph = {
+            "owner/vendor-a": {"vendor-b": "owner/vendor-b"},
+            "owner/vendor-b": {"vendor-a": "owner/vendor-a"},
+        }
+        fake_deps, fake_install = _make_fake_install_env(tmp_repo, dep_graph)
+
+        with patch("vendored_install.download_deps", side_effect=fake_deps), \
+             patch("vendored_install.download_and_run_install", side_effect=fake_install):
+            with pytest.raises(SystemExit) as exc_info:
+                inst.install_new_vendor(
+                    "owner/vendor-a", "latest", "token", deps_mode="install"
+                )
         assert exc_info.value.code == 1
 
     def test_self_dependency_detected(self, tmp_repo):
@@ -1634,22 +1650,37 @@ class TestAutoInstallAndCycleDetection:
                                     installing_set=installing_set)
         assert exc_info.value.code == 1
 
-    @patch("vendored_install.install_new_vendor")
-    def test_installing_set_prevents_revisit(self, mock_install_new, tmp_repo):
-        """Same dep required by two vendors is only installed once."""
-        # First dep already in installing_set means it won't be re-installed
-        # (it would trigger circular detection if already in set)
-        # Instead, test that a satisfied dep isn't re-installed
-        configs_dir = tmp_repo / ".vendored" / "configs"
-        configs_dir.mkdir(parents=True)
-        (configs_dir / "shared-dep.json").write_text(
-            json.dumps({"_vendor": {"repo": "owner/shared-dep"}})
-        )
+    @patch("vendored_install.check_repo_exists")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    def test_installing_set_prevents_revisit(self, mock_ver, mock_check_sh,
+                                             mock_check_repo, tmp_repo):
+        """Same dep required by two vendors is only installed once via installing_set."""
+        # Diamond: A -> B, A -> C, B -> D, C -> D. D should be installed once.
+        install_calls = []
+        dep_graph = {
+            "owner/a": {"b": "owner/b", "c": "owner/c"},
+            "owner/b": {"d": "owner/d"},
+            "owner/c": {"d": "owner/d"},
+            "owner/d": None,
+        }
+        fake_deps, orig_fake_install = _make_fake_install_env(tmp_repo, dep_graph)
 
-        deps = {"shared-dep": {"repo": "owner/shared-dep"}}
-        inst.resolve_deps(deps, "token", "install")
-        # Already installed, so install_new_vendor should NOT be called
-        mock_install_new.assert_not_called()
+        def tracking_install(repo, version, token, vendor_name=None,
+                             vendor_config=None):
+            install_calls.append(repo)
+            return orig_fake_install(repo, version, token,
+                                     vendor_name=vendor_name,
+                                     vendor_config=vendor_config)
+
+        with patch("vendored_install.download_deps", side_effect=fake_deps), \
+             patch("vendored_install.download_and_run_install", side_effect=tracking_install):
+            inst.install_new_vendor(
+                "owner/a", "latest", "token", deps_mode="install"
+            )
+
+        d_count = install_calls.count("owner/d")
+        assert d_count == 1, f"owner/d installed {d_count} times: {install_calls}"
 
     @patch("vendored_install.install_new_vendor")
     def test_auto_install_uses_latest_version(self, mock_install_new, tmp_repo):
