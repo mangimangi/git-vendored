@@ -995,6 +995,37 @@ class TestCreatePullRequest:
         git_cmds = [c for c in calls if c[0] == "git"]
         assert ["git", "config", "user.name", "github-actions[bot]"] in git_cmds
         assert ["git", "add", "-A"] in git_cmds
+        # Commit must bypass pre-commit hook (install script is the
+        # authorized mechanism; multi-vendor branches wouldn't match
+        # any single vendor's install_branch prefix).
+        assert ["git", "commit", "--no-verify", "-m",
+                "chore: install tool v2.0.0"] in git_cmds
+
+    @patch("vendored_install.subprocess.run")
+    def test_multi_vendor_commit_uses_no_verify(self, mock_run, make_config,
+                                                 monkeypatch):
+        """Multi-vendor PR commit bypasses pre-commit hook."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {
+            "tool-a": {**SAMPLE_VENDOR, "install_branch": "chore/install-a"},
+            "tool-b": {**SAMPLE_VENDOR, "install_branch": "chore/install-b"},
+        }})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [
+            {"vendor": "tool-a", "old_version": "1.0.0",
+             "new_version": "2.0.0", "changed": True},
+            {"vendor": "tool-b", "old_version": "1.0.0",
+             "new_version": "3.0.0", "changed": True},
+        ]
+        pr_url = inst.create_pull_request(results)
+        assert pr_url == "https://github.com/o/r/pull/1"
+
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        commit_cmds = [c for c in calls
+                       if c[0] == "git" and "commit" in c]
+        assert len(commit_cmds) == 1
+        assert "--no-verify" in commit_cmds[0]
 
     @patch("vendored_install.subprocess.run")
     def test_no_changes_skips_pr(self, mock_run, make_config, capsys):
