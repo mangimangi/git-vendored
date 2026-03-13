@@ -460,10 +460,12 @@ class TestInstallExistingVendor:
         assert result["old_version"] == "1.0.0"
         mock_download.assert_not_called()
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.get_auth_token")
-    def test_installs_new_version(self, mock_token, mock_resolve, mock_download, tmp_repo):
+    def test_installs_new_version(self, mock_token, mock_resolve, mock_download,
+                                   mock_deps, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "2.0.0"
         mock_download.return_value = None  # v1 compat: no manifest
@@ -476,10 +478,12 @@ class TestInstallExistingVendor:
         assert result["new_version"] == "2.0.0"
         mock_download.assert_called_once()
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.get_auth_token")
-    def test_fresh_install(self, mock_token, mock_resolve, mock_download, tmp_repo):
+    def test_fresh_install(self, mock_token, mock_resolve, mock_download,
+                            mock_deps, tmp_repo):
         mock_token.return_value = "token"
         mock_resolve.return_value = "1.0.0"
         mock_download.return_value = None
@@ -489,10 +493,12 @@ class TestInstallExistingVendor:
         assert result["old_version"] == "none"
         assert result["new_version"] == "1.0.0"
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.get_auth_token")
-    def test_force_reinstall(self, mock_token, mock_resolve, mock_download, tmp_repo):
+    def test_force_reinstall(self, mock_token, mock_resolve, mock_download,
+                              mock_deps, tmp_repo):
         """--force should reinstall even when at target version."""
         mock_token.return_value = "token"
         mock_resolve.return_value = "1.0.0"
@@ -504,10 +510,12 @@ class TestInstallExistingVendor:
         assert result["changed"] is True
         mock_download.assert_called_once()
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.get_auth_token")
-    def test_manifest_stored_on_update(self, mock_token, mock_resolve, mock_download, tmp_repo):
+    def test_manifest_stored_on_update(self, mock_token, mock_resolve, mock_download,
+                                        mock_deps, tmp_repo):
         """When install.sh emits a manifest, it should be stored."""
         mock_token.return_value = "token"
         mock_resolve.return_value = "2.0.0"
@@ -536,11 +544,12 @@ class TestInstallExistingVendor:
         assert result["changed"] is False
         mock_download.assert_not_called()
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.get_auth_token")
     def test_passes_vendor_name_and_config_to_download(self, mock_token, mock_resolve,
-                                                        mock_download, tmp_repo):
+                                                        mock_download, mock_deps, tmp_repo):
         """install_existing_vendor passes vendor_name and vendor_config to download."""
         mock_token.return_value = "token"
         mock_resolve.return_value = "2.0.0"
@@ -555,12 +564,14 @@ class TestInstallExistingVendor:
 # ── Tests: install_new_vendor (add path) ──────────────────────────────────
 
 class TestInstallNewVendor:
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
     @patch("vendored_install.check_repo_exists")
     def test_add_new_vendor(self, mock_exists, mock_install_sh,
-                            mock_version, mock_download, make_config, tmp_repo, capsys):
+                            mock_version, mock_download, mock_deps,
+                            make_config, tmp_repo, capsys):
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
 
@@ -584,11 +595,12 @@ class TestInstallNewVendor:
         out = capsys.readouterr().out
         assert "Added vendor: new-tool" in out
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
     @patch("vendored_install.check_repo_exists")
     def test_add_already_registered_fails(self, mock_exists, mock_install_sh,
-                                           mock_version, make_config):
+                                           mock_version, mock_deps, make_config):
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {"existing": {"repo": "owner/existing-tool"}}})
 
@@ -596,12 +608,14 @@ class TestInstallNewVendor:
             inst.install_new_vendor("owner/existing-tool", "latest", "token")
         assert exc_info.value.code == 1
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
     @patch("vendored_install.check_repo_exists")
     def test_add_with_custom_name(self, mock_exists, mock_install_sh,
-                                   mock_version, mock_download, make_config, tmp_repo, capsys):
+                                   mock_version, mock_download, mock_deps,
+                                   make_config, tmp_repo, capsys):
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
 
@@ -621,13 +635,14 @@ class TestInstallNewVendor:
         out = capsys.readouterr().out
         assert "Added vendor: my-custom-name" in out
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
     @patch("vendored_install.check_repo_exists")
     def test_add_new_vendor_with_per_vendor_configs_active(
             self, mock_exists, mock_install_sh, mock_version, mock_download,
-            make_config, tmp_repo, capsys):
+            mock_deps, make_config, tmp_repo, capsys):
         """install.sh writes to config.json but per-vendor configs are active."""
         mock_version.return_value = "1.0.0"
         # Existing vendor in per-vendor config (makes load_config read from configs/)
@@ -669,12 +684,14 @@ class TestInstallNewVendor:
         out = capsys.readouterr().out
         assert "Added vendor: new-tool" in out
 
+    @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
     @patch("vendored_install.check_repo_exists")
     def test_add_with_manifest(self, mock_exists, mock_install_sh,
-                                mock_version, mock_download, make_config, tmp_repo, capsys):
+                                mock_version, mock_download, mock_deps,
+                                make_config, tmp_repo, capsys):
         """When install.sh emits a manifest, it should be stored on add."""
         mock_version.return_value = "1.0.0"
         make_config({"vendors": {}})
@@ -1400,3 +1417,166 @@ class TestCLIRouting:
             with pytest.raises(SystemExit) as exc_info:
                 inst.main()
             assert exc_info.value.code == 1
+
+
+# ── Tests: Dependency Resolution ─────────────────────────────────────────
+
+class TestDependencyResolution:
+    @patch("vendored_install.subprocess.run")
+    def test_download_deps_returns_dict(self, mock_run):
+        """download_deps parses deps.json from vendor repo."""
+        import base64 as b64
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        encoded = b64.b64encode(json.dumps(deps).encode()).decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=encoded + "\n", stderr="")
+
+        result = inst.download_deps("owner/tool", "v1.0.0", "token")
+        assert result == deps
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_deps_returns_none_when_missing(self, mock_run):
+        """download_deps returns None when no deps.json exists (404)."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
+
+        result = inst.download_deps("owner/tool", "v1.0.0", "token")
+        assert result is None
+
+    def test_check_deps_all_satisfied(self, tmp_repo):
+        """check_deps returns all deps as satisfied when installed."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "git-semver.json").write_text(json.dumps({"_vendor": {"repo": "mangimangi/git-semver"}}))
+
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        satisfied, missing = inst.check_deps(deps)
+        assert len(satisfied) == 1
+        assert len(missing) == 0
+        assert satisfied[0][0] == "git-semver"
+
+    def test_check_deps_missing(self, tmp_repo):
+        """check_deps reports missing deps."""
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        satisfied, missing = inst.check_deps(deps)
+        assert len(satisfied) == 0
+        assert len(missing) == 1
+        assert missing[0][0] == "git-semver"
+
+    def test_check_deps_by_file_existence(self, tmp_repo):
+        """check_deps finds dep satisfied via manifests/<dep>.version file."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "git-semver.version").write_text("1.0.0\n")
+
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        satisfied, missing = inst.check_deps(deps)
+        assert len(satisfied) == 1
+        assert len(missing) == 0
+
+    def test_resolve_deps_error_mode_exits(self, tmp_repo):
+        """Missing deps in error mode triggers sys.exit(1)."""
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        with pytest.raises(SystemExit) as exc_info:
+            inst.resolve_deps(deps, "token", "error")
+        assert exc_info.value.code == 1
+
+    def test_resolve_deps_warn_mode_continues(self, tmp_repo, capsys):
+        """Missing deps in warn mode prints warning but doesn't exit."""
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        inst.resolve_deps(deps, "token", "warn")
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "git-semver" in out
+
+    def test_resolve_deps_skip_mode_noop(self, tmp_repo):
+        """Skip mode does nothing, even with missing deps."""
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        # Should not raise
+        inst.resolve_deps(deps, "token", "skip")
+
+    def test_resolve_deps_no_deps_noop(self, tmp_repo):
+        """No deps.json (None) is a no-op."""
+        inst.resolve_deps(None, "token", "error")
+
+    def test_deps_flag_parsed(self):
+        """CLI --deps=warn is parsed correctly."""
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("target")
+        parser.add_argument("--version", default="latest")
+        parser.add_argument("--force", action="store_true")
+        parser.add_argument("--pr", action="store_true")
+        parser.add_argument("--name", default=None)
+        parser.add_argument("--deps", default=None,
+                            choices=["error", "warn", "install", "skip"])
+        args = parser.parse_args(["owner/tool", "--deps=warn"])
+        assert args.deps == "warn"
+
+    def test_deps_config_default(self, tmp_repo):
+        """dependency_mode from per-vendor config used when no CLI flag."""
+        vendor_config = {"repo": "owner/tool", "dependency_mode": "warn"}
+        mode = inst._get_dep_mode(None, vendor_config)
+        assert mode == "warn"
+
+    def test_deps_cli_overrides_config(self, tmp_repo):
+        """CLI flag takes priority over config dependency_mode."""
+        vendor_config = {"repo": "owner/tool", "dependency_mode": "warn"}
+        mode = inst._get_dep_mode("skip", vendor_config)
+        assert mode == "skip"
+
+    def test_write_and_read_deps(self, tmp_repo):
+        """write_deps creates .deps file, read_deps reads it back."""
+        inst.write_deps("tool", ["git-semver", "other-dep"])
+        result = inst.read_deps("tool")
+        assert result == ["git-semver", "other-dep"]
+
+        # Verify file location
+        deps_path = tmp_repo / ".vendored" / "manifests" / "tool.deps"
+        assert deps_path.is_file()
+
+    def test_read_deps_returns_none_when_missing(self, tmp_repo):
+        """read_deps returns None when no .deps file exists."""
+        result = inst.read_deps("nonexistent")
+        assert result is None
+
+    @patch("vendored_install.download_deps")
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.subprocess.run")
+    def test_deps_cached_after_install(self, mock_run, mock_download_install,
+                                        mock_download_deps, tmp_repo):
+        """After install_existing_vendor, .deps file exists."""
+        # Set up vendor config
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        # Set up manifest for current version
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        # Set up dep vendor as installed
+        (configs_dir / "git-semver.json").write_text(
+            json.dumps({"_vendor": {"repo": "mangimangi/git-semver"}})
+        )
+
+        # Mock version resolution
+        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+
+        # Mock deps.json download
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+        mock_download_deps.return_value = deps
+
+        # Mock install.sh
+        mock_download_install.return_value = [".tool/script.sh"]
+        (tmp_repo / ".tool").mkdir(exist_ok=True)
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+
+        result = inst.install_existing_vendor(
+            "tool", SAMPLE_VENDOR, "2.0.0", force=True
+        )
+
+        assert result["changed"] is True
+        # .deps file should be written
+        deps_file = manifests_dir / "tool.deps"
+        assert deps_file.is_file()
+        assert "git-semver" in deps_file.read_text()
