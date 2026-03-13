@@ -1002,6 +1002,23 @@ class TestCreatePullRequest:
                 "chore: install tool v2.0.0"] in git_cmds
 
     @patch("vendored_install.subprocess.run")
+    def test_push_uses_force_with_lease(self, mock_run, make_config, monkeypatch):
+        """Push uses --force-with-lease so stale ephemeral branches don't block."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        inst.create_pull_request(results)
+
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        push_cmds = [c for c in calls
+                     if c[0] == "git" and "push" in c]
+        assert len(push_cmds) == 1
+        assert "--force-with-lease" in push_cmds[0]
+
+    @patch("vendored_install.subprocess.run")
     def test_multi_vendor_commit_uses_no_verify(self, mock_run, make_config,
                                                  monkeypatch):
         """Multi-vendor PR commit bypasses pre-commit hook."""
