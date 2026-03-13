@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-SEMVER_SCRIPT = ".semver/git-semver"
+SEMVER_SCRIPT = str(Path(__file__).parent / "git-semver")
 CONFIG_PATH = ".semver/config.json"
 
 
