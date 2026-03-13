@@ -1,11 +1,12 @@
-# Vendor Dependency Management
+# gv-e19e: Vendor Dependency Management
 
 **Status:** Planning
-**Priority:** TBD
+**Priority:** P2
+**Epic:** gv-e19e
 
 ## Summary
 
-Extend the vendor contract to support **vendor-to-vendor dependencies**. Vendors declare which other vendors they require, and the framework checks (and optionally installs) those dependencies during the install flow.
+Extend the vendor contract to support **vendor-to-vendor dependencies**. Vendors declare which other vendors they require via `deps.json`, and the framework checks (and optionally installs) those dependencies during the install flow.
 
 ---
 
@@ -48,11 +49,19 @@ vendor-repo/
 }
 ```
 
-Each key is the expected vendor name in the consumer's `.vendored/configs/`. The `repo` field is the `owner/repo` needed for auto-install.
+Each key is the vendor name. **Vendor names must match the repo name** (the segment after `/` in `owner/repo`). The `repo` field is the `owner/repo` needed for auto-install.
 
-**Why JSON, not plain text?** Auto-install needs the `repo` for each dependency. A plain text list of names wouldn't carry enough info. JSON is also consistent with `config.json` and per-vendor configs.
+**Why JSON, not plain text?** Auto-install needs the `repo` for each dependency. A plain text list of names wouldn't carry enough info. JSON is also consistent with per-vendor configs.
 
-**Why at repo root, not emitted by install.sh?** Dependencies must be checked *before* running install.sh — we need to know what's missing before attempting installation, not after.
+**Why `deps.json` and not part of the vendor config?** Dependencies must be checked *before* running `install.sh`. The consumer's per-vendor config (`configs/<vendor>.json`) is written by the framework *after* install succeeds. A separate file in the vendor repo allows the framework to download and inspect deps pre-install.
+
+**Why not a broader `vendor.json` metadata file?** We considered bundling deps with other pre-install metadata (contract version, min framework version). Decision: start narrow with deps only. A broader metadata file can be introduced later if needed — renaming is cheaper than over-designing now.
+
+### Vendor Naming Convention
+
+**Vendor names must match repo names.** The vendor name is derived from the repo: `mangimangi/git-semver` → vendor name `git-semver`. This is enforced for dependency resolution — `deps.json` keys must match the repo-derived name of the dependency.
+
+The `--name` CLI flag on install is not supported for vendors that are dependencies of other vendors. If a consumer installs a vendor under a custom name, dep resolution will not find it.
 
 ### Framework Behavior
 
@@ -64,12 +73,15 @@ During `.vendored/install`, after pre-validation but before running `install.sh`
 1. Download deps.json from vendor repo at target ref (if exists)
 2. Parse dependency list
 3. For each dependency:
-   a. Check if vendor is installed (manifest exists in .vendored/manifests/)
+   a. Check if vendor is installed:
+      - .vendored/configs/<dep>.json exists, OR
+      - .vendored/manifests/<dep>.version exists
    b. If installed → satisfied
    c. If missing → apply dependency_mode:
       - "error"   → collect missing deps, fail with clear message
       - "warn"    → log warning, continue with install
       - "install" → auto-install the missing dep (recursive)
+      - "skip"    → don't check deps at all
 4. If all deps satisfied (or mode allows continuing) → run install.sh
 ```
 
@@ -85,8 +97,8 @@ New functions:
 | Function | Purpose |
 |----------|---------|
 | `download_deps(repo, ref, token)` | Download and parse `deps.json` from vendor repo (returns dict or None) |
-| `check_deps(deps, installed_vendors)` | Check which deps are installed, returns `(satisfied, missing)` |
-| `resolve_deps(deps, token, mode, installing_set)` | Apply dependency_mode: error/warn/auto-install |
+| `check_deps(deps)` | Check which deps are installed via per-vendor config or manifest existence |
+| `resolve_deps(deps, token, mode, installing_set)` | Apply dependency_mode: error/warn/install/skip |
 
 #### Auto-Install (dependency_mode: "install")
 
@@ -101,11 +113,15 @@ When a missing dep is detected and mode is `"install"`:
 
 ### Dependency Mode Configuration
 
-**Framework-level default** in `.vendored/config.json`:
+**Per-vendor setting** in `.vendored/configs/<vendor>.json` under the `_vendor` key:
 
 ```json
 {
-  "dependency_mode": "error"
+  "_vendor": {
+    "repo": "mangimangi/my-tool",
+    "install_branch": "chore/install-my-tool",
+    "dependency_mode": "install"
+  }
 }
 ```
 
@@ -125,7 +141,9 @@ python3 .vendored/install owner/repo --deps=skip
 | `install` | Auto-install missing deps, then install the vendor |
 | `skip` | Don't check deps at all |
 
-**Resolution order:** CLI flag > `config.json` `dependency_mode` > default (`error`)
+**Resolution order:** CLI flag (`--deps`) > per-vendor `_vendor.dependency_mode` > default (`error`)
+
+For `install all`, each vendor's own `dependency_mode` is used unless the CLI flag overrides globally.
 
 ### CI / Workflow Integration
 
@@ -148,7 +166,7 @@ Warning: The following vendors depend on git-semver:
 Proceed anyway? [y/N]
 ```
 
-This requires the framework to cache/store resolved deps, or re-download deps.json for each installed vendor. Caching is simpler — store resolved deps at `.vendored/manifests/<vendor>.deps` during install.
+This uses cached `.vendored/manifests/<vendor>.deps` files (written during install) to perform reverse-dep lookups without re-downloading deps.json from vendor repos.
 
 ### Manifest Extension
 
@@ -168,7 +186,7 @@ git-semver
 pearls
 ```
 
-This enables reverse-dep lookups without re-downloading deps.json from vendor repos.
+This enables reverse-dep lookups without re-downloading deps.json from vendor repos. Updated on every install, so staleness is bounded.
 
 ---
 
@@ -216,6 +234,21 @@ Dependencies satisfied.
 Added vendor: my-tool (5 files)
 ```
 
+### Per-vendor dependency mode
+
+```json
+// .vendored/configs/my-tool.json
+{
+  "_vendor": {
+    "repo": "mangimangi/my-tool",
+    "install_branch": "chore/install-my-tool",
+    "dependency_mode": "install"
+  }
+}
+```
+
+With this config, `python3 .vendored/install my-tool` auto-installs deps without needing `--deps=install` on the CLI.
+
 ### CI workflow auto-installs new deps on update
 
 ```bash
@@ -237,13 +270,17 @@ git-semver: already at v2.1.0, skipping
 
 2. **Topological sort for `install all`** — **Yes.** The framework will topologically sort vendors by their dependency graph before iterating. This prevents ordering failures where a dep is listed after the vendor that needs it.
 
-## Open Questions
+3. **Vendor naming** — **Enforced.** Vendor names must match repo names (`owner/repo` → vendor name is `repo`). `deps.json` keys reference vendors by this canonical name. The `--name` override is not supported for deps.
 
-1. **Should `validate` (gv-9d4e) also check `deps.json`?** — The standalone validation tool could verify that deps.json is well-formed and that declared deps are themselves valid vendor repos. Natural extension but separate from this epic.
+4. **Dependency mode** — **Per-vendor.** Stored in `_vendor.dependency_mode` in per-vendor config files. CLI `--deps=X` overrides. Default is `error` (fail-fast).
 
-2. **Dep caching vs. re-download** — For reverse-dep checks on remove, we proposed storing `.vendored/manifests/<vendor>.deps`. Alternative: re-download deps.json from each installed vendor's repo at remove time. Caching is faster and works offline, but can go stale. **Proposal:** cache in `.deps` file — it's updated on every install, so staleness is bounded.
+5. **Dep presence check** — Uses v2 per-vendor config structure: checks `.vendored/configs/<dep>.json` or `.vendored/manifests/<dep>.version` existence. Does not reference monolithic `config.json`.
 
-3. **Should deps be optional vs required?** — Could a vendor declare a dep as optional (soft dependency, e.g., "works better with X but doesn't require it")? **Proposal:** not in v1 — all declared deps are required. Optional deps can be a future extension.
+6. **Dep caching** — Cache in `.vendored/manifests/<vendor>.deps` after install. Updated on every install so staleness is bounded. Used for reverse-dep checks on remove (no re-download needed).
+
+7. **`deps.json` scope** — Deps only. No broader vendor metadata file. Can be extended or replaced later if pre-install metadata needs grow.
+
+8. **All deps required** — No optional/soft dependencies in v1. All declared deps are required. Optional deps can be a future extension.
 
 ---
 
@@ -252,14 +289,15 @@ git-semver: already at v2.1.0, skipping
 - **System-level dependencies** (jq, python3, curl) — out of scope. This is vendor-to-vendor only.
 - **Version pinning** — consumers can't pin a dep to a specific version via this mechanism. They install deps at whatever version they want; this feature only checks presence.
 - **Dependency resolution conflicts** — no diamond dependency resolution. If A needs semver and B needs semver, there's only one semver installed anyway. Version conflicts (when version constraints are added) would be a future concern.
+- **Broader vendor metadata file** — `deps.json` is deps-only. Contract version, min framework version, etc. are out of scope for this epic.
 
 ---
 
 ## Backwards Compatibility
 
 - **`deps.json` is optional** — vendors without it work exactly as before. Zero breaking changes.
-- **Consumers without `dependency_mode` config** — default to `"error"`, which is safe (fail-fast on missing deps rather than silently proceeding).
-- **Existing vendors adding deps** — on next update via `install all`, the framework downloads deps.json for the first time and applies the dependency_mode logic.
+- **Consumers without `dependency_mode` in vendor config** — default to `"error"`, which is safe (fail-fast on missing deps rather than silently proceeding).
+- **Existing vendors adding deps** — on next update via `install all`, the framework downloads deps.json for the first time and applies the dependency_mode logic. If deps are already installed (common case), no action needed.
 
 ---
 
@@ -268,11 +306,11 @@ git-semver: already at v2.1.0, skipping
 ### 1. Core dep resolution in `templates/install`
 
 - Add `download_deps(repo, ref, token)` — download and parse `deps.json` from vendor repo (returns dict or None if no deps.json)
-- Add `check_deps(deps)` — check which deps are installed via `.vendored/manifests/<vendor>.version` existence
+- Add `check_deps(deps)` — check which deps are installed via `.vendored/configs/<dep>.json` or `.vendored/manifests/<dep>.version` existence
 - Add `resolve_deps(deps, token, mode, installing_set)` — apply dependency_mode logic (error/warn/install/skip)
-- Wire into `install_vendor()` — call resolve_deps before `download_and_run_install()`
+- Wire into `install_new_vendor()` and `install_existing_vendor()` — call resolve_deps before `download_and_run_install()`
 - Add `--deps` CLI flag with error/warn/install/skip values
-- Read `dependency_mode` from `config.json` as default
+- Read `dependency_mode` from per-vendor config `_vendor.dependency_mode` as default
 - Cycle detection via `installing_set` parameter
 
 ### 2. Topological sort for `install all`
@@ -302,3 +340,5 @@ git-semver: already at v2.1.0, skipping
 - Integration test: vendor with deps.json, dep missing → error mode fails, install mode succeeds
 - Integration test: circular dependency → error with clear message
 - Integration test: `install all` respects topological order
+- Test per-vendor dependency_mode override
+- Test CLI `--deps` flag overrides per-vendor config
