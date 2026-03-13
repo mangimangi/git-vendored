@@ -84,7 +84,7 @@ def sync_branch():
 
 def semver(*args):
     """Call .semver/git-semver with arguments."""
-    return run(SEMVER_SCRIPT, *args)
+    return run(SEMVER_SCRIPT, *args, capture=False)
 
 
 def create_pr(branch, title, body, base="main"):
