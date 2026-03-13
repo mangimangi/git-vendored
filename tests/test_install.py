@@ -1665,3 +1665,81 @@ class TestAutoInstallAndCycleDetection:
         workflow_path = ROOT / "templates" / "github" / "workflows" / "install-vendored.yml"
         content = workflow_path.read_text()
         assert "--deps=install" in content
+
+
+# ── Tests: Topological sort ──────────────────────────────────────────────
+
+class TestTopologicalSort:
+    def test_topo_sort_no_deps(self, tmp_repo):
+        """All vendors independent -> alphabetical order."""
+        vendors = {"c-tool": {}, "a-tool": {}, "b-tool": {}}
+        result = inst.topological_sort(vendors)
+        assert result == ["a-tool", "b-tool", "c-tool"]
+
+    def test_topo_sort_linear(self, tmp_repo):
+        """A depends on B -> B before A."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "vendor-a.deps").write_text("vendor-b\n")
+
+        vendors = {"vendor-a": {}, "vendor-b": {}}
+        result = inst.topological_sort(vendors)
+        assert result.index("vendor-b") < result.index("vendor-a")
+
+    def test_topo_sort_diamond(self, tmp_repo):
+        """A depends on B and C, B depends on D, C depends on D -> D first."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "a.deps").write_text("b\nc\n")
+        (manifests_dir / "b.deps").write_text("d\n")
+        (manifests_dir / "c.deps").write_text("d\n")
+
+        vendors = {"a": {}, "b": {}, "c": {}, "d": {}}
+        result = inst.topological_sort(vendors)
+        assert result.index("d") < result.index("b")
+        assert result.index("d") < result.index("c")
+        assert result.index("b") < result.index("a")
+        assert result.index("c") < result.index("a")
+
+    def test_topo_sort_cycle_detected(self, tmp_repo):
+        """A depends on B, B depends on A -> sys.exit(1)."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "a.deps").write_text("b\n")
+        (manifests_dir / "b.deps").write_text("a\n")
+
+        vendors = {"a": {}, "b": {}}
+        with pytest.raises(SystemExit) as exc_info:
+            inst.topological_sort(vendors)
+        assert exc_info.value.code == 1
+
+    def test_topo_sort_missing_dep_ignored(self, tmp_repo):
+        """Dep not installed -> no edge, no crash."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "a.deps").write_text("not-installed\n")
+
+        vendors = {"a": {}}
+        result = inst.topological_sort(vendors)
+        assert result == ["a"]
+
+    def test_topo_sort_single_vendor(self, tmp_repo):
+        """One vendor returns [vendor]."""
+        vendors = {"only-one": {}}
+        result = inst.topological_sort(vendors)
+        assert result == ["only-one"]
+
+    @patch("vendored_install.topological_sort")
+    @patch("vendored_install.install_existing_vendor")
+    @patch("vendored_install.output_results")
+    def test_install_all_uses_topo_sort(self, mock_output, mock_update,
+                                         mock_topo, make_config):
+        """install all calls topological_sort."""
+        mock_topo.return_value = ["tool"]
+        mock_update.return_value = {"vendor": "tool", "old_version": "1.0.0",
+                                     "new_version": "2.0.0", "changed": True}
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        with patch("sys.argv", ["install", "all"]):
+            inst.main()
+        mock_topo.assert_called_once()

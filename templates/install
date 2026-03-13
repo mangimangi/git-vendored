@@ -412,6 +412,53 @@ def _get_dep_mode(args_deps, vendor_config):
     return "error"
 
 
+def topological_sort(vendors):
+    """Sort vendors by dependency graph (deps first).
+
+    Reads cached .vendored/manifests/<vendor>.deps for each vendor.
+    Returns sorted list of vendor names.
+    Falls back to alphabetical order if no deps exist.
+    Detects cycles and exits with error.
+    """
+    vendor_names = sorted(vendors.keys())
+
+    # Build adjacency: edges from dep -> dependent
+    # in_degree[v] = number of deps v has among installed vendors
+    in_degree = {name: 0 for name in vendor_names}
+    dependents = {name: [] for name in vendor_names}  # dep -> list of dependents
+    vendor_set = set(vendor_names)
+
+    for name in vendor_names:
+        deps = read_deps(name)
+        if not deps:
+            continue
+        for dep_name in deps:
+            if dep_name in vendor_set:
+                in_degree[name] += 1
+                dependents[dep_name].append(name)
+
+    # Kahn's algorithm
+    queue = sorted([n for n in vendor_names if in_degree[n] == 0])
+    result = []
+
+    while queue:
+        node = queue.pop(0)
+        result.append(node)
+        for dependent in sorted(dependents[node]):
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+                queue.sort()  # maintain alphabetical order among peers
+
+    if len(result) != len(vendor_names):
+        # Cycle detected — find the cycle members
+        cycle = [n for n in vendor_names if n not in result]
+        print(f"::error::Circular dependency detected among vendors: {', '.join(cycle)}")
+        sys.exit(1)
+
+    return result
+
+
 # ── Version detection ─────────────────────────────────────────────────────
 
 def get_current_version(vendor_name, vendor_config=None):
@@ -1067,8 +1114,10 @@ def main():
         if not vendors:
             print("No vendors configured in .vendored/config.json")
             sys.exit(0)
+        sorted_names = topological_sort(vendors)
         results = []
-        for name, vcfg in vendors.items():
+        for name in sorted_names:
+            vcfg = vendors[name]
             results.append(
                 install_existing_vendor(name, vcfg, args.version, args.force,
                                         deps_mode=args.deps)
