@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/configure-prl.sh",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/configure.sh",
             "statusMessage": "Configuring prl (pearls) issue tracker..."
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/configure-prl.sh --resume",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/configure.sh --resume",
             "statusMessage": "Configuring prl (pearls) issue tracker..."
           }
         ]
