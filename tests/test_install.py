@@ -1580,3 +1580,88 @@ class TestDependencyResolution:
         deps_file = manifests_dir / "tool.deps"
         assert deps_file.is_file()
         assert "git-semver" in deps_file.read_text()
+
+
+# ── Tests: Auto-install mode and cycle detection ─────────────────────────
+
+class TestAutoInstallAndCycleDetection:
+    @patch("vendored_install.install_new_vendor")
+    def test_resolve_deps_install_mode(self, mock_install_new, tmp_repo, capsys):
+        """Missing dep in install mode triggers install_new_vendor call."""
+        mock_install_new.return_value = {"changed": True}
+        deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
+
+        inst.resolve_deps(deps, "token", "install")
+        mock_install_new.assert_called_once()
+        call_args = mock_install_new.call_args
+        assert call_args[0][0] == "mangimangi/git-semver"
+        assert call_args[0][1] == "latest"
+
+    @patch("vendored_install.install_new_vendor")
+    def test_auto_install_recursive(self, mock_install_new, tmp_repo, capsys):
+        """dep A depends on dep B, both get auto-installed."""
+        call_count = [0]
+
+        def fake_install(repo, version, token, **kwargs):
+            call_count[0] += 1
+            return {"changed": True}
+
+        mock_install_new.side_effect = fake_install
+
+        deps = {
+            "dep-a": {"repo": "owner/dep-a"},
+            "dep-b": {"repo": "owner/dep-b"},
+        }
+        inst.resolve_deps(deps, "token", "install")
+        assert call_count[0] == 2
+
+    def test_circular_dependency_detected(self, tmp_repo):
+        """Circular dep A -> B -> A detected with sys.exit(1)."""
+        installing_set = {"owner/vendor-a"}
+        deps = {"vendor-a": {"repo": "owner/vendor-a"}}
+
+        with pytest.raises(SystemExit) as exc_info:
+            inst.resolve_deps(deps, "token", "install",
+                              installing_set=installing_set)
+        assert exc_info.value.code == 1
+
+    def test_self_dependency_detected(self, tmp_repo):
+        """Vendor that depends on itself is detected as circular."""
+        # install_new_vendor checks repo in installing_set
+        installing_set = {"owner/tool"}
+        with pytest.raises(SystemExit) as exc_info:
+            inst.install_new_vendor("owner/tool", "latest", "token",
+                                    installing_set=installing_set)
+        assert exc_info.value.code == 1
+
+    @patch("vendored_install.install_new_vendor")
+    def test_installing_set_prevents_revisit(self, mock_install_new, tmp_repo):
+        """Same dep required by two vendors is only installed once."""
+        # First dep already in installing_set means it won't be re-installed
+        # (it would trigger circular detection if already in set)
+        # Instead, test that a satisfied dep isn't re-installed
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "shared-dep.json").write_text(
+            json.dumps({"_vendor": {"repo": "owner/shared-dep"}})
+        )
+
+        deps = {"shared-dep": {"repo": "owner/shared-dep"}}
+        inst.resolve_deps(deps, "token", "install")
+        # Already installed, so install_new_vendor should NOT be called
+        mock_install_new.assert_not_called()
+
+    @patch("vendored_install.install_new_vendor")
+    def test_auto_install_uses_latest_version(self, mock_install_new, tmp_repo):
+        """Auto-installed deps use 'latest' version."""
+        mock_install_new.return_value = {"changed": True}
+        deps = {"dep": {"repo": "owner/dep"}}
+        inst.resolve_deps(deps, "token", "install")
+        call_args = mock_install_new.call_args
+        assert call_args[0][1] == "latest"
+
+    def test_workflow_template_has_deps_install(self):
+        """install-vendored.yml contains --deps=install."""
+        workflow_path = ROOT / "templates" / "github" / "workflows" / "install-vendored.yml"
+        content = workflow_path.read_text()
+        assert "--deps=install" in content

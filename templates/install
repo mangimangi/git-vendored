@@ -388,11 +388,9 @@ def resolve_deps(deps, token, mode, installing_set=None):
                 print(f"::error::Dependency '{dep_name}' has no repo field")
                 sys.exit(1)
             print(f"  {dep_name}: not installed, auto-installing...")
-            result = install_new_vendor(dep_repo, "latest",
-                                        token, installing_set=installing_set)
-            n_files = "unknown"
-            if result.get("changed"):
-                n_files = result.get("manifest_count", "unknown")
+            result = install_new_vendor(dep_repo, "latest", token,
+                                        deps_mode="install",
+                                        installing_set=installing_set)
             print(f"  Added vendor: {dep_name}")
         return
 
