@@ -107,7 +107,7 @@ class TestMatchesAnyPattern:
 # ── Tests: check_vendor ────────────────────────────────────────────────────
 
 class TestCheckVendor:
-    def test_no_violations_unrelated_files(self):
+    def test_no_violations_unrelated_files(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
             "git-vendored", vendor_config,
@@ -115,7 +115,7 @@ class TestCheckVendor:
         )
         assert violations == []
 
-    def test_violation_protected_file(self):
+    def test_violation_protected_file(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
             "git-vendored", vendor_config,
@@ -124,7 +124,7 @@ class TestCheckVendor:
         assert ".vendored/install" in violations
         assert len(violations) == 1
 
-    def test_allowed_file_not_violation(self):
+    def test_allowed_file_not_violation(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
             "git-vendored", vendor_config,
@@ -132,7 +132,7 @@ class TestCheckVendor:
         )
         assert violations == []
 
-    def test_skip_on_install_branch(self):
+    def test_skip_on_install_branch(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
             "git-vendored", vendor_config,
@@ -140,7 +140,7 @@ class TestCheckVendor:
         )
         assert violations == []
 
-    def test_install_branch_only_skips_own_vendor(self):
+    def test_install_branch_only_skips_own_vendor(self, tmp_repo):
         """A pearls install branch should NOT skip git-vendored checks."""
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
@@ -149,7 +149,7 @@ class TestCheckVendor:
         )
         assert ".vendored/install" in violations
 
-    def test_pearls_allowed_files(self):
+    def test_pearls_allowed_files(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["pearls"]
         violations = check.check_vendor(
             "pearls", vendor_config,
@@ -158,7 +158,7 @@ class TestCheckVendor:
         )
         assert violations == []
 
-    def test_pearls_protected_file(self):
+    def test_pearls_protected_file(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["pearls"]
         violations = check.check_vendor(
             "pearls", vendor_config,
@@ -168,7 +168,7 @@ class TestCheckVendor:
         assert ".pearls/prl.py" in violations
         assert ".pearls/merge-driver.py" in violations
 
-    def test_pearls_archive_allowed(self):
+    def test_pearls_archive_allowed(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["pearls"]
         violations = check.check_vendor(
             "pearls", vendor_config,
@@ -177,7 +177,7 @@ class TestCheckVendor:
         )
         assert violations == []
 
-    def test_workflow_file_protected(self):
+    def test_workflow_file_protected(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
             "git-vendored", vendor_config,
@@ -186,7 +186,7 @@ class TestCheckVendor:
         )
         assert ".github/workflows/install-vendored.yml" in violations
 
-    def test_mixed_violations_and_allowed(self):
+    def test_mixed_violations_and_allowed(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
         violations = check.check_vendor(
             "git-vendored", vendor_config,
@@ -197,7 +197,7 @@ class TestCheckVendor:
         assert ".vendored/install" in violations
         assert ".vendored/check" in violations
 
-    def test_no_protected_patterns(self):
+    def test_no_protected_patterns(self, tmp_repo):
         vendor_config = {"repo": "owner/repo", "protected": [], "allowed": []}
         violations = check.check_vendor(
             "empty", vendor_config,
