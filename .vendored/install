@@ -686,8 +686,10 @@ def create_pull_request(results):
         ["git", "commit", "--no-verify", "-m", title],
         check=True, capture_output=True,
     )
+    # --force-with-lease: these install branches are ephemeral automation
+    # artifacts; a stale remote ref from a prior run must not block the push.
     push_result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
+        ["git", "push", "--force-with-lease", "-u", "origin", branch],
         capture_output=True, text=True,
     )
     if push_result.returncode != 0:
