@@ -1,0 +1,110 @@
+#!/bin/bash
+# .pearls/hooks/pre-push
+# Pre-push hook that enforces branch naming conventions.
+# See AGENTS.md "Branch Naming (REQUIRED)" for the full pattern docs.
+#
+# Valid patterns:
+#   <prefix>-<epic>.<hash>[+<hash>]/<mode>   First-class epic session (hashes required)
+#   <prefix>-<epic>.<hash>[+<hash>]           First-class epic task
+#   <prefix>-<hex4>/<mode>                    Feature epic session
+#   <prefix>-<name>/plan                      Planning session
+#   main                                      Main branch
+#   chore/install-pearls*                     Install branches
+#
+# Modes: plan, refine, estimate, impl, oneshot, eval, cleanup
+#
+# Installed by configure.sh as a symlink from .git/hooks/pre-push.
+
+# Read config
+PREFIX=""
+EPICS=()
+
+if [ -f .pearls/config.json ]; then
+    PREFIX=$(python3 -c "
+import json; print(json.load(open('.pearls/config.json')).get('prefix', ''))
+" 2>/dev/null || echo "")
+    EPICS_STR=$(python3 -c "
+import json; print(' '.join(json.load(open('.pearls/config.json')).get('epics', [])))
+" 2>/dev/null || echo "")
+    read -ra EPICS <<< "$EPICS_STR"
+fi
+
+if [ -z "$PREFIX" ]; then
+    # No prefix configured, can't validate
+    exit 0
+fi
+
+MODES="plan|refine|estimate|impl|oneshot|eval|cleanup"
+HASH="[a-f0-9]{4}"
+
+validate_branch() {
+    local BRANCH="$1"
+
+    # Always allowed
+    [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && return 0
+    [[ "$BRANCH" == chore/install-pearls* ]] && return 0
+
+    # First-class epic patterns (with required task hashes)
+    for EPIC in "${EPICS[@]}"; do
+        # With hashes + mode: prl-1shots.b2c1+a3f8/impl
+        [[ "$BRANCH" =~ ^${PREFIX}-${EPIC}\.${HASH}(\+${HASH})*/(${MODES})$ ]] && return 0
+        # With hashes, no mode: prl-1shots.b2c1 or prl-1shots.b2c1+a3f8
+        [[ "$BRANCH" =~ ^${PREFIX}-${EPIC}\.${HASH}(\+${HASH})*$ ]] && return 0
+    done
+
+    # Reject bare first-class epic names (must have task hashes)
+    for EPIC in "${EPICS[@]}"; do
+        if [[ "$BRANCH" =~ ^${PREFIX}-${EPIC}(/|$) ]]; then
+            echo "Error: First-class epic '${EPIC}' branches require task hashes." >&2
+            echo "  Expected: ${PREFIX}-${EPIC}.<hash>/<mode> or ${PREFIX}-${EPIC}.<hash>" >&2
+            echo "  Example:  ${PREFIX}-${EPIC}.b2c1+a3f8/impl" >&2
+            return 1
+        fi
+    done
+
+    # Feature epic session: prl-a3f8/impl
+    [[ "$BRANCH" =~ ^${PREFIX}-${HASH}/(${MODES})$ ]] && return 0
+
+    # Planning session: prl-auth-system/plan
+    [[ "$BRANCH" =~ ^${PREFIX}-[a-zA-Z0-9][a-zA-Z0-9_-]*/plan$ ]] && return 0
+
+    return 1
+}
+
+# Read refs being pushed from stdin
+ERRORS=""
+while read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+    # Skip delete pushes
+    [[ "$LOCAL_SHA" == "0000000000000000000000000000000000000000" ]] && continue
+
+    # Skip tag pushes
+    [[ "$REMOTE_REF" == refs/tags/* ]] && continue
+
+    # Extract branch name from remote ref
+    BRANCH="${REMOTE_REF#refs/heads/}"
+
+    if ! validate_branch "$BRANCH"; then
+        ERRORS="${ERRORS}  ${BRANCH}\n"
+    fi
+done
+
+if [ -n "$ERRORS" ]; then
+    echo "" >&2
+    echo "Error: Branch name does not match required naming conventions." >&2
+    echo "" >&2
+    echo "Rejected:" >&2
+    echo -e "$ERRORS" >&2
+    echo "Valid patterns:" >&2
+    echo "  ${PREFIX}-<epic>.<hash>[+<hash>]/<mode>  First-class epic session" >&2
+    echo "  ${PREFIX}-<epic>.<hash>[+<hash>]          First-class epic task" >&2
+    echo "  ${PREFIX}-<hex4>/<mode>                   Feature epic session" >&2
+    echo "  ${PREFIX}-<name>/plan                     Planning session" >&2
+    echo "  main                                      Main branch" >&2
+    echo "  chore/install-pearls*                     Install branch" >&2
+    echo "" >&2
+    echo "Modes: plan, refine, estimate, impl, oneshot, eval, cleanup" >&2
+    echo "" >&2
+    echo "See AGENTS.md for full documentation." >&2
+    echo "To bypass: git push --no-verify" >&2
+    exit 1
+fi
