@@ -332,3 +332,117 @@ class TestMain:
             rem.main()
 
         assert not (tmp_repo / ".tool").exists()
+
+
+# ── Tests: Reverse dependency check ──────────────────────────────────────
+
+class TestReverseDeps:
+    def test_check_reverse_deps_none(self, tmp_repo):
+        """No .deps files returns empty list."""
+        result = rem.check_reverse_deps("tool")
+        assert result == []
+
+    def test_check_reverse_deps_found(self, tmp_repo):
+        """Vendor-a.deps contains 'tool' -> ['vendor-a']."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "vendor-a.deps").write_text("tool\n")
+
+        result = rem.check_reverse_deps("tool")
+        assert result == ["vendor-a"]
+
+    def test_check_reverse_deps_multiple(self, tmp_repo):
+        """Two vendors depend on same tool."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "vendor-a.deps").write_text("tool\n")
+        (manifests_dir / "vendor-b.deps").write_text("tool\nother\n")
+
+        result = rem.check_reverse_deps("tool")
+        assert sorted(result) == ["vendor-a", "vendor-b"]
+
+    def test_check_reverse_deps_skips_self(self, tmp_repo):
+        """Tool's own .deps file is ignored."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.deps").write_text("tool\n")
+
+        result = rem.check_reverse_deps("tool")
+        assert result == []
+
+    def test_remove_warns_on_reverse_deps(self, make_config, tmp_repo, capsys):
+        """Removing a dep'd-on vendor prints warning."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": SAMPLE_VENDOR}})
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "other.deps").write_text("tool\n")
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+
+        with patch("sys.argv", ["remove", "tool"]):
+            with patch("builtins.input", return_value="n"):
+                with pytest.raises(SystemExit) as exc_info:
+                    rem.main()
+                assert exc_info.value.code == 0
+
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "other" in out
+        # Files should still exist (aborted)
+        assert (tmp_repo / ".tool" / "script.sh").exists()
+
+    def test_remove_force_skips_reverse_dep_prompt(self, make_config, tmp_repo, capsys):
+        """--force bypasses the reverse dep prompt."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": SAMPLE_VENDOR}})
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+        (manifests_dir / "other.deps").write_text("tool\n")
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+
+        out = capsys.readouterr().out
+        assert "Warning" in out
+        assert "Removed" in out
+        assert not (tmp_repo / ".tool" / "script.sh").exists()
+
+    def test_remove_cleans_up_deps_file(self, make_config, tmp_repo, capsys):
+        """.deps file deleted during removal."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+        (manifests_dir / "tool.deps").write_text("some-dep\n")
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+
+        assert not (manifests_dir / "tool.deps").exists()
+
+    def test_remove_without_deps_file_still_works(self, make_config, tmp_repo, capsys):
+        """Vendor with no .deps file removes cleanly."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
+
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+
+        assert "Removed" in capsys.readouterr().out
+        assert not (tmp_repo / ".tool" / "script.sh").exists()
