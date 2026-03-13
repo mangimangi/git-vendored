@@ -906,6 +906,13 @@ def create_pull_request(results):
         ["git", "commit", "--no-verify", "-m", title],
         check=True, capture_output=True,
     )
+    # Fetch the remote branch (if it exists) so --force-with-lease has a
+    # valid baseline.  On a fresh CI clone the remote ref is unknown,
+    # causing --force-with-lease to reject the push with "stale info".
+    subprocess.run(
+        ["git", "fetch", "origin", branch],
+        capture_output=True,
+    )
     # --force-with-lease: these install branches are ephemeral automation
     # artifacts; a stale remote ref from a prior run must not block the push.
     push_result = subprocess.run(
