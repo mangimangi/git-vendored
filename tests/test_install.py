@@ -1019,6 +1019,24 @@ class TestCreatePullRequest:
         assert "--force-with-lease" in push_cmds[0]
 
     @patch("vendored_install.subprocess.run")
+    def test_unstages_workflow_files(self, mock_run, make_config, monkeypatch):
+        """Workflow files are unstaged so GITHUB_TOKEN without workflows perm works."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock_subprocess()
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                     "new_version": "2.0.0", "changed": True}]
+        inst.create_pull_request(results)
+
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        reset_cmds = [c for c in calls
+                      if c[0] == "git" and "reset" in c]
+        assert len(reset_cmds) == 1
+        assert reset_cmds[0] == ["git", "reset", "HEAD", "--",
+                                  ".github/workflows/"]
+
+    @patch("vendored_install.subprocess.run")
     def test_multi_vendor_commit_uses_no_verify(self, mock_run, make_config,
                                                  monkeypatch):
         """Multi-vendor PR commit bypasses pre-commit hook."""

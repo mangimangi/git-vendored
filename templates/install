@@ -882,6 +882,16 @@ def create_pull_request(results):
     )
     subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
+    # Unstage workflow files: the GITHUB_TOKEN used by CI lacks the
+    # `workflows` permission, so pushing commits that touch
+    # .github/workflows/ would be rejected.  Workflow templates are
+    # written to disk by install.sh for initial bootstrap; they should
+    # not be re-committed in automated update PRs.
+    subprocess.run(
+        ["git", "reset", "HEAD", "--", ".github/workflows/"],
+        capture_output=True,
+    )
+
     diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
     if diff_result.returncode == 0:
         print("No changes to commit")
