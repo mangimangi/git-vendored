@@ -3,7 +3,7 @@
 # on merge to main (patch), or when triggered manually via workflow_dispatch
 # (major|minor|patch).
 #
-# All logic lives in .semver/bump-and-release (updated via vendor install).
+# All logic lives in .vendored/pkg/git-semver/bump-and-release (updated via vendor install).
 # This workflow is a thin shell: triggers, permissions, and context passing.
 #
 # Skips automated commits (chore: bump version, chore: install).
@@ -64,4 +64,4 @@ jobs:
           INPUT_BUMP_TYPE: ${{ inputs.bump_type || '' }}
           INPUT_SUBDIRECTORY: ${{ inputs.subdirectory || '' }}
           INPUT_CHANGELOG_DESCRIPTION: ${{ inputs.changelog_description || '' }}
-        run: python3 .semver/bump-and-release
+        run: python3 .vendored/pkg/git-semver/bump-and-release
