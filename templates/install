@@ -357,10 +357,10 @@ def resolve_deps(deps, token, mode, installing_set=None):
     """Apply dependency mode for resolved deps.
 
     Modes:
-      - "error": exit if any deps missing
+      - "error": exit if any deps missing (default)
       - "warn": print warning for missing deps, continue
       - "skip": no-op
-      - "install": not yet supported in this version
+      - "install": auto-install missing deps (with cycle detection)
     """
     if mode == "skip":
         return
@@ -381,7 +381,7 @@ def resolve_deps(deps, token, mode, installing_set=None):
 
     if mode == "install":
         if installing_set is None:
-            installing_set = set()
+            installing_set = []
         for dep_name, dep_info in missing:
             dep_repo = dep_info.get("repo")
             if not dep_repo:
@@ -608,12 +608,12 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
                        installing_set=None):
     """First-time add: pre-validate, run install.sh, post-validate."""
     if installing_set is None:
-        installing_set = set()
+        installing_set = []
     if repo in installing_set:
-        chain = " -> ".join(sorted(installing_set)) + " -> " + repo
+        chain = " -> ".join(installing_set) + " -> " + repo
         print(f"::error::Circular dependency detected: {chain}")
         sys.exit(1)
-    installing_set.add(repo)
+    installing_set.append(repo)
 
     # Pre-validate
     check_repo_exists(repo, token)
@@ -713,13 +713,13 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
                             force=False, deps_mode=None, installing_set=None):
     """Update path: resolve version, skip if current, run install.sh."""
     if installing_set is None:
-        installing_set = set()
+        installing_set = []
     repo = vendor_config["repo"]
     if repo in installing_set:
-        chain = " -> ".join(sorted(installing_set)) + " -> " + repo
+        chain = " -> ".join(installing_set) + " -> " + repo
         print(f"::error::Circular dependency detected: {chain}")
         sys.exit(1)
-    installing_set.add(repo)
+    installing_set.append(repo)
 
     token = get_auth_token(vendor_config)
     target_version = resolve_version(vendor_name, repo, requested_version, token)

@@ -1617,7 +1617,7 @@ class TestAutoInstallAndCycleDetection:
 
     def test_circular_dependency_detected(self, tmp_repo):
         """Circular dep A -> B -> A detected with sys.exit(1)."""
-        installing_set = {"owner/vendor-a"}
+        installing_set = ["owner/vendor-a"]
         deps = {"vendor-a": {"repo": "owner/vendor-a"}}
 
         with pytest.raises(SystemExit) as exc_info:
@@ -1628,7 +1628,7 @@ class TestAutoInstallAndCycleDetection:
     def test_self_dependency_detected(self, tmp_repo):
         """Vendor that depends on itself is detected as circular."""
         # install_new_vendor checks repo in installing_set
-        installing_set = {"owner/tool"}
+        installing_set = ["owner/tool"]
         with pytest.raises(SystemExit) as exc_info:
             inst.install_new_vendor("owner/tool", "latest", "token",
                                     installing_set=installing_set)
