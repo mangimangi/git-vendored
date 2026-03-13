@@ -1013,6 +1013,12 @@ class TestCreatePullRequest:
         inst.create_pull_request(results)
 
         calls = [c[0][0] for c in mock_run.call_args_list]
+        # Should fetch the remote branch first so --force-with-lease
+        # has a valid baseline on fresh CI clones.
+        fetch_cmds = [c for c in calls
+                      if c[0] == "git" and "fetch" in c]
+        assert ["git", "fetch", "origin",
+                "chore/install-tool-v2.0.0"] in fetch_cmds
         push_cmds = [c for c in calls
                      if c[0] == "git" and "push" in c]
         assert len(push_cmds) == 1
