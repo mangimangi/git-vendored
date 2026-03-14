@@ -100,9 +100,16 @@ if [ ! -f .vendored/config.json ]; then
     echo "Created .vendored/config.json"
 fi
 
-# Install/update workflow templates (always updated to propagate changes)
+# Install workflow templates (skip if already present — GITHUB_TOKEN cannot
+# push commits that modify workflow files without the `workflows` permission,
+# which is not available to GITHUB_TOKEN)
 install_workflow() {
     local workflow="$1"
+    if [ -f ".github/workflows/$workflow" ]; then
+        echo "Workflow .github/workflows/$workflow already exists, skipping"
+        INSTALLED_FILES+=(".github/workflows/$workflow")
+        return
+    fi
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
         INSTALLED_FILES+=(".github/workflows/$workflow")
