@@ -23,6 +23,7 @@ Environment:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -710,7 +711,8 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
 
 
 def install_existing_vendor(vendor_name, vendor_config, requested_version,
-                            force=False, deps_mode=None, installing_set=None):
+                            force=False, deps_mode=None, installing_set=None,
+                            post_install_only=False):
     """Update path: resolve version, skip if current, run install.sh."""
     if installing_set is None:
         installing_set = []
@@ -745,6 +747,11 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     manifest_files = download_and_run_install(repo, target_version, token,
                                               vendor_name=vendor_name,
                                               vendor_config=vendor_config)
+
+    # Self-bootstrap: if install.sh updated the coordinator on disk,
+    # re-exec so post-install steps use the new code.
+    if not post_install_only:
+        _maybe_reexec()
 
     # Process manifest if install.sh wrote one
     if manifest_files:
@@ -1082,6 +1089,52 @@ def _should_migrate_project_configs():
     return False
 
 
+# ── Self-bootstrap ────────────────────────────────────────────────────────
+
+def _file_hash(path):
+    """Return SHA-256 hex digest of a file's contents."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _maybe_reexec():
+    """Re-exec with the new on-disk coordinator if it changed.
+
+    After install.sh writes a new .vendored/install, the in-memory
+    coordinator is stale.  Re-exec so post-install steps (PR creation,
+    output) run using the new code.
+
+    Only called when --post-install-only is NOT already set (guards
+    against infinite re-exec).
+    """
+    install_on_disk = ".vendored/install"
+    if not os.path.isfile(install_on_disk):
+        return
+
+    running_script = os.path.abspath(__file__)
+    on_disk_abs = os.path.abspath(install_on_disk)
+
+    # If we ARE the on-disk file (e.g. during tests or local dev), skip
+    if running_script == on_disk_abs:
+        return
+
+    if _file_hash(running_script) == _file_hash(on_disk_abs):
+        return
+
+    # Coordinator changed — re-exec with --post-install-only
+    new_argv = [sys.executable, on_disk_abs]
+    # Forward original args, add --post-install-only
+    for arg in sys.argv[1:]:
+        new_argv.append(arg)
+    new_argv.append("--post-install-only")
+
+    print("Coordinator updated on disk, re-executing with new version...")
+    os.execv(sys.executable, new_argv)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def _is_repo_spec(arg):
@@ -1118,6 +1171,10 @@ def main():
         choices=["error", "warn", "install", "skip"],
         help="Dependency handling mode (default: from config or 'error')"
     )
+    parser.add_argument(
+        "--post-install-only", action="store_true",
+        help="Skip install, only run post-install steps (used by self-bootstrap)"
+    )
     args = parser.parse_args()
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
@@ -1132,6 +1189,29 @@ def main():
 
     config = load_config()
     vendors = config.get("vendors", {})
+
+    if args.post_install_only:
+        # Self-bootstrap re-exec: install already happened, just do
+        # post-install steps (output, PR creation) with the new coordinator.
+        vendor_name = args.target
+        if vendor_name not in vendors:
+            print(f"::error::Unknown vendor for post-install: {vendor_name}")
+            sys.exit(1)
+        current_version = read_manifest_version(vendor_name)
+        if not current_version:
+            print(f"::error::No manifest version found for {vendor_name}")
+            sys.exit(1)
+        result = {
+            "vendor": vendor_name,
+            "old_version": "unknown",
+            "new_version": current_version,
+            "changed": True,
+        }
+        output_result(result)
+        results = [result]
+        if args.pr:
+            create_pull_request(results)
+        return
 
     if args.target == "all":
         # Update all registered vendors

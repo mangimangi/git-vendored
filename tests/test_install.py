@@ -20,6 +20,7 @@ def _import_install():
     loader = importlib.machinery.SourceFileLoader("vendored_install", filepath)
     spec = importlib.util.spec_from_loader("vendored_install", loader, origin=filepath)
     module = importlib.util.module_from_spec(spec)
+    module.__file__ = filepath
     sys.modules["vendored_install"] = module
     spec.loader.exec_module(module)
     return module
@@ -2061,3 +2062,180 @@ class TestTopologicalSort:
         with patch("sys.argv", ["install", "all"]):
             inst.main()
         mock_topo.assert_called_once()
+
+
+# ── Tests: Self-bootstrap ────────────────────────────────────────────────
+
+class TestFileHash:
+    def test_returns_consistent_hash(self, tmp_path):
+        f = tmp_path / "test.txt"
+        f.write_text("hello world")
+        assert inst._file_hash(str(f)) == inst._file_hash(str(f))
+
+    def test_different_content_different_hash(self, tmp_path):
+        f1 = tmp_path / "a.txt"
+        f2 = tmp_path / "b.txt"
+        f1.write_text("hello")
+        f2.write_text("world")
+        assert inst._file_hash(str(f1)) != inst._file_hash(str(f2))
+
+    def test_same_content_same_hash(self, tmp_path):
+        f1 = tmp_path / "a.txt"
+        f2 = tmp_path / "b.txt"
+        f1.write_text("same content")
+        f2.write_text("same content")
+        assert inst._file_hash(str(f1)) == inst._file_hash(str(f2))
+
+
+class TestMaybeReexec:
+    def test_no_reexec_when_no_install_on_disk(self, tmp_repo):
+        """No .vendored/install on disk → no re-exec."""
+        # .vendored/install doesn't exist in tmp_repo
+        inst._maybe_reexec()  # should return without error
+
+    def test_no_reexec_when_hashes_match(self, tmp_repo, monkeypatch):
+        """If on-disk coordinator matches running script, no re-exec."""
+        content = "#!/usr/bin/env python3\n# same version"
+        on_disk = tmp_repo / ".vendored" / "install"
+        on_disk.write_text(content)
+
+        # Patch __file__ to point to a different path with same content
+        fake_script = tmp_repo / "fake_install"
+        fake_script.write_text(content)
+        monkeypatch.setattr(inst, "__file__", str(fake_script))
+
+        # Should not call os.execv
+        with patch("os.execv") as mock_execv:
+            inst._maybe_reexec()
+            mock_execv.assert_not_called()
+
+    def test_reexec_when_hashes_differ(self, tmp_repo, monkeypatch):
+        """If on-disk coordinator differs, should re-exec with --post-install-only."""
+        on_disk = tmp_repo / ".vendored" / "install"
+        on_disk.write_text("#!/usr/bin/env python3\n# NEW version")
+
+        fake_script = tmp_repo / "fake_install"
+        fake_script.write_text("#!/usr/bin/env python3\n# OLD version")
+        monkeypatch.setattr(inst, "__file__", str(fake_script))
+
+        monkeypatch.setattr("sys.argv", ["install", "git-vendored", "--pr"])
+
+        with patch("os.execv") as mock_execv:
+            inst._maybe_reexec()
+            mock_execv.assert_called_once()
+            call_args = mock_execv.call_args[0]
+            argv = call_args[1]
+            assert "--post-install-only" in argv
+            assert str(on_disk) in argv[1]
+
+    def test_no_reexec_when_same_file(self, tmp_repo, monkeypatch):
+        """If running script IS the on-disk file, no re-exec."""
+        on_disk = tmp_repo / ".vendored" / "install"
+        on_disk.write_text("#!/usr/bin/env python3\n# some content")
+
+        # Point __file__ to the same path
+        monkeypatch.setattr(inst, "__file__", str(on_disk))
+
+        with patch("os.execv") as mock_execv:
+            inst._maybe_reexec()
+            mock_execv.assert_not_called()
+
+
+class TestPostInstallOnly:
+    def test_post_install_only_reads_from_disk(self, tmp_repo, make_config):
+        """--post-install-only builds result from manifest version on disk."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True, exist_ok=True)
+        (manifests / "tool.version").write_text("2.0.0\n")
+
+        with patch("sys.argv", ["install", "tool", "--post-install-only"]):
+            with patch("vendored_install.output_result") as mock_output:
+                with patch("vendored_install.create_pull_request"):
+                    inst.main()
+                result = mock_output.call_args[0][0]
+                assert result["vendor"] == "tool"
+                assert result["new_version"] == "2.0.0"
+                assert result["changed"] is True
+
+    def test_post_install_only_creates_pr_when_flagged(self, tmp_repo, make_config):
+        """--post-install-only --pr should call create_pull_request."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True, exist_ok=True)
+        (manifests / "tool.version").write_text("2.0.0\n")
+
+        with patch("sys.argv", ["install", "tool", "--post-install-only", "--pr"]):
+            with patch("vendored_install.output_result"):
+                with patch("vendored_install.create_pull_request") as mock_pr:
+                    inst.main()
+                    mock_pr.assert_called_once()
+
+    def test_post_install_only_skips_download(self, tmp_repo, make_config):
+        """--post-install-only must NOT call download_and_run_install."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True, exist_ok=True)
+        (manifests / "tool.version").write_text("2.0.0\n")
+
+        with patch("sys.argv", ["install", "tool", "--post-install-only"]):
+            with patch("vendored_install.output_result"):
+                with patch("vendored_install.create_pull_request"):
+                    with patch("vendored_install.download_and_run_install") as mock_dl:
+                        inst.main()
+                        mock_dl.assert_not_called()
+
+    def test_post_install_only_unknown_vendor_exits(self, tmp_repo, make_config):
+        """--post-install-only with unknown vendor exits with error."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["install", "unknown", "--post-install-only"]):
+            with pytest.raises(SystemExit):
+                inst.main()
+
+    def test_post_install_only_no_version_exits(self, tmp_repo, make_config):
+        """--post-install-only with no manifest version exits with error."""
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["install", "tool", "--post-install-only"]):
+            with pytest.raises(SystemExit):
+                inst.main()
+
+
+class TestInstallExistingVendorBootstrap:
+    """Test that install_existing_vendor triggers re-exec when coordinator changes."""
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install._maybe_reexec")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token")
+    @patch("vendored_install.download_deps")
+    def test_calls_maybe_reexec_after_install(self, mock_deps, mock_auth,
+                                               mock_resolve, mock_reexec,
+                                               mock_dl, tmp_repo, make_config):
+        """install_existing_vendor calls _maybe_reexec after download_and_run_install."""
+        mock_auth.return_value = "token"
+        mock_resolve.return_value = "2.0.0"
+        mock_dl.return_value = None
+        mock_deps.return_value = None
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        mock_reexec.assert_called_once()
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install._maybe_reexec")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token")
+    @patch("vendored_install.download_deps")
+    def test_skips_reexec_when_post_install_only(self, mock_deps, mock_auth,
+                                                   mock_resolve, mock_reexec,
+                                                   mock_dl, tmp_repo, make_config):
+        """install_existing_vendor skips _maybe_reexec when post_install_only=True."""
+        mock_auth.return_value = "token"
+        mock_resolve.return_value = "2.0.0"
+        mock_dl.return_value = None
+        mock_deps.return_value = None
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest",
+                                      post_install_only=True)
+        mock_reexec.assert_not_called()
