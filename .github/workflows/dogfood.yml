@@ -40,3 +40,5 @@ jobs:
     with:
       vendor: ${{ needs.resolve.outputs.vendor }}
       version: latest
+    secrets:
+      token: ${{ secrets.VENDOR_PAT }}
