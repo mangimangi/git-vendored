@@ -582,6 +582,57 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
             os.unlink(manifest_path)
 
 
+# ── Post-install hooks ─────────────────────────────────────────────────────
+
+def run_post_install_hook(vendor_name, install_dir, version):
+    """Run post-install.sh if it exists and .git/ is present.
+
+    After install.sh completes, checks for hooks/post-install.sh in the
+    vendor's install directory. Runs it with VENDOR_NAME, VENDOR_PKG_DIR,
+    and PROJECT_DIR set. Writes a version stamp to manifests.
+
+    Skipped for dogfood vendors (no install_dir) or non-git contexts.
+    """
+    if not install_dir:
+        return
+
+    hook_path = os.path.join(install_dir, "hooks", "post-install.sh")
+    if not os.path.isfile(hook_path):
+        return
+
+    if not os.path.isdir(".git"):
+        return
+
+    project_dir = os.path.abspath(".")
+    pkg_dir = os.path.abspath(install_dir)
+
+    env = os.environ.copy()
+    env["VENDOR_NAME"] = vendor_name
+    env["VENDOR_PKG_DIR"] = pkg_dir
+    env["PROJECT_DIR"] = project_dir
+
+    print(f"  Running post-install hook for {vendor_name}...")
+    result = subprocess.run(
+        ["bash", hook_path],
+        capture_output=True, text=True, env=env,
+        cwd=project_dir,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        print(f"::error::post-install.sh failed for {vendor_name} "
+              f"(exit {result.returncode})")
+        sys.exit(1)
+
+    # Write version stamp
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    stamp_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.post-installed")
+    with open(stamp_path, "w") as f:
+        f.write(f"{version}\n")
+
+
 # ── Post-validation (add path) ────────────────────────────────────────────
 
 def find_new_entry(before_vendors, after_vendors):
@@ -693,6 +744,10 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     if deps:
         write_deps(new_key, list(deps.keys()))
 
+    # Run post-install hook
+    install_dir = f".vendored/pkg/{new_key}" if not new_entry.get("dogfood") else None
+    run_post_install_hook(new_key, install_dir, resolved_version)
+
     print(f"\nAdded vendor: {new_key}")
     print(f"  repo: {new_entry['repo']}")
     print(f"  version: {resolved_version}")
@@ -762,6 +817,11 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     # Cache resolved deps
     if deps:
         write_deps(vendor_name, list(deps.keys()))
+
+    # Run post-install hook
+    is_dogfood = vendor_config.get("dogfood", False)
+    install_dir = f".vendored/pkg/{vendor_name}" if not is_dogfood else None
+    run_post_install_hook(vendor_name, install_dir, target_version)
 
     return {
         "vendor": vendor_name,
@@ -1142,12 +1202,72 @@ def _is_repo_spec(arg):
     return "/" in arg and not arg.startswith("-")
 
 
+def list_vendors():
+    """List installed vendors in dependency order, one per line.
+
+    Scans .vendored/manifests/ for .version files to find installed vendors,
+    then topologically sorts by dependency order.
+    """
+    if not os.path.isdir(MANIFESTS_DIR):
+        return
+
+    vendor_names = []
+    for filename in os.listdir(MANIFESTS_DIR):
+        if filename.endswith(".version"):
+            vendor_names.append(filename[:-8])  # strip .version
+
+    if not vendor_names:
+        return
+
+    # Build a minimal vendors dict for topological_sort
+    vendors = {name: {} for name in vendor_names}
+    for name in topological_sort(vendors):
+        print(name)
+
+
+def list_hooks(hook_type):
+    """List hook script paths for the given hook type in dependency order.
+
+    Maps hook type to filename (session-start.sh / session-resume.sh),
+    filters to vendors that have the file, outputs absolute paths.
+    """
+    hook_filenames = {
+        "start": "session-start.sh",
+        "resume": "session-resume.sh",
+    }
+    hook_file = hook_filenames.get(hook_type)
+    if not hook_file:
+        print(f"::error::Unknown hook type: {hook_type}")
+        print(f"Valid types: {', '.join(sorted(hook_filenames.keys()))}")
+        sys.exit(1)
+
+    if not os.path.isdir(MANIFESTS_DIR):
+        return
+
+    vendor_names = []
+    for filename in os.listdir(MANIFESTS_DIR):
+        if filename.endswith(".version"):
+            vendor_names.append(filename[:-8])
+
+    if not vendor_names:
+        return
+
+    # Build a minimal vendors dict for topological_sort
+    vendors = {name: {} for name in vendor_names}
+    sorted_names = topological_sort(vendors)
+
+    for name in sorted_names:
+        hook_path = os.path.join(".vendored", "pkg", name, "hooks", hook_file)
+        if os.path.isfile(hook_path):
+            print(os.path.abspath(hook_path))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Install or update vendored tools"
     )
     parser.add_argument(
-        "target",
+        "target", nargs="?", default=None,
         help='owner/repo (new vendor), vendor name, or "all"'
     )
     parser.add_argument(
@@ -1175,7 +1295,27 @@ def main():
         "--post-install-only", action="store_true",
         help="Skip install, only run post-install steps (used by self-bootstrap)"
     )
+    parser.add_argument(
+        "--list", action="store_true", dest="list_vendors",
+        help="List installed vendors in dependency order"
+    )
+    parser.add_argument(
+        "--hooks", default=None, metavar="TYPE",
+        choices=["start", "resume"],
+        help="List hook script paths for TYPE (start or resume) in dependency order"
+    )
     args = parser.parse_args()
+
+    # Query commands: --list and --hooks don't need a target
+    if args.list_vendors:
+        list_vendors()
+        return
+    if args.hooks:
+        list_hooks(args.hooks)
+        return
+
+    if not args.target:
+        parser.error("target is required (unless using --list or --hooks)")
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
     if _should_migrate_config():
