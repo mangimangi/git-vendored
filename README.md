@@ -172,11 +172,21 @@ This prevents accidental edits to vendor-managed files while allowing the automa
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
+    my-tool.post-installed       # post-install version stamp
     pearls.files
     pearls.version
   hooks/
     pre-commit                   # shared pre-commit hook
+
+.claude/
+  hooks/
+    vendored-session.sh          # auto-generated orchestrator
+  settings.json                  # framework merges hook entries here
 ```
+
+### Session Hooks
+
+Vendors can provide hook scripts in `<pkg>/hooks/` that run during Claude Code sessions. The framework discovers hooks, orders vendors by dependency, and generates an orchestrator script. See `docs/session-hooks.md` for details.
 
 Vendor data files (e.g. `.pearls/issues.jsonl`, `.semver/.version`) remain in their original `.<vendor>/` directories — these are vendor-owned, not framework-managed. After migration, dot-directories become data-only zones. See `docs/vendor-install-dir-guide.md` for details.
 

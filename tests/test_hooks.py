@@ -472,3 +472,83 @@ class TestMergeSettingsJson:
 
         settings = json.loads((claude_dir / "settings.json").read_text())
         assert "hooks" in settings
+
+
+# ── Tests: E2E legacy transition (gv-3adc.6) ─────────────────────────────
+
+class TestLegacyTransition:
+    def test_full_transition_from_legacy(self, tmp_repo):
+        """Simulate transition from legacy .claude/ to framework-managed hooks."""
+        # Set up legacy state: vendor with .claude/hooks/configure.sh in manifest
+        claude_dir = tmp_repo / ".claude" / "hooks"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "configure.sh").write_text("#!/bin/bash\necho old\n")
+        (tmp_repo / ".claude" / "settings.json").write_text(json.dumps({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [{"type": "command",
+                                   "command": '"$CLAUDE_PROJECT_DIR"/.claude/hooks/configure.sh'}]
+                    }
+                ]
+            }
+        }, indent=2) + "\n")
+
+        # Create new-style hooks (simulating updated vendor install)
+        _create_hook(tmp_repo, "pearls", "post-install.sh", "#!/bin/bash\nexit 0\n")
+        _create_hook(tmp_repo, "pearls", "session-start.sh", "#!/bin/bash\nexit 0\n")
+        _create_hook(tmp_repo, "pearls", "session-resume.sh", "#!/bin/bash\nexit 0\n")
+
+        vendors = {"pearls": {"repo": "mangimangi/pearls"}}
+
+        # Generate orchestrator (as install command would do)
+        has_hooks = inst.generate_orchestrator(vendors, str(tmp_repo))
+        assert has_hooks
+
+        # Merge settings (replaces legacy configure.sh entries with orchestrator)
+        inst.merge_settings_json(str(tmp_repo), has_hooks=True)
+
+        # Verify orchestrator generated
+        orch = tmp_repo / ".claude" / "hooks" / "vendored-session.sh"
+        assert orch.exists()
+        content = orch.read_text()
+        assert "pearls" in content
+        assert "set -euo pipefail" in content
+
+        # Verify settings.json updated correctly
+        settings = json.loads((tmp_repo / ".claude" / "settings.json").read_text())
+        session_hooks = settings["hooks"]["SessionStart"]
+
+        # Should have vendored entries + legacy configure.sh entry (preserved as non-vendor)
+        vendor_commands = []
+        legacy_commands = []
+        for entry in session_hooks:
+            for h in entry.get("hooks", []):
+                cmd = h.get("command", "")
+                if "vendored-session" in cmd:
+                    vendor_commands.append(cmd)
+                elif "configure.sh" in cmd:
+                    legacy_commands.append(cmd)
+
+        assert len(vendor_commands) == 2  # --start and --resume
+        # Legacy entry is preserved (it's the consumer's responsibility to remove
+        # the old configure.sh reference — the framework only manages vendored- entries)
+        assert len(legacy_commands) == 1
+
+    def test_legacy_settings_cleaned_on_second_pass(self, tmp_repo):
+        """After legacy configure.sh is removed from manifest, its settings entry
+        can be manually cleaned. Framework doesn't auto-remove non-vendor hooks."""
+        claude_dir = tmp_repo / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+
+        # Start with only vendored entries (clean state after migration)
+        _create_hook(tmp_repo, "pearls", "session-start.sh")
+        vendors = {"pearls": {"repo": "mangimangi/pearls"}}
+        inst.generate_orchestrator(vendors, str(tmp_repo))
+        inst.merge_settings_json(str(tmp_repo), has_hooks=True)
+
+        settings = json.loads((claude_dir / "settings.json").read_text())
+        for entry in settings["hooks"]["SessionStart"]:
+            for h in entry.get("hooks", []):
+                assert "configure.sh" not in h.get("command", "")
