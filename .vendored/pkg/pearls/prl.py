@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict, NotRequired, cast
 
-VERSION = "0.2.26"
+VERSION = "0.2.31"
 
 # ── Type aliases ─────────────────────────────────────────────────────────────
 
@@ -2052,7 +2052,7 @@ def cmd_prompt(args: argparse.Namespace) -> int:
 
     # Lazy import: only load madreperla when prompt body generation is needed
     import importlib.util
-    _repo_root = Path(__file__).resolve().parent.parent
+    _repo_root = find_pearls_dir().parent
     _pkg_dir = _repo_root / '.madreperla'
     if 'madreperla.prompt' not in sys.modules:
         _ps = importlib.util.spec_from_file_location('madreperla.prompt', _pkg_dir / 'prompt.py')
