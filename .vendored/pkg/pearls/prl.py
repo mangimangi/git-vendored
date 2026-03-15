@@ -30,7 +30,7 @@ Dependency types:
     implements/implemented_by - Realization link
     causes/caused_by   - Causal chain
 
-ID scheme (prefix from .pearls/config.json, required):
+ID scheme (prefix from .vendored/configs/pearls.json, required):
     Top-level:  {prefix}-a3f8          (random 4-char hex, merge-safe)
     Child:      {prefix}-a3f8.1        (sequential under parent)
     Subtask:    {prefix}-a3f8.1.1      (sequential under child)
@@ -79,18 +79,10 @@ class Estimate(TypedDict):
     estimator_cost: NotRequired[Cost]
 
 
-class EvalScores(TypedDict):
-    correctness: int
-    completeness: int
-    quality: int
-    testing: int
-    documentation: int
-
-
 class Evaluation(TypedDict):
     evaluator: str
     evaluated_at: str
-    scores: EvalScores
+    scores: dict[str, int]
     score: float
     cost: NotRequired[Cost]
 
@@ -138,6 +130,9 @@ class Config(TypedDict):
     docs: NotRequired[list[str]]
     models: NotRequired[dict[str, str]]
     install: NotRequired[dict[str, object]]
+    eval: NotRequired[dict[str, Any]]
+    prompts: NotRequired[dict[str, Any]]
+    sessions: NotRequired[dict[str, Any]]
 
 VALID_STATUSES = ["open", "in_progress", "implemented", "closed"]
 VALID_TYPES = ["task", "bug", "feature", "chore", "epic"]
@@ -172,7 +167,7 @@ SOFT_ORDER_TYPES = {"follows"}
 
 STATUS_ICONS = {"open": "○", "in_progress": "◐", "implemented": "◑", "closed": "●"}
 
-VENDORED_CONFIG = ".vendored/configs/pearls.json"
+CONFIG_PATH = ".vendored/configs/pearls.json"
 
 
 def find_pearls_dir() -> Path:
@@ -216,11 +211,8 @@ def find_issues_file() -> Path:
 
 
 def _config_path() -> Path:
-    """Resolve config path: vendored first, legacy fallback."""
-    vendored = find_pearls_dir().parent / VENDORED_CONFIG
-    if vendored.exists():
-        return vendored
-    return find_pearls_dir() / "config.json"
+    """Resolve config path from vendored configs."""
+    return find_pearls_dir().parent / CONFIG_PATH
 
 
 def load_prefix() -> str:
@@ -228,9 +220,8 @@ def load_prefix() -> str:
     config_path = _config_path()
     if not config_path.exists():
         print(
-            "Error: config not found (tried .vendored/configs/pearls.json "
-            "and .pearls/config.json).\n"
-            'Create .pearls/config.json with: {"prefix": "your-project"}',
+            f"Error: config not found at {config_path}.\n"
+            'Create .vendored/configs/pearls.json with: {"prefix": "your-project"}',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -262,13 +253,15 @@ def load_config() -> Config:
           objects with slug/alias/title/body (e.g. ["1shots", {"slug": "enhncmnts", "title": "Enhancements"}])
         - models (dict[str, str], optional): Default model overrides
         - install (dict[str, object], optional): Install behavior overrides
+        - eval (dict, optional): Eval config (e.g. {"threshold": 80})
+        - prompts (dict, optional): Prompt body overrides and template vars
+        - sessions (dict, optional): Session config per mode (model, max_turns)
     """
     config_path = _config_path()
     if not config_path.exists():
         print(
-            "Error: config not found (tried .vendored/configs/pearls.json "
-            "and .pearls/config.json).\n"
-            'Create .pearls/config.json with: {"prefix": "your-project"}',
+            f"Error: config not found at {config_path}.\n"
+            'Create .vendored/configs/pearls.json with: {"prefix": "your-project"}',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -287,6 +280,34 @@ def load_config() -> Config:
         )
         sys.exit(1)
     return cast(Config, config)
+
+
+# Hardcoded session defaults per mode
+_SESSION_DEFAULTS: dict[str, dict[str, Any]] = {
+    "planning":  {"model": "claude-opus-4-6", "max_turns": 25},
+    "refine":    {"model": "claude-opus-4-6", "max_turns": 30},
+    "estimate":  {"model": "claude-opus-4-6", "max_turns": 15},
+    "implement": {"model": "claude-opus-4-6", "max_turns": 50},
+    "oneshot":   {"model": "claude-opus-4-6", "max_turns": 50},
+    "eval":      {"model": "claude-opus-4-6", "max_turns": 20},
+    "cleanup":   {"model": "claude-opus-4-6", "max_turns": 15},
+}
+
+
+def resolve_session(config: Config, mode: str) -> dict[str, Any]:
+    """Resolve session config for a prompt mode.
+
+    Resolution: sessions.<mode>.<field> → sessions.default.<field> → hardcoded fallback.
+    """
+    hardcoded = _SESSION_DEFAULTS.get(mode, {"model": "claude-opus-4-6", "max_turns": 25})
+    sessions = config.get("sessions", {})
+    default = sessions.get("default", {})
+    mode_config = sessions.get(mode, {})
+
+    return {
+        "model": mode_config.get("model", default.get("model", hardcoded["model"])),
+        "max_turns": mode_config.get("max_turns", default.get("max_turns", hardcoded["max_turns"])),
+    }
 
 
 def get_epic_slugs(config: Config) -> list[str]:
@@ -1201,6 +1222,42 @@ def cmd_impl(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_EVAL_DIMENSIONS: dict[str, dict[str, Any]] = {
+    "correctness": {"description": "Does it work as specified?"},
+    "completeness": {"description": "Are all acceptance criteria met?"},
+    "quality": {"description": "Is it clean, maintainable, well-structured?"},
+    "testing": {"description": "Are changes adequately tested?"},
+    "documentation": {"description": "Are changes documented where needed?"},
+}
+
+
+def get_eval_dimensions(config: "dict[str, Any] | Config") -> list[dict[str, Any]]:
+    """Return eval dimensions with resolved thresholds from config.
+
+    Each returned dict has: name, description, threshold.
+    When eval.dimensions is absent, returns default 5 dimensions.
+    """
+    global_threshold = config.get("eval", {}).get("threshold", 80)
+    dims_config = config.get("eval", {}).get("dimensions")
+
+    if dims_config:
+        result = []
+        for name, spec in dims_config.items():
+            spec = spec or {}
+            result.append({
+                "name": name,
+                "description": spec.get("description", ""),
+                "threshold": spec.get("threshold", global_threshold),
+            })
+        return result
+
+    # Default dimensions
+    return [
+        {"name": name, "description": spec["description"], "threshold": global_threshold}
+        for name, spec in DEFAULT_EVAL_DIMENSIONS.items()
+    ]
+
+
 def cmd_eval(args: argparse.Namespace) -> int:
     """Record evaluation scores on an implemented issue."""
     if not validate_model(args.evaluator, "evaluator"):
@@ -1214,15 +1271,31 @@ def cmd_eval(args: argparse.Namespace) -> int:
             print("  Use --no-cost to skip cost tracking", file=sys.stderr)
             return 1
 
-    # Validate all scores are integers 0-100
-    score_fields = ["correctness", "completeness", "quality", "testing", "documentation"]
-    scores = {}
-    for field in score_fields:
-        val = getattr(args, field)
-        if val < 0 or val > 100:
-            print(f"Error: --{field} must be 0-100 (got {val})", file=sys.stderr)
+    # Parse --score key=value pairs
+    raw_scores = getattr(args, 'score', None) or []
+    if not raw_scores:
+        print("Error: at least one --score dimension=value is required", file=sys.stderr)
+        print("  Example: --score correctness=90 --score completeness=85", file=sys.stderr)
+        return 1
+    scores: dict[str, int] = {}
+    for entry in raw_scores:
+        if '=' not in entry:
+            print(f"Error: invalid --score format '{entry}' (expected name=value)", file=sys.stderr)
             return 1
-        scores[field] = val
+        name, val_str = entry.split('=', 1)
+        name = name.strip()
+        if not name:
+            print("Error: empty dimension name in --score", file=sys.stderr)
+            return 1
+        try:
+            val = int(val_str.strip())
+        except ValueError:
+            print(f"Error: score for '{name}' must be an integer (got '{val_str.strip()}')", file=sys.stderr)
+            return 1
+        if val < 0 or val > 100:
+            print(f"Error: --score {name} must be 0-100 (got {val})", file=sys.stderr)
+            return 1
+        scores[name] = val
 
     issues_path = find_issues_file()
     issues = read_issues(issues_path)
@@ -1258,18 +1331,36 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
     issue["evaluation"] = evaluation
 
+    # Auto-close on pass: per-dimension thresholds (epics exempt)
+    no_close = getattr(args, 'no_close', False)
+    auto_closed = False
+    if not is_epic and not no_close:
+        config = load_config()
+        dimensions = get_eval_dimensions(config)
+        dim_thresholds = {d["name"]: d["threshold"] for d in dimensions}
+        # Warn about dimensions not in config (typo protection)
+        for dim_name in scores:
+            if dim_thresholds and dim_name not in dim_thresholds:
+                print(f"Warning: dimension '{dim_name}' not in config", file=sys.stderr)
+        # Each scored dimension must meet its threshold (fallback to global for unknown dims)
+        global_threshold = config.get("eval", {}).get("threshold", 80)
+        if all(s >= dim_thresholds.get(dim, global_threshold) for dim, s in scores.items()):
+            issue["status"] = "closed"
+            issue["closed_at"] = now_iso()
+            auto_closed = True
+
     write_issues(issues_path, issues)
 
     print(f"Evaluated {args.issue_id}: {issue.get('title', '')}")
     print(f"  evaluator:     {args.evaluator}")
-    print(f"  correctness:   {scores['correctness']}")
-    print(f"  completeness:  {scores['completeness']}")
-    print(f"  quality:       {scores['quality']}")
-    print(f"  testing:       {scores['testing']}")
-    print(f"  documentation: {scores['documentation']}")
-    print(f"  overall:       {issue['evaluation']['score']}")
+    max_dim_len = max(len(d) for d in scores)
+    for dim, val in scores.items():
+        print(f"  {dim + ':': <{max_dim_len + 1}}  {val}")
+    print(f"  {'overall:': <{max_dim_len + 1}}  {issue['evaluation']['score']}")
     if not no_cost:
         print(f"  cost:          {evaluation['cost']}")
+    if auto_closed:
+        print(f"  auto-closed:   all scores >= threshold")
 
     return 0
 
@@ -1900,8 +1991,6 @@ def cmd_version(_args: argparse.Namespace) -> int:
 
 # ── Prompt Generation ────────────────────────────────────────────────────────
 
-REMOVE_AMBIGUITY = "If anything is unclear or ambiguous let's dig into it together and get to a shared place of clarity."
-
 
 def get_prompt_intro(description: str, docs_str: str) -> str:
     """Return the shared intro line used by all prompt modes."""
@@ -1913,28 +2002,18 @@ def get_prompt_header() -> str:
     return f"prl v{VERSION} configured — use `prl` commands to manage issues (not python3 prl.py)"
 
 
-def get_refine_body() -> str:
-    """Return the refine paragraph used by refine and oneshot modes."""
-    return f"I'd like to refine some features together and create straightforward pearls issues that are small in scope with clear acceptance criteria...if applicable we should specify requirements for extending docs and tests in addition to implementing the functionality of the feature. {REMOVE_AMBIGUITY} as part of this refinement - we should discern what epic the issue(s) will be created in (or if a new epic will be created)."
-
-
-def get_planning_body() -> str:
-    """Return the planning paragraph for planning mode."""
-    return f"I'd like to plan some features together and create markdown docs that completely/minimally encapsulate the features... {REMOVE_AMBIGUITY} as part of this planning - we must discern if the work is ready to be refined into implementation tasks\u2026if so, we need to decide what epic the work will be created in (or if we need to create a new epic)."
-
-
 def validate_prompt_config(config: Config) -> bool:
     """Validate that description and docs are configured for prompt generation."""
     if not config.get("description"):
         print(
-            "Error: 'description' not configured in .pearls/config.json.\n"
+            "Error: 'description' not configured in .vendored/configs/pearls.json.\n"
             "Add a project description to use prl prompt.",
             file=sys.stderr,
         )
         return False
     if not config.get("docs"):
         print(
-            "Error: 'docs' not configured in .pearls/config.json.\n"
+            "Error: 'docs' not configured in .vendored/configs/pearls.json.\n"
             "Add docs paths to use prl prompt.",
             file=sys.stderr,
         )
@@ -1964,116 +2043,37 @@ def cmd_prompt(args: argparse.Namespace) -> int:
         print(f"{header}\n\n{get_prompt_intro(description, docs_str)}")
         return 0
 
-    if args.prompt_type == "planning":
-        intro = get_prompt_intro(description, docs_str)
-        planning_body = get_planning_body()
-        prompt = f"""{header}
+    mode = args.prompt_type
+    valid_modes = {"planning", "refine", "estimate", "implement", "oneshot", "eval", "cleanup"}
+    if mode not in valid_modes:
+        print(f"Error: Unknown prompt type '{mode}'. "
+              "Valid types: planning, refine, estimate, implement, oneshot, eval, cleanup", file=sys.stderr)
+        return 1
 
-{intro}
+    # Lazy import: only load madreperla when prompt body generation is needed
+    import importlib.util
+    _repo_root = Path(__file__).resolve().parent.parent
+    _pkg_dir = _repo_root / '.madreperla'
+    if 'madreperla.prompt' not in sys.modules:
+        _ps = importlib.util.spec_from_file_location('madreperla.prompt', _pkg_dir / 'prompt.py')
+        assert _ps is not None and _ps.loader is not None
+        _pm = importlib.util.module_from_spec(_ps)
+        sys.modules['madreperla.prompt'] = _pm
+        _ps.loader.exec_module(_pm)
+    if 'madreperla' not in sys.modules:
+        _s = importlib.util.spec_from_file_location(
+            'madreperla', _pkg_dir / '__init__.py',
+            submodule_search_locations=[str(_pkg_dir)])
+        assert _s is not None and _s.loader is not None
+        _m = importlib.util.module_from_spec(_s)
+        sys.modules['madreperla'] = _m
+        _s.loader.exec_module(_m)
+    from madreperla import get_prompt_body  # type: ignore[import-not-found]
 
-{planning_body}
-
-if the work is ready for refinement, create the epic with `prl create --type=epic` (if it doesn't already exist) and save the planning doc to docs/planning/epics/<epic-id>.md (moving it from docs/planning/ if relevant info from prior planning docs exists). otherwise create/update the planning docs in docs/planning/. commit and push your changes when we're done planning.
-
-the scope of the work I want to plan is:"""
-        print(prompt)
-        return 0
-
-    if args.prompt_type == "refine":
-        intro = get_prompt_intro(description, docs_str)
-        refine_body = get_refine_body()
-        prompt = f"""{header}
-
-{intro}
-
-{refine_body}
-
-if an epic id is provided, check docs/planning/epics/<epic-id>.md for planning context. after creating issues, update the planning doc to remove items that have been refined into issues — delete the file if everything has been refined. commit and push your changes when done.
-
-the scope of the work I want to refine is:"""
-        print(prompt)
-        return 0
-
-    if args.prompt_type == "estimate":
-        intro = get_prompt_intro(description, docs_str)
-        implementer = config.get("models", {}).get("implementer", "claude-opus-4-6")
-        prompt = f"""{header}
-
-{intro}
-
-then let's estimate some issues and add your token estimate using `prl estimate`...you can assume the issues will be implemented by {implementer} unless otherwise specified. we can disregard any existing estimates as they are likely stale!
-
-please estimate each open tasks/subtasks in epic"""
-
-        print(prompt)
-        return 0
-
-    if args.prompt_type == "implement":
-        intro = get_prompt_intro(description, docs_str)
-        prompt = f"""{header}
-
-{intro}
-
-then I'd like you to implement the open tasks/subtasks in an epic and you can leave the epic open when you're finished in case we need to file more issues later
-
-the epic id is:"""
-        print(prompt)
-        return 0
-
-    if args.prompt_type == "oneshot":
-        intro = get_prompt_intro(description, docs_str)
-        refine_body = get_refine_body()
-        prompt = f"""{header}
-
-{intro}
-
-{refine_body}
-
-we can create the issues in the '1shots' epic...and after we've refined the work and created the issues, go ahead & estimate then implement!
-
-the scope of the work I want to refine is:"""
-        print(prompt)
-        return 0
-
-    if args.prompt_type == "eval":
-        intro = get_prompt_intro(description, docs_str)
-        evaluator = config.get("models", {}).get("evaluator", "claude-opus-4-6")
-        prompt = f"""{header}
-
-{intro}
-
-then I'd like you to evaluate the implemented issues in an epic. for each implemented issue:
-
-1. find the code changes: run `prl show <id>` — if it has a `pr_number`, use `gh pr diff <pr_number>`; otherwise `git show <commit>`
-2. score each dimension 0-100: correctness, completeness, quality, testing, documentation
-3. record the evaluation with `prl eval <id> --evaluator {evaluator} --correctness N --completeness N --quality N --testing N --documentation N`
-4. if you find defects, create defect tickets with `prl create --title="..." --defect-of <id>`
-5. if the implementation is clean (all scores >= 80), close it with `prl close <id>`
-
-leave the epic open when you're finished.
-
-the epic id is:"""
-        print(prompt)
-        return 0
-
-    if args.prompt_type == "cleanup":
-        prefix = load_prefix()
-        epic_slugs = get_epic_slugs(config)
-        keep_epics = ", ".join(f"{prefix}-{slug}" for slug in epic_slugs) if epic_slugs else "(none configured)"
-        intro = get_prompt_intro(description, docs_str)
-        prompt = f"""{header}
-
-{intro}
-
-then can you please archive closed epics and closed parent-less issues as well as any children of open epics that do not relate explicitly/implicitly to existing open children
-
-any open epics without open children should be closed but NOT archived with the exception of first-class epics: {keep_epics}"""
-        print(prompt)
-        return 0
-
-    print(f"Error: Unknown prompt type '{args.prompt_type}'. "
-          "Valid types: planning, refine, estimate, implement, oneshot, eval, cleanup", file=sys.stderr)
-    return 1
+    intro = get_prompt_intro(description, docs_str)
+    body = get_prompt_body(mode, config)
+    print(f"{header}\n\n{intro}\n\n{body}")
+    return 0
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -2155,15 +2155,12 @@ def main() -> int:
     p_eval = sub.add_parser("eval", help="Record evaluation scores on an implemented issue")
     p_eval.add_argument("issue_id", help="Issue ID")
     p_eval.add_argument("--evaluator", required=True, help="Full model ID of evaluator")
-    p_eval.add_argument("--correctness", type=int, required=True, help="Correctness score 0-100")
-    p_eval.add_argument("--completeness", type=int, required=True, help="Completeness score 0-100")
-    p_eval.add_argument("--quality", type=int, required=True, help="Quality score 0-100")
-    p_eval.add_argument("--testing", type=int, required=True, help="Testing score 0-100")
-    p_eval.add_argument("--documentation", type=int, required=True, help="Documentation score 0-100")
+    p_eval.add_argument("--score", action="append", metavar="DIM=N", help="Score a dimension (repeatable, e.g. --score correctness=90)")
     p_eval.add_argument("-i", "--input", type=int, help="Evaluator input tokens consumed (required unless --no-cost)")
     p_eval.add_argument("-o", "--output", type=int, help="Evaluator output tokens generated (required unless --no-cost)")
     p_eval.add_argument("--no-cost", action="store_true", help="Skip cost tracking")
     p_eval.add_argument("--force", action="store_true", help="Overwrite existing evaluation")
+    p_eval.add_argument("--no-close", action="store_true", help="Suppress auto-close even when all scores pass threshold")
     p_eval.set_defaults(func=cmd_eval)
 
     # dep

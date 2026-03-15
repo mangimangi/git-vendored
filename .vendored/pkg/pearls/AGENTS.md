@@ -41,7 +41,7 @@ prl ready                   # Show issues ready for work
 prl show <id>               # Show issue details
 prl start <id>              # Mark as in_progress (--agent <name> for identity)
 prl impl <id> -a <model> -i <input> -o <output>  # Mark as implemented
-prl eval <id> --evaluator <model> --correctness N --completeness N --quality N --testing N --documentation N -i <input> -o <output>
+prl eval <id> --evaluator <model> --score correctness=N --score completeness=N --score quality=N --score testing=N --score documentation=N -i <input> -o <output>
 prl close <id>                                    # Close issue (--agent <name> for identity)
 ```
 
@@ -262,16 +262,20 @@ All branches **must** follow these naming conventions. A pre-push hook enforces 
 | Pattern | When | Example |
 |---------|------|---------|
 | `<prefix>-<epic>.<h1>+<h2>/<mode>` | Session on specific tasks | `prl-1shots.b2c1+a3f8/impl` |
+| `<prefix>-<epic>.<h1>/<mode>/<sid>` | Parallel session (session-id suffix) | `prl-1shots.b2c1/impl/d4e5` |
 | `<prefix>-<epic>.<hash>` | Single task | `prl-1shots.b2c1` |
 | `<prefix>-<epic>.<h1>+<h2>+<h3>` | Multiple tasks (no mode) | `prl-1shots.b2c1+a3f8+d4e5` |
 
 First-class epics are broad containers — branches **must** include the specific task hash(es) being worked on.
+
+The optional `/<session-id>` suffix (4-char hex) on mode-bearing patterns supports parallel sessions working on the same epic. Note: eval sessions in the pipeline push to `/impl` branches, not `/eval` branches.
 
 **Feature epic branches** (e.g., `prl-a3f8`):
 
 | Pattern | When | Example |
 |---------|------|---------|
 | `<epic-id>/<mode>` | Session on the epic | `prl-a3f8/impl` |
+| `<epic-id>/<mode>/<sid>` | Parallel session | `prl-a3f8/impl/b2c1` |
 
 **Planning branches** (planning happens before epics exist):
 

@@ -46,8 +46,8 @@ validate_branch() {
 
     # First-class epic patterns (with required task hashes)
     for EPIC in "${EPICS[@]}"; do
-        # With hashes + mode: prl-1shots.b2c1+a3f8/impl
-        [[ "$BRANCH" =~ ^${PREFIX}-${EPIC}\.${HASH}(\+${HASH})*/(${MODES})$ ]] && return 0
+        # With hashes + mode + optional session-id: prl-1shots.b2c1+a3f8/impl or prl-1shots.b2c1/impl/b2c1
+        [[ "$BRANCH" =~ ^${PREFIX}-${EPIC}\.${HASH}(\+${HASH})*/(${MODES})(/${HASH})?$ ]] && return 0
         # With hashes, no mode: prl-1shots.b2c1 or prl-1shots.b2c1+a3f8
         [[ "$BRANCH" =~ ^${PREFIX}-${EPIC}\.${HASH}(\+${HASH})*$ ]] && return 0
     done
@@ -62,8 +62,8 @@ validate_branch() {
         fi
     done
 
-    # Feature epic session: prl-a3f8/impl
-    [[ "$BRANCH" =~ ^${PREFIX}-${HASH}/(${MODES})$ ]] && return 0
+    # Feature epic session: prl-a3f8/impl or prl-a3f8/impl/b2c1
+    [[ "$BRANCH" =~ ^${PREFIX}-${HASH}/(${MODES})(/${HASH})?$ ]] && return 0
 
     # Planning session: prl-auth-system/plan
     [[ "$BRANCH" =~ ^${PREFIX}-[a-zA-Z0-9][a-zA-Z0-9_-]*/plan$ ]] && return 0

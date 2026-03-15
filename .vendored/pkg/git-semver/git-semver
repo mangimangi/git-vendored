@@ -19,8 +19,7 @@ from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
-VENDORED_CONFIG = ".vendored/configs/git-semver.json"
-DEFAULT_CONFIG_PATH = ".semver/config.json"
+CONFIG_PATH = ".vendored/configs/git-semver.json"
 DEFAULT_VERSION_FILE = "VERSION"
 
 # Keys reserved for root-level config (not subdirectory names)
@@ -37,12 +36,8 @@ class SemverError(Exception):
 # ── Config ──────────────────────────────────────────────────────────────────
 
 def load_config(config_path=None):
-    """Load and validate config. Tries vendored path first."""
-    if config_path:
-        path = Path(config_path)
-    else:
-        vendored = Path(VENDORED_CONFIG)
-        path = vendored if vendored.exists() else Path(DEFAULT_CONFIG_PATH)
+    """Load config from vendored configs path."""
+    path = Path(config_path) if config_path else Path(CONFIG_PATH)
 
     if not path.exists():
         raise SemverError(f"Config not found: {path}")
@@ -592,7 +587,7 @@ def build_parser():
     )
     parser.add_argument(
         "--config", default=None,
-        help=f"Config file path (default: {DEFAULT_CONFIG_PATH})",
+        help=f"Config file path (default: {CONFIG_PATH})",
     )
     subparsers = parser.add_subparsers(dest="command")
 
