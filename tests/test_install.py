@@ -2239,3 +2239,210 @@ class TestInstallExistingVendorBootstrap:
         inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest",
                                       post_install_only=True)
         mock_reexec.assert_not_called()
+
+
+# ── Tests: run_post_install_hook ─────────────────────────────────────────
+
+class TestRunPostInstallHook:
+    def test_runs_hook_when_exists(self, tmp_repo):
+        """Runs post-install.sh and writes version stamp."""
+        install_dir = str(tmp_repo / ".vendored" / "pkg" / "tool")
+        hooks_dir = tmp_repo / ".vendored" / "pkg" / "tool" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        hook_script = hooks_dir / "post-install.sh"
+        hook_script.write_text("#!/bin/bash\necho hook-ran\n")
+        hook_script.chmod(0o755)
+
+        # Create .git/ so the hook runs
+        (tmp_repo / ".git").mkdir()
+        (tmp_repo / ".vendored" / "manifests").mkdir(parents=True, exist_ok=True)
+
+        inst.run_post_install_hook("tool", install_dir, "1.0.0")
+
+        stamp = tmp_repo / ".vendored" / "manifests" / "tool.post-installed"
+        assert stamp.exists()
+        assert stamp.read_text().strip() == "1.0.0"
+
+    def test_skips_when_no_hook(self, tmp_repo):
+        """Skips silently when no post-install.sh exists."""
+        install_dir = str(tmp_repo / ".vendored" / "pkg" / "tool")
+        (tmp_repo / ".vendored" / "pkg" / "tool").mkdir(parents=True)
+        (tmp_repo / ".git").mkdir()
+
+        # Should not raise
+        inst.run_post_install_hook("tool", install_dir, "1.0.0")
+
+        stamp = tmp_repo / ".vendored" / "manifests" / "tool.post-installed"
+        assert not stamp.exists()
+
+    def test_skips_when_no_git(self, tmp_repo):
+        """Skips when .git/ does not exist."""
+        install_dir = str(tmp_repo / ".vendored" / "pkg" / "tool")
+        hooks_dir = tmp_repo / ".vendored" / "pkg" / "tool" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / "post-install.sh").write_text("#!/bin/bash\necho nope\n")
+
+        inst.run_post_install_hook("tool", install_dir, "1.0.0")
+
+        stamp = tmp_repo / ".vendored" / "manifests" / "tool.post-installed"
+        assert not stamp.exists()
+
+    def test_skips_when_no_install_dir(self, tmp_repo):
+        """Skips for dogfood vendors (install_dir is None)."""
+        inst.run_post_install_hook("tool", None, "1.0.0")
+
+    def test_sets_env_vars(self, tmp_repo):
+        """Sets VENDOR_NAME, VENDOR_PKG_DIR, PROJECT_DIR env vars."""
+        install_dir = str(tmp_repo / ".vendored" / "pkg" / "tool")
+        hooks_dir = tmp_repo / ".vendored" / "pkg" / "tool" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        # Script that writes env vars to a file for verification
+        env_out = tmp_repo / "env_output.txt"
+        hook_script = hooks_dir / "post-install.sh"
+        hook_script.write_text(
+            f'#!/bin/bash\necho "$VENDOR_NAME|$VENDOR_PKG_DIR|$PROJECT_DIR" > {env_out}\n'
+        )
+        hook_script.chmod(0o755)
+
+        (tmp_repo / ".git").mkdir()
+        (tmp_repo / ".vendored" / "manifests").mkdir(parents=True, exist_ok=True)
+
+        inst.run_post_install_hook("tool", install_dir, "1.0.0")
+
+        parts = env_out.read_text().strip().split("|")
+        assert parts[0] == "tool"
+        assert parts[1] == os.path.abspath(install_dir)
+        assert parts[2] == os.path.abspath(str(tmp_repo))
+
+    def test_exits_on_hook_failure(self, tmp_repo):
+        """Exits with error if post-install.sh fails."""
+        install_dir = str(tmp_repo / ".vendored" / "pkg" / "tool")
+        hooks_dir = tmp_repo / ".vendored" / "pkg" / "tool" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        hook_script = hooks_dir / "post-install.sh"
+        hook_script.write_text("#!/bin/bash\nexit 1\n")
+        hook_script.chmod(0o755)
+
+        (tmp_repo / ".git").mkdir()
+
+        with pytest.raises(SystemExit):
+            inst.run_post_install_hook("tool", install_dir, "1.0.0")
+
+
+# ── Tests: list_vendors ──────────────────────────────────────────────────
+
+class TestListVendors:
+    def test_lists_vendors_alphabetically(self, tmp_repo, capsys):
+        """Lists vendors sorted alphabetically when no deps."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "beta.version").write_text("1.0.0\n")
+        (manifests / "alpha.version").write_text("2.0.0\n")
+
+        inst.list_vendors()
+        output = capsys.readouterr().out.strip().split("\n")
+        assert output == ["alpha", "beta"]
+
+    def test_lists_vendors_in_dependency_order(self, tmp_repo, capsys):
+        """Lists vendors respecting dependency order."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "app.version").write_text("1.0.0\n")
+        (manifests / "lib.version").write_text("1.0.0\n")
+        # app depends on lib
+        (manifests / "app.deps").write_text("lib\n")
+
+        inst.list_vendors()
+        output = capsys.readouterr().out.strip().split("\n")
+        assert output == ["lib", "app"]
+
+    def test_empty_manifests_dir(self, tmp_repo, capsys):
+        """Outputs nothing when no vendors installed."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+
+        inst.list_vendors()
+        assert capsys.readouterr().out == ""
+
+    def test_no_manifests_dir(self, tmp_repo, capsys):
+        """Outputs nothing when manifests dir doesn't exist."""
+        inst.list_vendors()
+        assert capsys.readouterr().out == ""
+
+
+# ── Tests: list_hooks ────────────────────────────────────────────────────
+
+class TestListHooks:
+    def test_lists_start_hooks(self, tmp_repo, capsys):
+        """Lists session-start.sh hooks for vendors that have them."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "tool-a.version").write_text("1.0.0\n")
+        (manifests / "tool-b.version").write_text("1.0.0\n")
+
+        # Only tool-a has the hook
+        hooks_a = tmp_repo / ".vendored" / "pkg" / "tool-a" / "hooks"
+        hooks_a.mkdir(parents=True)
+        (hooks_a / "session-start.sh").write_text("#!/bin/bash\n")
+
+        pkg_b = tmp_repo / ".vendored" / "pkg" / "tool-b"
+        pkg_b.mkdir(parents=True)
+
+        inst.list_hooks("start")
+        output = capsys.readouterr().out.strip()
+        assert output == os.path.abspath(
+            str(tmp_repo / ".vendored" / "pkg" / "tool-a" / "hooks" / "session-start.sh")
+        )
+
+    def test_lists_resume_hooks(self, tmp_repo, capsys):
+        """Lists session-resume.sh hooks."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "tool.version").write_text("1.0.0\n")
+
+        hooks = tmp_repo / ".vendored" / "pkg" / "tool" / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "session-resume.sh").write_text("#!/bin/bash\n")
+
+        inst.list_hooks("resume")
+        output = capsys.readouterr().out.strip()
+        assert output == os.path.abspath(
+            str(tmp_repo / ".vendored" / "pkg" / "tool" / "hooks" / "session-resume.sh")
+        )
+
+    def test_respects_dependency_order(self, tmp_repo, capsys):
+        """Hook paths are listed in dependency order."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "app.version").write_text("1.0.0\n")
+        (manifests / "lib.version").write_text("1.0.0\n")
+        (manifests / "app.deps").write_text("lib\n")
+
+        for name in ["app", "lib"]:
+            hooks = tmp_repo / ".vendored" / "pkg" / name / "hooks"
+            hooks.mkdir(parents=True)
+            (hooks / "session-start.sh").write_text("#!/bin/bash\n")
+
+        inst.list_hooks("start")
+        output = capsys.readouterr().out.strip().split("\n")
+        assert len(output) == 2
+        # lib before app
+        assert "lib" in output[0]
+        assert "app" in output[1]
+
+    def test_no_hooks_outputs_nothing(self, tmp_repo, capsys):
+        """Outputs nothing when no vendors have the requested hook."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "tool.version").write_text("1.0.0\n")
+
+        pkg = tmp_repo / ".vendored" / "pkg" / "tool"
+        pkg.mkdir(parents=True)
+
+        inst.list_hooks("start")
+        assert capsys.readouterr().out == ""
+
+    def test_invalid_hook_type_exits(self, tmp_repo):
+        """Exits with error for unknown hook type."""
+        with pytest.raises(SystemExit):
+            inst.list_hooks("invalid")
