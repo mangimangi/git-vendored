@@ -16,6 +16,7 @@ Options:
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 
@@ -236,6 +237,43 @@ def main():
     save_config(config)
 
     print(f"\nRemoved vendor: {args.vendor} ({removed} files deleted)")
+
+    # Regenerate orchestrator hooks (import from install script)
+    _regenerate_hooks()
+
+
+def _regenerate_hooks() -> None:
+    """Regenerate orchestrator and settings.json after vendor removal.
+
+    Imports the install script to reuse generate_orchestrator and
+    merge_settings_json.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    # Try to find install script relative to this file, then fall back to cwd
+    try:
+        install_path = os.path.join(os.path.dirname(__file__), "install")
+    except NameError:
+        install_path = ".vendored/install"
+    if not os.path.isfile(install_path):
+        install_path = ".vendored/install"
+    if not os.path.isfile(install_path):
+        return
+
+    try:
+        loader = importlib.machinery.SourceFileLoader("vendored_install", install_path)
+        spec = importlib.util.spec_from_loader("vendored_install", loader,
+                                                origin=install_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        config = mod.load_config()
+        vendors = config.get("vendors", {})
+        has_hooks = mod.generate_orchestrator(vendors, ".")
+        mod.merge_settings_json(".", has_hooks=has_hooks)
+    except Exception as e:
+        print(f"  Warning: could not regenerate hooks: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
