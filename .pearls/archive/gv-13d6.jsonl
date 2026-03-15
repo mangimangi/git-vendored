@@ -1,0 +1,1 @@
+{"id":"gv-13d6","title":"Circular dependency chain message shows sorted set, not actual path","status":"closed","issue_type":"bug","priority":2,"created_at":"2026-03-13T15:21:28Z","deps":[{"id":"gv-e19e.2","type":"caused_by"}],"references":[{"commit":"365526b"}],"closed_at":"2026-03-13T15:31:06Z","archived_at":"2026-03-15T01:45:40Z"}
