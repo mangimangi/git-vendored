@@ -460,6 +460,50 @@ def topological_sort(vendors):
     return result
 
 
+# ── Hook discovery ────────────────────────────────────────────────────────
+
+PKG_DIR = ".vendored/pkg"
+HOOK_NAMES = ("session-start.sh", "session-resume.sh", "post-install.sh")
+
+
+def discover_vendor_hooks(vendors: dict[str, dict]) -> list[tuple[str, dict[str, str]]]:
+    """Scan vendor packages for hook scripts, return ordered list.
+
+    Returns a list of (vendor_name, hooks_dict) tuples in dependency order.
+    hooks_dict maps hook filename to its full path, e.g.:
+        {"session-start.sh": ".vendored/pkg/mytool/hooks/session-start.sh"}
+
+    Only vendors with at least one hook file are included.
+    Ordering uses the existing topological sort (Kahn's algorithm) with
+    alphabetical tiebreak for unrelated vendors.
+    """
+    # Find vendors that have hooks
+    hook_vendors: dict[str, dict[str, str]] = {}
+    for name in sorted(vendors.keys()):
+        hooks_dir = os.path.join(PKG_DIR, name, "hooks")
+        if not os.path.isdir(hooks_dir):
+            continue
+        found: dict[str, str] = {}
+        for hook_name in HOOK_NAMES:
+            hook_path = os.path.join(hooks_dir, hook_name)
+            if os.path.isfile(hook_path):
+                found[hook_name] = hook_path
+        if found:
+            hook_vendors[name] = found
+
+    if not hook_vendors:
+        return []
+
+    # Use topological sort to order (only among hook-bearing vendors)
+    sorted_names = topological_sort(vendors)
+
+    result: list[tuple[str, dict[str, str]]] = []
+    for name in sorted_names:
+        if name in hook_vendors:
+            result.append((name, hook_vendors[name]))
+    return result
+
+
 # ── Version detection ─────────────────────────────────────────────────────
 
 def get_current_version(vendor_name, vendor_config=None):
