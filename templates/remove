@@ -13,7 +13,11 @@ Options:
     --force     Skip confirmation prompt (for CI use)
 """
 
+from __future__ import annotations
+
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -148,6 +152,7 @@ def get_files_to_remove(vendor_name):
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.deps"),
+        os.path.join(MANIFESTS_DIR, f"{vendor_name}.post-installed"),
     ]
     return manifest_files + [f for f in extra if os.path.isfile(f)]
 
@@ -235,7 +240,37 @@ def main():
     config["vendors"] = vendors
     save_config(config)
 
+    # Regenerate orchestrator and settings (remove stale vendor entries)
+    _regenerate_hooks(vendors)
+
     print(f"\nRemoved vendor: {args.vendor} ({removed} files deleted)")
+
+
+def _regenerate_hooks(vendors: dict[str, object]) -> None:
+    """Regenerate orchestrator and settings.json after vendor removal.
+
+    Imports the install module's functions dynamically to avoid code duplication.
+    """
+    # Try to find install script relative to this file, fall back to .vendored/install
+    try:
+        this_file = os.path.abspath(__file__)
+        install_path = os.path.join(os.path.dirname(this_file), "install")
+    except NameError:
+        install_path = os.path.join(".vendored", "install")
+    if not os.path.isfile(install_path):
+        return
+    try:
+        loader = importlib.machinery.SourceFileLoader("vendored_install", install_path)
+        spec = importlib.util.spec_from_loader("vendored_install", loader,
+                                                origin=install_path)
+        if spec is None:
+            return
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        mod.write_orchestrator(vendors)
+        mod.merge_settings(vendors)
+    except Exception:
+        pass  # Best-effort: don't fail removal if hook regen fails
 
 
 if __name__ == "__main__":

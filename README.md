@@ -172,15 +172,59 @@ This prevents accidental edits to vendor-managed files while allowing the automa
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
+    my-tool.post-installed       # post-install version stamp
     pearls.files
     pearls.version
   hooks/
     pre-commit                   # shared pre-commit hook
+  pkg/
+    my-tool/
+      hooks/
+        post-install.sh          # runs after install when .git/ exists
+        session-start.sh         # runs on Claude Code session start
+        session-resume.sh        # runs on Claude Code session resume
+.claude/
+  hooks/
+    vendored-session.sh          # generated orchestrator (do not edit)
+  settings.json                  # merged with orchestrator entries
 ```
 
 Vendor data files (e.g. `.pearls/issues.jsonl`, `.semver/.version`) remain in their original `.<vendor>/` directories — these are vendor-owned, not framework-managed. After migration, dot-directories become data-only zones. See `docs/vendor-install-dir-guide.md` for details.
 
 Manifest `.files` are plain text, one-path-per-line. Easy to `cat`, `diff`, `grep`.
+
+## Session Hooks
+
+Vendors can provide hook scripts in `<vendor_install_dir>/hooks/` that integrate with Claude Code's session lifecycle. The framework discovers these hooks, orders them by dependency, and generates a single orchestrator script.
+
+### Hook Types
+
+| Hook | When it runs | Purpose |
+|------|-------------|---------|
+| `post-install.sh` | After `install`, when `.git/` exists | Git-dependent setup (merge drivers, hook symlinks) |
+| `session-start.sh` | On Claude Code session startup | Runtime configuration (PATH setup, prompt generation) |
+| `session-resume.sh` | On Claude Code session resume | Lightweight re-configuration |
+
+### How It Works
+
+1. After any `install` or `remove`, the framework scans `.vendored/pkg/*/hooks/` for hook scripts
+2. Vendors with hooks are ordered by dependency (topological sort, alphabetical tiebreak)
+3. A single orchestrator script is generated at `.claude/hooks/vendored-session.sh`
+4. The orchestrator entries are merged into `.claude/settings.json` (preserving non-vendor hooks)
+
+### Post-Install Safety Net
+
+The orchestrator includes a safety net that runs `post-install.sh` at session start if the version stamp (`.vendored/manifests/<vendor>.post-installed`) doesn't match the installed version. This handles cases where `install` ran in CI without `.git/` access.
+
+### Environment Variables
+
+All hooks receive:
+
+| Variable | Value |
+|----------|-------|
+| `VENDOR_NAME` | Vendor identifier (e.g. `pearls`) |
+| `VENDOR_PKG_DIR` | Absolute path to `.vendored/pkg/<vendor>` |
+| `PROJECT_DIR` | Absolute path to consumer repo root |
 
 ## Migration
 

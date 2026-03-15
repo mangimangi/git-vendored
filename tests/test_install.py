@@ -2061,7 +2061,9 @@ class TestTopologicalSort:
 
         with patch("sys.argv", ["install", "all"]):
             inst.main()
-        mock_topo.assert_called_once()
+        # topological_sort is called for install ordering and also by
+        # discover_hooks (via write_orchestrator and merge_settings)
+        assert mock_topo.call_count >= 1
 
 
 # ── Tests: Self-bootstrap ────────────────────────────────────────────────
