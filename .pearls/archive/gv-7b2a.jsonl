@@ -1,0 +1,1 @@
+{"id":"gv-7b2a","title":"Stale docstring in resolve_deps says install mode 'not yet supported'","status":"closed","issue_type":"bug","priority":2,"created_at":"2026-03-13T15:21:27Z","deps":[{"id":"gv-e19e.2","type":"caused_by"}],"references":[{"commit":"365526b"}],"closed_at":"2026-03-13T15:31:06Z","archived_at":"2026-03-15T01:45:42Z"}
