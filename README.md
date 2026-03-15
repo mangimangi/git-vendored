@@ -169,6 +169,10 @@ This prevents accidental edits to vendor-managed files while allowing the automa
       lib.py
     pearls/
       prl.py
+      hooks/
+        post-install.sh            # runs after install when .git/ exists
+        session-start.sh           # runs on Claude Code session startup
+        session-resume.sh          # runs on Claude Code session resume
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
@@ -186,7 +190,23 @@ This prevents accidental edits to vendor-managed files while allowing the automa
 
 ### Session Hooks
 
-Vendors can provide hook scripts in `<pkg>/hooks/` that run during Claude Code sessions. The framework discovers hooks, orders vendors by dependency, and generates an orchestrator script. See `docs/session-hooks.md` for details.
+Vendors can provide hook scripts in `<pkg>/hooks/` that run during Claude Code sessions:
+
+| Hook | When it runs | Use cases |
+|------|-------------|-----------|
+| `post-install.sh` | After `install.sh`, only when `.git/` exists | Merge drivers, git hooks, gitattributes |
+| `session-start.sh` | Claude Code session startup | CLI shims, session prompts, runtime setup |
+| `session-resume.sh` | Claude Code session resume | Lightweight re-initialization |
+
+All hooks are optional — vendors include only the ones they need. Each hook receives `VENDOR_NAME`, `VENDOR_PKG_DIR`, and `PROJECT_DIR` environment variables.
+
+After install or remove, the framework:
+1. Discovers hooks in `.vendored/pkg/*/hooks/`
+2. Orders vendors by dependency (topological sort, alphabetical tiebreak)
+3. Generates `.claude/hooks/vendored-session.sh` (the orchestrator)
+4. Merges orchestrator entries into `.claude/settings.json`
+
+Post-install hooks are tracked via version stamps (`.vendored/manifests/<vendor>.post-installed`) for idempotency. See `docs/session-hooks.md` for full details.
 
 Vendor data files (e.g. `.pearls/issues.jsonl`, `.semver/.version`) remain in their original `.<vendor>/` directories — these are vendor-owned, not framework-managed. After migration, dot-directories become data-only zones. See `docs/vendor-install-dir-guide.md` for details.
 
