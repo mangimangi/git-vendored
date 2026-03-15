@@ -8,7 +8,11 @@
       ".github/workflows/release.yml"
     ],
     "allowed": [
-      ".semver/config.json"
+      ".vendored/configs/git-semver.json"
     ]
-  }
+  },
+  "version_file": "VERSION",
+  "files": ["install.sh", "templates/*"],
+  "updates": {},
+  "changelog": true
 }

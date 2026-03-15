@@ -67,7 +67,7 @@ SAMPLE_CONFIG = {
             "protected": [".pearls/**"],
             "allowed": [
                 ".pearls/issues.jsonl",
-                ".pearls/config.json",
+                ".vendored/configs/pearls.json",
                 ".pearls/.prl-version",
                 ".pearls/archive/*.jsonl"
             ]
@@ -153,7 +153,7 @@ class TestCheckVendor:
         vendor_config = SAMPLE_CONFIG["vendors"]["pearls"]
         violations = check.check_vendor(
             "pearls", vendor_config,
-            [".pearls/issues.jsonl", ".pearls/config.json", ".pearls/.prl-version"],
+            [".pearls/issues.jsonl", ".vendored/configs/pearls.json", ".pearls/.prl-version"],
             "feature/something"
         )
         assert violations == []
