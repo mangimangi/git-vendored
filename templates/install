@@ -504,6 +504,63 @@ def discover_vendor_hooks(vendors: dict[str, dict]) -> list[tuple[str, dict[str,
     return result
 
 
+def run_post_install(vendor_name: str, project_dir: str) -> bool:
+    """Run a vendor's post-install.sh if .git/ exists and stamp is stale.
+
+    After install.sh completes, checks for <pkg>/hooks/post-install.sh.
+    Only runs if .git/ exists (handles git-dependent setup like merge drivers).
+    Writes a version stamp on success for idempotency.
+
+    Returns True if hook ran successfully, False otherwise.
+    """
+    install_dir = os.path.join(PKG_DIR, vendor_name)
+    hook_path = os.path.join(install_dir, "hooks", "post-install.sh")
+
+    if not os.path.isfile(hook_path):
+        return False
+
+    git_dir = os.path.join(project_dir, ".git")
+    if not os.path.exists(git_dir):
+        return False
+
+    # Check version stamp for idempotency
+    version = read_manifest_version(vendor_name)
+    stamp_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.post-installed")
+    if os.path.isfile(stamp_path):
+        stamp_version = open(stamp_path).read().strip()
+        if stamp_version == version:
+            return True  # Already run for this version
+
+    # Run post-install.sh
+    env = os.environ.copy()
+    env["VENDOR_NAME"] = vendor_name
+    env["VENDOR_PKG_DIR"] = os.path.abspath(install_dir)
+    env["PROJECT_DIR"] = os.path.abspath(project_dir)
+
+    print(f"  Running post-install for {vendor_name}...")
+    result = subprocess.run(
+        ["bash", hook_path],
+        cwd=project_dir,
+        env=env,
+        capture_output=True, text=True
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+
+    if result.returncode != 0:
+        print(f"  Warning: post-install.sh failed for {vendor_name} "
+              f"(exit {result.returncode})")
+        return False
+
+    # Write stamp on success
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    with open(stamp_path, "w") as f:
+        f.write(f"{version}\n")
+    return True
+
+
 # ── Version detection ─────────────────────────────────────────────────────
 
 def get_current_version(vendor_name, vendor_config=None):
@@ -737,6 +794,9 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     if deps:
         write_deps(new_key, list(deps.keys()))
 
+    # Run post-install hook if present
+    run_post_install(new_key, ".")
+
     print(f"\nAdded vendor: {new_key}")
     print(f"  repo: {new_entry['repo']}")
     print(f"  version: {resolved_version}")
@@ -806,6 +866,9 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     # Cache resolved deps
     if deps:
         write_deps(vendor_name, list(deps.keys()))
+
+    # Run post-install hook if present
+    run_post_install(vendor_name, ".")
 
     return {
         "vendor": vendor_name,
