@@ -6,5 +6,25 @@
     "protected": [
       ".vendored/pkg/madreperla/**"
     ]
+  },
+  "provider": "pearls",
+  "description": "git-vendored: automated vendor install control for repo-embedded tools via GitHub workflows",
+  "docs": [
+    ".vendored/pkg/pearls/AGENTS.md",
+    "README.md",
+    "docs/"
+  ],
+  "providers": {
+    "issues": {
+      "name": "pearls",
+      "docs": [
+        ".vendored/pkg/pearls/AGENTS.md"
+      ]
+    }
+  },
+  "prompts": {},
+  "sessions": {},
+  "eval": {
+    "threshold": 80
   }
 }
