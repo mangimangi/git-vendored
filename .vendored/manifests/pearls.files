@@ -1,10 +1,9 @@
-.claude/hooks/configure.sh
-.claude/settings.json
 .pearls/.gitattributes
 .pearls/.gitignore
-.vendored/pkg/pearls/.madreperla/__init__.py
-.vendored/pkg/pearls/.madreperla/prompt.py
 .vendored/pkg/pearls/AGENTS.md
+.vendored/pkg/pearls/hooks/post-install.sh
 .vendored/pkg/pearls/hooks/pre-push
+.vendored/pkg/pearls/hooks/session-resume.sh
+.vendored/pkg/pearls/hooks/session-start.sh
 .vendored/pkg/pearls/merge-driver.py
 .vendored/pkg/pearls/prl.py

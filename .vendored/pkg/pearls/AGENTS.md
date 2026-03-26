@@ -296,7 +296,7 @@ The `<planning-doc>` is the filename (without extension) from `docs/planning/<fi
 
 Valid `<mode>` values: `plan`, `refine`, `estimate`, `impl`, `oneshot`, `eval`, `cleanup`
 
-These correspond to `prl prompt` modes.
+These correspond to `madp` modes.
 
 ### Bypass
 

@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict, NotRequired, cast
 
-VERSION = "0.2.32"
+VERSION = "0.2.36"
 
 # ── Type aliases ─────────────────────────────────────────────────────────────
 
@@ -1989,92 +1989,6 @@ def cmd_version(_args: argparse.Namespace) -> int:
     return 0
 
 
-# ── Prompt Generation ────────────────────────────────────────────────────────
-
-
-def get_prompt_intro(description: str, docs_str: str) -> str:
-    """Return the shared intro line used by all prompt modes."""
-    return f"hi claude - this is {description}...check out {docs_str} to understand the contributing workflow"
-
-
-def get_prompt_header() -> str:
-    """Return version/command context appended to all prompt outputs."""
-    return f"prl v{VERSION} configured — use `prl` commands to manage issues (not python3 prl.py)"
-
-
-def validate_prompt_config(config: Config) -> bool:
-    """Validate that description and docs are configured for prompt generation."""
-    if not config.get("description"):
-        print(
-            "Error: 'description' not configured in .vendored/configs/pearls.json.\n"
-            "Add a project description to use prl prompt.",
-            file=sys.stderr,
-        )
-        return False
-    if not config.get("docs"):
-        print(
-            "Error: 'docs' not configured in .vendored/configs/pearls.json.\n"
-            "Add docs paths to use prl prompt.",
-            file=sys.stderr,
-        )
-        return False
-    return True
-
-
-def cmd_prompt(args: argparse.Namespace) -> int:
-    """Generate session-starter prompts for AI agents."""
-    if getattr(args, 'resume', False):
-        print(get_prompt_header())
-        return 0
-
-    config = load_config()
-
-    if not validate_prompt_config(config):
-        return 1
-
-    description = config["description"]
-    docs = config["docs"]
-    docs_str = " ".join(docs)
-
-    header = get_prompt_header()
-
-    # No prompt_type provided - just output the intro + header
-    if args.prompt_type is None:
-        print(f"{header}\n\n{get_prompt_intro(description, docs_str)}")
-        return 0
-
-    mode = args.prompt_type
-    valid_modes = {"planning", "refine", "estimate", "implement", "oneshot", "eval", "cleanup"}
-    if mode not in valid_modes:
-        print(f"Error: Unknown prompt type '{mode}'. "
-              "Valid types: planning, refine, estimate, implement, oneshot, eval, cleanup", file=sys.stderr)
-        return 1
-
-    # Lazy import: only load madreperla when prompt body generation is needed
-    import importlib.util
-    _pkg_dir = Path(__file__).resolve().parent / '.madreperla'
-    if 'madreperla.prompt' not in sys.modules:
-        _ps = importlib.util.spec_from_file_location('madreperla.prompt', _pkg_dir / 'prompt.py')
-        assert _ps is not None and _ps.loader is not None
-        _pm = importlib.util.module_from_spec(_ps)
-        sys.modules['madreperla.prompt'] = _pm
-        _ps.loader.exec_module(_pm)
-    if 'madreperla' not in sys.modules:
-        _s = importlib.util.spec_from_file_location(
-            'madreperla', _pkg_dir / '__init__.py',
-            submodule_search_locations=[str(_pkg_dir)])
-        assert _s is not None and _s.loader is not None
-        _m = importlib.util.module_from_spec(_s)
-        sys.modules['madreperla'] = _m
-        _s.loader.exec_module(_m)
-    from madreperla import get_prompt_body  # type: ignore[import-not-found]
-
-    intro = get_prompt_intro(description, docs_str)
-    body = get_prompt_body(mode, config)
-    print(f"{header}\n\n{intro}\n\n{body}")
-    return 0
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -2210,14 +2124,6 @@ def main() -> int:
     p_board.add_argument("--all", "-a", action="store_true", help="Show all closed issues (default: 10)")
     p_board.set_defaults(func=cmd_board)
 
-    # prompt
-    p_prompt = sub.add_parser("prompt", help="Generate session-starter prompts")
-    p_prompt.add_argument("prompt_type", nargs="?", default=None,
-                          help="Prompt type: planning, refine, estimate, implement, oneshot, eval, or cleanup (optional - omit for intro only)")
-    p_prompt.add_argument("--resume", action="store_true",
-                          help="Output minimal resume header only")
-    p_prompt.set_defaults(func=cmd_prompt)
-
     # archive
     p_archive = sub.add_parser("archive", help="Archive issues to .pearls/archive/")
     p_archive.add_argument("issue_id", help="Issue or epic ID to archive")
@@ -2236,6 +2142,21 @@ def main() -> int:
     # version
     p_version = sub.add_parser("version", help="Show version")
     p_version.set_defaults(func=cmd_version)
+
+    # Intercept removed subcommands before argparse to give helpful errors
+    if len(sys.argv) > 1 and sys.argv[1] == "prompt":
+        print(
+            "Error: 'prl prompt' has been removed. Use 'madp' instead.\n"
+            "\n"
+            "  madp              # default intro prompt\n"
+            "  madp planning     # plan features\n"
+            "  madp implement    # implement tasks\n"
+            "  madp eval         # evaluate implementations\n"
+            "\n"
+            "Run 'madp --help' for all available modes.",
+            file=sys.stderr,
+        )
+        return 1
 
     args = parser.parse_args()
 

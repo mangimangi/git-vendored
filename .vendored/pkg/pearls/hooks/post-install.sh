@@ -1,44 +1,28 @@
 #!/bin/bash
-# .claude/hooks/configure.sh
-# Configures prl CLI for this project (runs on Claude Code session start)
+# hooks/post-install.sh
+# Runs once after vendored install (when .git/ exists).
+# Registers merge driver and installs pre-push hook symlink.
 set -euo pipefail
 
-# Parse arguments
-RESUME_MODE=false
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --resume)
-            RESUME_MODE=true
-            shift
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
-
-# Find prl.py — vendored path first, legacy fallback
-if [ -f "$PROJECT_DIR/.vendored/pkg/pearls/prl.py" ]; then
+# Resolve project root — prefer env var, fall back to discovery
+PROJECT_DIR="${PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
+# Resolve package dir — prefer env var, fall back to discovery
+if [ -n "${VENDOR_PKG_DIR:-}" ]; then
+    PEARLS_DIR="$VENDOR_PKG_DIR"
+elif [ -f "$PROJECT_DIR/.vendored/pkg/pearls/prl.py" ]; then
     PEARLS_DIR="$PROJECT_DIR/.vendored/pkg/pearls"
 elif [ -f "$PROJECT_DIR/.pearls/prl.py" ]; then
     PEARLS_DIR="$PROJECT_DIR/.pearls"
 else
-    echo "Error: prl.py not found. Run the install-vendored workflow first." >&2
+    echo "Error: prl.py not found. Run the install workflow first." >&2
     exit 1
 fi
-PRL_PY="$PEARLS_DIR/prl.py"
 
-# Create wrapper in ~/.local/bin
-SHIM_DIR="$HOME/.local/bin"
-mkdir -p "$SHIM_DIR"
-
-cat > "$SHIM_DIR/prl" << EOF
-#!/bin/bash
-exec python3 "$PRL_PY" "\$@"
-EOF
-chmod +x "$SHIM_DIR/prl"
+# Require .git/ — post-install hooks only run when git is available
+if [ ! -d "$PROJECT_DIR/.git" ]; then
+    echo "Skipping post-install: .git/ not found (CI install without checkout?)" >&2
+    exit 0
+fi
 
 # Register merge driver for issues.jsonl (idempotent)
 MERGE_DRIVER="$PEARLS_DIR/merge-driver.py"
@@ -64,24 +48,4 @@ if [ -f "$PRE_PUSH_SRC" ]; then
     else
         ln -s "$PRE_PUSH_REL" "$PRE_PUSH_DST"
     fi
-fi
-
-# Verify it works
-if ! command -v prl &>/dev/null; then
-    exit 0
-fi
-
-# On resume, skip prompt generation (keep context minimal)
-if [ "$RESUME_MODE" = true ]; then
-    prl prompt --resume
-    exit 0
-fi
-
-# Generate session prompt (always call prl prompt for startup context)
-if [ -n "${PRL_PROMPT_MODE:-}" ]; then
-    # Use specified prompt mode
-    prl prompt "$PRL_PROMPT_MODE"
-else
-    # Default: just output the intro
-    prl prompt
 fi
