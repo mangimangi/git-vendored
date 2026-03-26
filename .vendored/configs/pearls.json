@@ -13,14 +13,5 @@
       ".pearls/archive/*.jsonl"
     ]
   },
-  "prefix": "gv",
-  "description": "git-vendored: automated vendor install control for repo-embedded tools via GitHub workflows",
-  "docs": [
-    ".vendored/pkg/pearls/AGENTS.md",
-    "README.md",
-    "docs/"
-  ],
-  "models": {
-    "implementer": "claude-opus-4-6"
-  }
+  "prefix": "gv"
 }
