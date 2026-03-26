@@ -3,4 +3,5 @@
 .vendored/check
 .vendored/hooks/pre-commit
 .vendored/install
+.vendored/lib/vendor-helpers.sh
 .vendored/remove

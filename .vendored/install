@@ -556,6 +556,10 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
         run_env["VENDOR_MANIFEST"] = manifest_path
         if install_dir:
             run_env["VENDOR_INSTALL_DIR"] = install_dir
+        # Provide vendor helper library path
+        lib_path = os.path.abspath(".vendored/lib/vendor-helpers.sh")
+        if os.path.isfile(lib_path):
+            run_env["VENDOR_LIB"] = lib_path
 
         run_result = subprocess.run(
             ["bash", script_path, version],

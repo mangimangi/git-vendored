@@ -55,7 +55,7 @@ fetch_file() {{
 
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
-mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .github/workflows
+mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .vendored/lib .github/workflows
 
 echo "Downloading .vendored/install..."
 fetch_file "templates/install" ".vendored/install"
@@ -71,6 +71,11 @@ echo "Downloading .vendored/remove..."
 fetch_file "templates/remove" ".vendored/remove"
 chmod +x .vendored/remove
 INSTALLED_FILES+=(".vendored/remove")
+
+echo "Downloading .vendored/lib/vendor-helpers.sh..."
+fetch_file "templates/lib/vendor-helpers.sh" ".vendored/lib/vendor-helpers.sh"
+chmod +x .vendored/lib/vendor-helpers.sh
+INSTALLED_FILES+=(".vendored/lib/vendor-helpers.sh")
 
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
