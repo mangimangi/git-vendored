@@ -1,0 +1,9 @@
+{
+  "_vendor": {
+    "repo": "mangimangi/madreperla",
+    "install_branch": "chore/install-madreperla",
+    "protected": [
+      ".vendored/pkg/madreperla/**"
+    ]
+  }
+}
