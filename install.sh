@@ -84,6 +84,11 @@ fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 INSTALLED_FILES+=(".vendored/hooks/pre-commit")
 
+echo "Downloading .vendored/hooks/vendored-session.sh..."
+fetch_file "templates/hooks/vendored-session.sh" ".vendored/hooks/vendored-session.sh"
+chmod +x .vendored/hooks/vendored-session.sh
+INSTALLED_FILES+=(".vendored/hooks/vendored-session.sh")
+
 # Install pre-commit hook into .git/hooks/ (symlink, idempotent)
 if [ -d .git/hooks ]; then
     HOOK_DST=".git/hooks/pre-commit"
@@ -146,6 +151,9 @@ write_manifest() {
 }
 
 write_manifest
+
+# Set up agent hooks (auto-detect claude/codex)
+python3 .vendored/install --setup-hooks
 
 echo ""
 echo "Done! git-vendored v$VERSION installed."

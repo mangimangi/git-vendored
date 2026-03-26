@@ -90,6 +90,11 @@ fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 INSTALLED_FILES+=(".vendored/hooks/pre-commit")
 
+echo "Downloading .vendored/hooks/vendored-session.sh..."
+fetch_file "templates/hooks/vendored-session.sh" ".vendored/hooks/vendored-session.sh"
+chmod +x .vendored/hooks/vendored-session.sh
+INSTALLED_FILES+=(".vendored/hooks/vendored-session.sh")
+
 # Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
 rm -f .vendored/.version
 
