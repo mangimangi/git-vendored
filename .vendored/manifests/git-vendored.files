@@ -1,6 +1,7 @@
 .github/workflows/check-vendor.yml
 .github/workflows/install-vendored.yml
 .vendored/check
+.vendored/feedback
 .vendored/hooks/pre-commit
 .vendored/install
 .vendored/lib/vendor-helpers.sh

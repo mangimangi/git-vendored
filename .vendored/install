@@ -37,7 +37,8 @@ MANIFESTS_DIR = ".vendored/manifests"
 
 # Registry fields managed by the framework (stored under _vendor key)
 REGISTRY_FIELDS = {"repo", "install_branch", "protected", "allowed",
-                   "private", "automerge", "dogfood", "dependency_mode"}
+                   "private", "automerge", "dogfood", "dependency_mode",
+                   "support"}
 
 
 # ── Config helpers ────────────────────────────────────────────────────────

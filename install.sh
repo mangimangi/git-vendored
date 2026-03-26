@@ -66,6 +66,11 @@ chmod +x .vendored/remove
 INSTALLED_FILES+=(".vendored/remove")
 
 # Download vendor helper library
+echo "Downloading .vendored/feedback..."
+fetch_file "templates/feedback" ".vendored/feedback"
+chmod +x .vendored/feedback
+INSTALLED_FILES+=(".vendored/feedback")
+
 echo "Downloading .vendored/lib/vendor-helpers.sh..."
 fetch_file "templates/lib/vendor-helpers.sh" ".vendored/lib/vendor-helpers.sh"
 chmod +x .vendored/lib/vendor-helpers.sh
