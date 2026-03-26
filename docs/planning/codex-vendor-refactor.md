@@ -190,11 +190,13 @@ Add an optional `support` key to `_vendor`:
 - `instructions` → empty
 - `labels` → empty
 
-#### Framework Query Command
+#### Standalone Feedback Script
+
+A separate script at `.vendored/feedback` (not a flag on install):
 
 ```bash
-python3 .vendored/install --support           # all vendors
-python3 .vendored/install --support pearls    # specific vendor
+python3 .vendored/feedback                # all vendors
+python3 .vendored/feedback pearls         # specific vendor
 ```
 
 Output (structured, parseable):
@@ -209,14 +211,17 @@ Instructions: Include the output of `prl list` and your .pearls/issues.jsonl in 
 Issues: https://github.com/mangimangi/git-semver/issues
 ```
 
+This script is framework-owned (in git-vendored's manifest), installed
+alongside `install`, `check`, and `remove`.
+
 #### Context Injection (Light Touch)
 
 By default, the framework injects a **breadcrumb** into session context — not
 the full support details. This keeps context lean while making support
 discoverable:
 
-> Installed tools with feedback paths: pearls, git-semver, git-vendored.
-> Run `.vendored/install --support <tool>` for bug report instructions.
+> Installed tools with feedback loops: pearls, git-semver, git-vendored.
+> Run `.vendored/feedback <tool>` for details.
 
 This breadcrumb is emitted by the orchestrator (vendored-session.sh) during
 session start — it's stdout that gets injected into the agent's context
@@ -233,7 +238,7 @@ if it wants to go beyond the config fields.
 
 ### Open Questions
 
-- Should `--support` output be JSON for machine consumption, or human-readable
+- Should `feedback` output be JSON for machine consumption, or human-readable
   with a `--json` flag?
 - Should the breadcrumb list ALL vendors or only those with explicit `support`
   config? (Leaning: all, since smart default covers every vendor.)
@@ -247,7 +252,7 @@ if it wants to go beyond the config fields.
    - No dependencies, smallest scope
    - Enables simpler vendor install.sh going forward
 
-2. Vendor support/feedback config (_vendor.support + --support)
+2. Vendor support/feedback config (_vendor.support + .vendored/feedback)
    - No dependencies on (1) or (3)
    - Small, self-contained
 
