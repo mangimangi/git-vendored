@@ -1206,13 +1206,7 @@ ORCHESTRATOR_PATH = ".vendored/hooks/vendored-session.sh"
 OLD_ORCHESTRATOR_PATH = ".claude/hooks/vendored-session.sh"
 
 
-def _detect_agent():
-    """Auto-detect which AI agent is in use based on dotdir presence."""
-    if os.path.isdir(".claude"):
-        return "claude"
-    if os.path.isdir(".codex"):
-        return "codex"
-    return None
+ALL_AGENTS = ["claude", "codex"]
 
 
 def setup_hooks_claude():
@@ -1301,24 +1295,9 @@ def setup_hooks_codex():
 def setup_hooks(agent=None):
     """Set up agent-specific hooks pointing to the framework orchestrator.
 
-    If agent is None, auto-detects based on which dotdir exists.
+    If agent is None, auto-detects and configures ALL detected agents.
+    If agent is specified, configures only that agent.
     """
-    if agent is None:
-        agent = _detect_agent()
-        if agent is None:
-            print("  No agent detected (.claude/ or .codex/ not found), skipping hook setup")
-            return
-
-    # Install orchestrator
-    orchestrator_src = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "templates", "hooks", "vendored-session.sh"
-    )
-    # If we're the installed copy, look relative to .vendored/
-    if not os.path.isfile(orchestrator_src):
-        # Already installed at the target path — nothing to copy
-        pass
-
     os.makedirs(os.path.dirname(ORCHESTRATOR_PATH), exist_ok=True)
 
     # Migrate old orchestrator location
@@ -1326,14 +1305,20 @@ def setup_hooks(agent=None):
         os.remove(OLD_ORCHESTRATOR_PATH)
         print(f"  Removed old orchestrator at {OLD_ORCHESTRATOR_PATH}")
 
-    if agent == "claude":
-        setup_hooks_claude()
-    elif agent == "codex":
-        setup_hooks_codex()
+    if agent is not None:
+        agents = [agent]
     else:
-        print(f"::error::Unknown agent: {agent}")
-        print("Valid agents: claude, codex")
-        sys.exit(1)
+        agents = ALL_AGENTS
+
+    for a in agents:
+        if a == "claude":
+            setup_hooks_claude()
+        elif a == "codex":
+            setup_hooks_codex()
+        else:
+            print(f"::error::Unknown agent: {a}")
+            print("Valid agents: claude, codex")
+            sys.exit(1)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────

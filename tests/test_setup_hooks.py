@@ -34,22 +34,10 @@ def tmp_repo(tmp_path, monkeypatch):
     return tmp_path
 
 
-class TestDetectAgent:
-    def test_detects_claude(self, tmp_repo):
-        (tmp_repo / ".claude").mkdir()
-        assert inst._detect_agent() == "claude"
-
-    def test_detects_codex(self, tmp_repo):
-        (tmp_repo / ".codex").mkdir()
-        assert inst._detect_agent() == "codex"
-
-    def test_prefers_claude_when_both(self, tmp_repo):
-        (tmp_repo / ".claude").mkdir()
-        (tmp_repo / ".codex").mkdir()
-        assert inst._detect_agent() == "claude"
-
-    def test_returns_none_when_neither(self, tmp_repo):
-        assert inst._detect_agent() is None
+class TestAllAgents:
+    def test_all_agents_contains_claude_and_codex(self):
+        assert "claude" in inst.ALL_AGENTS
+        assert "codex" in inst.ALL_AGENTS
 
 
 class TestSetupHooksClaude:
@@ -143,7 +131,6 @@ class TestSetupHooksClaude:
 
 class TestSetupHooksCodex:
     def test_creates_config_toml(self, tmp_repo):
-        (tmp_repo / ".codex").mkdir()
         inst.setup_hooks_codex()
         config_path = tmp_repo / ".codex" / "config.toml"
         assert config_path.is_file()
@@ -161,7 +148,6 @@ class TestSetupHooksCodex:
         assert "[hooks.session-start]" in content
 
     def test_idempotent(self, tmp_repo):
-        (tmp_repo / ".codex").mkdir()
         inst.setup_hooks_codex()
         first = (tmp_repo / ".codex" / "config.toml").read_text()
         inst.setup_hooks_codex()
@@ -170,29 +156,28 @@ class TestSetupHooksCodex:
 
 
 class TestSetupHooks:
-    def test_auto_detect_claude(self, tmp_repo):
-        (tmp_repo / ".claude").mkdir()
+    def test_configures_both_agents_by_default(self, tmp_repo):
         inst.setup_hooks()
         assert (tmp_repo / ".claude" / "settings.json").is_file()
-
-    def test_auto_detect_codex(self, tmp_repo):
-        (tmp_repo / ".codex").mkdir()
-        inst.setup_hooks()
         assert (tmp_repo / ".codex" / "config.toml").is_file()
 
-    def test_no_op_when_no_agent(self, tmp_repo, capsys):
+    def test_configures_both_even_without_dotdirs(self, tmp_repo):
+        """Both agents should be configured even if .claude/ and .codex/ don't exist yet."""
+        assert not (tmp_repo / ".claude").exists()
+        assert not (tmp_repo / ".codex").exists()
         inst.setup_hooks()
-        output = capsys.readouterr().out
-        assert "No agent detected" in output
+        assert (tmp_repo / ".claude" / "settings.json").is_file()
+        assert (tmp_repo / ".codex" / "config.toml").is_file()
 
     def test_explicit_claude(self, tmp_repo):
-        # Does NOT require .claude/ to exist — setup_hooks_claude creates it
         inst.setup_hooks("claude")
         assert (tmp_repo / ".claude" / "settings.json").is_file()
+        assert not (tmp_repo / ".codex" / "config.toml").exists()
 
     def test_explicit_codex(self, tmp_repo):
         inst.setup_hooks("codex")
         assert (tmp_repo / ".codex" / "config.toml").is_file()
+        assert not (tmp_repo / ".claude").exists()
 
     def test_removes_old_orchestrator(self, tmp_repo):
         (tmp_repo / ".claude" / "hooks").mkdir(parents=True)
