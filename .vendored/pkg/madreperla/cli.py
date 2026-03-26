@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 
 VALID_MODES = {"planning", "refine", "estimate", "implement", "oneshot", "eval", "cleanup"}
 
