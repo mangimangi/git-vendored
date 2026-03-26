@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 
 VALID_MODES = {"planning", "refine", "estimate", "implement", "oneshot", "eval", "cleanup"}
 
@@ -50,19 +50,21 @@ def _find_project_root() -> Path:
 
 
 def load_config(project_root: Path | None = None) -> dict[str, Any]:
-    """Load madreperla's own config from .madreperla/config.json.
+    """Load madreperla config from .vendored/configs/madreperla.json.
 
     Returns dict with keys: provider, prompts, sessions, eval.
     Returns empty dict with defaults if config file is missing.
+    Strips _vendor metadata before returning.
     """
     if project_root is None:
         project_root = _find_project_root()
-    config_path = project_root / ".madreperla" / "config.json"
+    config_path = project_root / ".vendored" / "configs" / "madreperla.json"
     if not config_path.exists():
         return {"provider": "pearls"}
     try:
         with open(config_path, "r") as f:
-            return cast(dict[str, Any], json.load(f))
+            raw: dict[str, Any] = json.load(f)
+        return {k: v for k, v in raw.items() if k != "_vendor"}
     except json.JSONDecodeError as e:
         print(f"Warning: {config_path} is not valid JSON: {e}", file=sys.stderr)
         return {"provider": "pearls"}
@@ -131,14 +133,14 @@ def validate_prompt_config(config: dict[str, Any]) -> bool:
     """Validate that description and docs are configured for prompt generation."""
     if not config.get("description"):
         print(
-            "Error: 'description' not configured in .madreperla/config.json.\n"
+            "Error: 'description' not configured in .vendored/configs/madreperla.json.\n"
             "Add a project description to use madp.",
             file=sys.stderr,
         )
         return False
     if not config.get("docs"):
         print(
-            "Error: 'docs' not configured in .madreperla/config.json.\n"
+            "Error: 'docs' not configured in .vendored/configs/madreperla.json.\n"
             "Add docs paths to use madp.",
             file=sys.stderr,
         )
