@@ -37,8 +37,7 @@ MANIFESTS_DIR = ".vendored/manifests"
 
 # Registry fields managed by the framework (stored under _vendor key)
 REGISTRY_FIELDS = {"repo", "install_branch", "protected", "allowed",
-                   "private", "automerge", "dogfood", "dependency_mode",
-                   "support"}
+                   "private", "automerge", "dogfood", "dependency_mode"}
 
 
 # ── Config helpers ────────────────────────────────────────────────────────
@@ -557,10 +556,6 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
         run_env["VENDOR_MANIFEST"] = manifest_path
         if install_dir:
             run_env["VENDOR_INSTALL_DIR"] = install_dir
-        # Provide vendor helper library path
-        lib_path = os.path.abspath(".vendored/lib/vendor-helpers.sh")
-        if os.path.isfile(lib_path):
-            run_env["VENDOR_LIB"] = lib_path
 
         run_result = subprocess.run(
             ["bash", script_path, version],
@@ -1200,126 +1195,6 @@ def _maybe_reexec():
     os.execv(sys.executable, new_argv)
 
 
-# ── Hook setup ─────────────────────────────────────────────────────────
-
-ORCHESTRATOR_PATH = ".vendored/hooks/vendored-session.sh"
-OLD_ORCHESTRATOR_PATH = ".claude/hooks/vendored-session.sh"
-
-
-ALL_AGENTS = ["claude", "codex"]
-
-
-def setup_hooks_claude():
-    """Generate/update .claude/settings.json with hooks pointing to orchestrator."""
-    settings_path = ".claude/settings.json"
-    os.makedirs(".claude", exist_ok=True)
-
-    settings = {}
-    if os.path.isfile(settings_path):
-        with open(settings_path) as f:
-            settings = json.load(f)
-
-    hooks = settings.setdefault("hooks", {})
-    session_start = hooks.setdefault("SessionStart", [])
-
-    # Check if vendored hooks already exist
-    vendored_matchers = {entry.get("matcher") for entry in session_start
-                         if any(ORCHESTRATOR_PATH in h.get("command", "")
-                                or OLD_ORCHESTRATOR_PATH in h.get("command", "")
-                                for h in entry.get("hooks", []))}
-
-    for matcher, flag in [("startup", "--start"), ("resume", "--resume")]:
-        if matcher in vendored_matchers:
-            # Update existing entry to point to new path
-            for entry in session_start:
-                if entry.get("matcher") == matcher:
-                    for hook in entry.get("hooks", []):
-                        if (ORCHESTRATOR_PATH in hook.get("command", "")
-                                or OLD_ORCHESTRATOR_PATH in hook.get("command", "")):
-                            hook["command"] = (
-                                f'"$CLAUDE_PROJECT_DIR"/{ORCHESTRATOR_PATH} {flag}'
-                            )
-        else:
-            session_start.append({
-                "matcher": matcher,
-                "hooks": [{
-                    "type": "command",
-                    "command": f'"$CLAUDE_PROJECT_DIR"/{ORCHESTRATOR_PATH} {flag}',
-                    "statusMessage": "Configuring vendored tools...",
-                }],
-            })
-
-    with open(settings_path, "w") as f:
-        json.dump(settings, f, indent=2)
-        f.write("\n")
-    print(f"  Updated {settings_path} with vendored session hooks")
-
-
-def setup_hooks_codex():
-    """Generate/update .codex/config.toml with hooks pointing to orchestrator."""
-    config_path = ".codex/config.toml"
-    os.makedirs(".codex", exist_ok=True)
-
-    # Read existing config (simple line-based approach, no toml dependency)
-    lines = []
-    if os.path.isfile(config_path):
-        with open(config_path) as f:
-            lines = f.readlines()
-
-    # Check if hook already configured
-    hook_marker = ORCHESTRATOR_PATH
-    already_configured = any(hook_marker in line for line in lines)
-
-    if already_configured:
-        # Update path if needed (old path -> new path)
-        updated = []
-        for line in lines:
-            if OLD_ORCHESTRATOR_PATH in line:
-                line = line.replace(OLD_ORCHESTRATOR_PATH, ORCHESTRATOR_PATH)
-            updated.append(line)
-        with open(config_path, "w") as f:
-            f.writelines(updated)
-        print(f"  Updated {config_path} with vendored session hooks")
-        return
-
-    # Append hook configuration
-    with open(config_path, "a") as f:
-        if lines and not lines[-1].endswith("\n"):
-            f.write("\n")
-        f.write(f"\n[hooks.session-start]\n")
-        f.write(f'command = "{ORCHESTRATOR_PATH} --start"\n')
-    print(f"  Updated {config_path} with vendored session hooks")
-
-
-def setup_hooks(agent=None):
-    """Set up agent-specific hooks pointing to the framework orchestrator.
-
-    If agent is None, auto-detects and configures ALL detected agents.
-    If agent is specified, configures only that agent.
-    """
-    os.makedirs(os.path.dirname(ORCHESTRATOR_PATH), exist_ok=True)
-
-    # Migrate old orchestrator location
-    if os.path.isfile(OLD_ORCHESTRATOR_PATH):
-        os.remove(OLD_ORCHESTRATOR_PATH)
-        print(f"  Removed old orchestrator at {OLD_ORCHESTRATOR_PATH}")
-
-    if agent is not None:
-        agents = [agent]
-    else:
-        agents = ALL_AGENTS
-
-    for a in agents:
-        if a == "claude":
-            setup_hooks_claude()
-        elif a == "codex":
-            setup_hooks_codex()
-        else:
-            print(f"::error::Unknown agent: {a}")
-            print("Valid agents: claude, codex")
-            sys.exit(1)
-
-
 # ── CLI ───────────────────────────────────────────────────────────────────
 
 def _is_repo_spec(arg):
@@ -1429,27 +1304,18 @@ def main():
         choices=["start", "resume"],
         help="List hook script paths for TYPE (start or resume) in dependency order"
     )
-    parser.add_argument(
-        "--setup-hooks", nargs="?", const="auto", default=None,
-        metavar="AGENT", dest="setup_hooks",
-        help="Set up agent hooks (claude, codex, or auto-detect)"
-    )
     args = parser.parse_args()
 
-    # Query commands: --list, --hooks, --setup-hooks don't need a target
+    # Query commands: --list and --hooks don't need a target
     if args.list_vendors:
         list_vendors()
         return
     if args.hooks:
         list_hooks(args.hooks)
         return
-    if args.setup_hooks is not None:
-        agent = None if args.setup_hooks == "auto" else args.setup_hooks
-        setup_hooks(agent)
-        return
 
     if not args.target:
-        parser.error("target is required (unless using --list, --hooks, or --setup-hooks)")
+        parser.error("target is required (unless using --list or --hooks)")
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
     if _should_migrate_config():
