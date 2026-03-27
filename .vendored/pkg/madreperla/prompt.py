@@ -7,13 +7,13 @@ from typing import Any
 
 DEFAULT_PLANNING_BODY = """I'd like to plan some features together and create markdown docs that completely/minimally encapsulate the features... If anything is unclear or ambiguous let's dig into it together and get to a shared place of clarity. as part of this planning - we must discern if the work is ready to be refined into implementation tasks\u2026if so, we need to decide what epic the work will be created in (or if we need to create a new epic).
 
-if the work is ready for refinement, create an epic (if it doesn't already exist) and save the planning doc to docs/planning/epics/<epic-id>.md (moving it from docs/planning/ if relevant info from prior planning docs exists). otherwise create/update the planning docs in docs/planning/. check the issue tracker docs for CLI syntax. commit and push your changes when we're done planning.
+if the work is ready for refinement, create an epic (if it doesn't already exist) and save the planning doc as an epic planning doc (moving it from general planning if relevant info from prior planning docs exists). otherwise create/update the planning docs. check the issue tracker and docs provider for paths and CLI syntax. commit and push your changes when we're done planning.
 
 the scope of the work I want to plan is:"""
 
 DEFAULT_REFINE_BODY = """I'd like to refine some features together and create straightforward issues that are small in scope with clear acceptance criteria...if applicable we should specify requirements for extending docs and tests in addition to implementing the functionality of the feature. If anything is unclear or ambiguous let's dig into it together and get to a shared place of clarity. as part of this refinement - we should discern what epic the issue(s) will be created in (or if a new epic will be created).
 
-if an epic id is provided, check docs/planning/epics/<epic-id>.md for planning context. after creating issues, update the planning doc to remove items that have been refined into issues \u2014 delete the file if everything has been refined. commit and push your changes when done.
+if an epic id is provided, check the epic's planning doc for context. after creating issues, update the planning doc to remove items that have been refined into issues \u2014 delete the file if everything has been refined. commit and push your changes when done.
 
 the scope of the work I want to refine is:"""
 
@@ -36,7 +36,7 @@ DEFAULT_EVAL_BODY = """then I'd like you to evaluate the implemented issues in a
 1. find the code changes: show the issue details \u2014 if it has a `pr_number`, use `gh pr diff <pr_number>`; otherwise `git show <commit>`
 2. score each dimension 0-100:
 {eval_dimensions}
-3. record the evaluation with `{eval_cli_example}` \u2014 the issue tracker auto-closes issues when all scores meet their threshold
+3. record your evaluation scores using the issue tracker CLI \u2014 the issue tracker auto-closes issues when all scores meet their threshold. check the issue tracker docs for eval CLI syntax.
 4. if you find defects, create a defect ticket linked to the original issue
 
 leave the epic open when you're finished.
@@ -55,6 +55,45 @@ DEFAULT_BODIES: dict[str, str] = {
     "oneshot": DEFAULT_ONESHOT_BODY,
     "eval": DEFAULT_EVAL_BODY,
     "cleanup": DEFAULT_CLEANUP_BODY,
+}
+
+
+# ── Default Resume Body Templates ───────────────────────────────────────────
+
+DEFAULT_PLANNING_RESUME = """continue the planning work. review what we've discussed so far and pick up where we left off.
+
+the scope of the work I want to plan is:"""
+
+DEFAULT_REFINE_RESUME = """continue the refinement work. review the issues created so far and pick up where we left off.
+
+the scope of the work I want to refine is:"""
+
+DEFAULT_ESTIMATE_RESUME = """continue estimating. review which issues still need estimates and pick up where we left off.
+
+please estimate each open tasks/subtasks in epic"""
+
+DEFAULT_IMPLEMENT_RESUME = """continue implementing. review what's been done so far and pick up where we left off.
+
+the epic id is:"""
+
+DEFAULT_ONESHOT_RESUME = """continue the work. review what's been refined, estimated, and implemented so far and pick up where we left off.
+
+the scope of the work I want to refine is:"""
+
+DEFAULT_EVAL_RESUME = """continue evaluating. review which implemented issues still need evaluation and pick up where we left off.
+
+the epic id is:"""
+
+DEFAULT_CLEANUP_RESUME = """continue the cleanup. review what's been archived so far and pick up where we left off."""
+
+DEFAULT_RESUME_BODIES: dict[str, str] = {
+    "planning": DEFAULT_PLANNING_RESUME,
+    "refine": DEFAULT_REFINE_RESUME,
+    "estimate": DEFAULT_ESTIMATE_RESUME,
+    "implement": DEFAULT_IMPLEMENT_RESUME,
+    "oneshot": DEFAULT_ONESHOT_RESUME,
+    "eval": DEFAULT_EVAL_RESUME,
+    "cleanup": DEFAULT_CLEANUP_RESUME,
 }
 
 
@@ -142,11 +181,24 @@ def build_prompt_vars(config: dict[str, Any]) -> dict[str, str]:
 
 
 def get_prompt_body(mode: str, config: dict[str, Any]) -> str:
-    """Return the interpolated body for a prompt mode.
+    """Return the interpolated start body for a prompt mode.
 
     Body resolution: config prompts.<mode> override → DEFAULT_*_BODY fallback.
     Vars resolution: prompts.vars (user) overrides built-in vars.
     """
     body = config.get("prompts", {}).get(mode) or DEFAULT_BODIES[mode]
+    vars_dict = build_prompt_vars(config)
+    return interpolate_vars(body, vars_dict)
+
+
+def get_prompt_resume_body(mode: str, config: dict[str, Any]) -> str:
+    """Return the interpolated resume body for a prompt mode.
+
+    Resume body resolution: config prompts.<mode>_resume override →
+    DEFAULT_RESUME_BODIES fallback.
+    Vars resolution: prompts.vars (user) overrides built-in vars.
+    """
+    resume_key = f"{mode}_resume"
+    body = config.get("prompts", {}).get(resume_key) or DEFAULT_RESUME_BODIES[mode]
     vars_dict = build_prompt_vars(config)
     return interpolate_vars(body, vars_dict)

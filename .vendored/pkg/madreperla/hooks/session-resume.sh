@@ -35,5 +35,9 @@ if ! command -v madp &>/dev/null; then
     exit 0
 fi
 
-# Resume: minimal prompt
-madp --resume
+# Resume: mode-aware when MADP_MODE is set
+if [ -n "${MADP_MODE:-}" ]; then
+    madp --resume "$MADP_MODE"
+else
+    madp --resume
+fi
