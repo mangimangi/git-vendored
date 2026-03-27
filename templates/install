@@ -1219,7 +1219,6 @@ def setup_hooks_claude():
         with open(settings_path) as f:
             settings = json.load(f)
 
-    orchestrator = f'".vendored/hooks/vendored-session.sh"'
     hooks = settings.setdefault("hooks", {})
     session_start = hooks.setdefault("SessionStart", [])
 
