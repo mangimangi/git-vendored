@@ -206,6 +206,321 @@ fetch_file "lib/utils.py" "out/utils.py"
         assert "out/utils.py" in lines
 
 
+class TestFetchDir:
+    """Tests for the fetch_dir function, which uses gh API to list and download directory trees."""
+
+    @pytest.fixture
+    def mock_gh_server(self, tmp_repo):
+        """Create a fake repo with mock gh and curl for fetch_dir testing.
+
+        fetch_dir uses `gh api` to list directory contents, then fetch_file
+        to download each file. This provides mocks for both.
+        """
+        # Create a fake repo source tree with nested dirs
+        repo_dir = tmp_repo / "fake_repo"
+        repo_dir.mkdir()
+        (repo_dir / "script.sh").write_text("#!/bin/bash\necho hello\n")
+        (repo_dir / "lib").mkdir()
+        (repo_dir / "lib" / "utils.py").write_text("# utils\n")
+        (repo_dir / "lib" / "core.py").write_text("# core\n")
+        (repo_dir / "lib" / "sub").mkdir()
+        (repo_dir / "lib" / "sub" / "deep.py").write_text("# deep\n")
+
+        mock_bin = tmp_repo / "mock_bin"
+        mock_bin.mkdir()
+
+        # Mock gh: handles both directory listing and file content API calls
+        mock_gh = mock_bin / "gh"
+        mock_gh.write_text(f"""\
+#!/bin/bash
+# Mock gh CLI for vendor-helpers tests.
+# Handles: gh api "repos/.../contents/<path>?ref=..." --jq '<expr>'
+REPO_DIR="{repo_dir}"
+
+# Parse args: gh api <url> --jq <expr>
+url="$2"
+jq_expr=""
+for i in "${{@:3}}"; do
+    if [ "$prev_jq" = "1" ]; then
+        jq_expr="$i"
+        prev_jq=0
+        continue
+    fi
+    if [ "$i" = "--jq" ]; then
+        prev_jq=1
+    fi
+done
+
+# Extract the repo path from the URL (repos/owner/repo/contents/<path>?ref=...)
+path=$(echo "$url" | sed 's|repos/[^/]*/[^/]*/contents/||; s|?ref=.*||')
+local_path="$REPO_DIR/$path"
+
+# Directory listing: jq expr starts with '.[]'
+if [[ "$jq_expr" == '.[]'* ]] && [ -d "$local_path" ]; then
+    for entry in "$local_path"/*; do
+        name=$(basename "$entry")
+        rel_path="$path/$name"
+        if [ -d "$entry" ]; then
+            printf "dir\\t%s\\t%s\\n" "$rel_path" "$name"
+        elif [ -f "$entry" ]; then
+            printf "file\\t%s\\t%s\\n" "$rel_path" "$name"
+        fi
+    done
+    exit 0
+fi
+
+# File content: jq expr is '.content'
+if [[ "$jq_expr" == ".content"* ]] && [ -f "$local_path" ]; then
+    base64 < "$local_path"
+    exit 0
+fi
+
+echo "Mock gh: unhandled request: url=$url jq=$jq_expr path=$local_path" >&2
+exit 1
+""")
+        mock_gh.chmod(0o755)
+
+        # Mock curl (still needed if _vendor_download falls through to curl path)
+        mock_curl = mock_bin / "curl"
+        mock_curl.write_text(f"""\
+#!/bin/bash
+output=""
+url=""
+for arg in "$@"; do
+    if [ "$prev_was_o" = "1" ]; then
+        output="$arg"
+        prev_was_o=0
+        continue
+    fi
+    if [ "$arg" = "-o" ]; then
+        prev_was_o=1
+        continue
+    fi
+    if [[ "$arg" != -* ]]; then
+        url="$arg"
+    fi
+done
+path=$(echo "$url" | sed 's|https://raw.githubusercontent.com/[^/]*/[^/]*/[^/]*/||')
+src="{repo_dir}/$path"
+if [ -f "$src" ]; then
+    if [ -n "$output" ]; then
+        cp "$src" "$output"
+    else
+        cat "$src"
+    fi
+else
+    echo "Mock curl: not found: $src" >&2
+    exit 1
+fi
+""")
+        mock_curl.chmod(0o755)
+
+        return repo_dir, mock_bin
+
+    def test_downloads_directory_files(self, tmp_repo, mock_gh_server):
+        """fetch_dir should download all files in a directory."""
+        repo_dir, mock_bin = mock_gh_server
+        manifest = tmp_repo / "manifest.txt"
+        # GH_TOKEN needed so _vendor_download uses the gh path (where mock gh handles content)
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_dir "lib" "out/lib"',
+            {"VENDOR_MANIFEST": str(manifest), "GH_TOKEN": "test-token"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert (tmp_repo / "out" / "lib" / "utils.py").read_text() == "# utils\n"
+        assert (tmp_repo / "out" / "lib" / "core.py").read_text() == "# core\n"
+
+    def test_recursive_subdirectories(self, tmp_repo, mock_gh_server):
+        """fetch_dir should recurse into subdirectories."""
+        repo_dir, mock_bin = mock_gh_server
+        manifest = tmp_repo / "manifest.txt"
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_dir "lib" "out/lib"',
+            {"VENDOR_MANIFEST": str(manifest), "GH_TOKEN": "test-token"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert (tmp_repo / "out" / "lib" / "sub" / "deep.py").read_text() == "# deep\n"
+
+    def test_all_files_in_manifest(self, tmp_repo, mock_gh_server):
+        """fetch_dir should append all downloaded files to the manifest."""
+        repo_dir, mock_bin = mock_gh_server
+        manifest = tmp_repo / "manifest.txt"
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_dir "lib" "out/lib"',
+            {"VENDOR_MANIFEST": str(manifest), "GH_TOKEN": "test-token"},
+        )
+        assert result.returncode == 0, result.stderr
+        lines = manifest.read_text().strip().split("\n")
+        assert "out/lib/utils.py" in lines
+        assert "out/lib/core.py" in lines
+        assert "out/lib/sub/deep.py" in lines
+
+    def test_creates_target_directory(self, tmp_repo, mock_gh_server):
+        """fetch_dir should create the target directory if it doesn't exist."""
+        repo_dir, mock_bin = mock_gh_server
+        manifest = tmp_repo / "manifest.txt"
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_dir "lib" "deep/nested/output"',
+            {"VENDOR_MANIFEST": str(manifest), "GH_TOKEN": "test-token"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert (tmp_repo / "deep" / "nested" / "output").is_dir()
+        assert (tmp_repo / "deep" / "nested" / "output" / "utils.py").is_file()
+
+    def test_error_when_gh_api_fails(self, tmp_repo, mock_gh_server):
+        """fetch_dir should return error when gh API fails for a nonexistent path."""
+        repo_dir, mock_bin = mock_gh_server
+        manifest = tmp_repo / "manifest.txt"
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_dir "nonexistent_dir" "out/nope"',
+            {"VENDOR_MANIFEST": str(manifest), "GH_TOKEN": "test-token"},
+        )
+        assert result.returncode != 0
+
+
+class TestVendorPatAuth:
+    """Tests for VENDOR_PAT authentication, which should override GH_TOKEN."""
+
+    def test_vendor_pat_overrides_gh_token(self, tmp_repo, mock_server):
+        """When both VENDOR_PAT and GH_TOKEN are set, VENDOR_PAT should be used."""
+        repo_dir, mock_bin = mock_server
+        manifest = tmp_repo / "manifest.txt"
+
+        # Create a mock curl that logs the auth header it receives
+        auth_log = tmp_repo / "auth_log.txt"
+        mock_curl = mock_bin / "curl"
+        mock_curl.write_text(f"""\
+#!/bin/bash
+# Mock curl that logs auth headers to a file.
+output=""
+url=""
+auth_header=""
+for arg in "$@"; do
+    if [ "$prev_was_o" = "1" ]; then
+        output="$arg"
+        prev_was_o=0
+        continue
+    fi
+    if [ "$prev_was_H" = "1" ]; then
+        auth_header="$arg"
+        prev_was_H=0
+        continue
+    fi
+    if [ "$arg" = "-o" ]; then
+        prev_was_o=1
+        continue
+    fi
+    if [ "$arg" = "-H" ]; then
+        prev_was_H=1
+        continue
+    fi
+    if [[ "$arg" != -* ]]; then
+        url="$arg"
+    fi
+done
+
+echo "$auth_header" > "{auth_log}"
+
+path=$(echo "$url" | sed 's|https://raw.githubusercontent.com/[^/]*/[^/]*/[^/]*/||')
+src="{repo_dir}/$path"
+if [ -f "$src" ]; then
+    if [ -n "$output" ]; then
+        cp "$src" "$output"
+    else
+        cat "$src"
+    fi
+else
+    echo "Mock curl: not found: $src" >&2
+    exit 1
+fi
+""")
+        mock_curl.chmod(0o755)
+
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_file "script.sh" "out/script.sh"',
+            {
+                "VENDOR_MANIFEST": str(manifest),
+                "GH_TOKEN": "wrong-token",
+                "VENDOR_PAT": "correct-pat-token",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        logged_header = auth_log.read_text().strip()
+        assert "correct-pat-token" in logged_header
+        assert "wrong-token" not in logged_header
+
+    def test_vendor_pat_alone_works(self, tmp_repo, mock_server):
+        """When only VENDOR_PAT is set (no GH_TOKEN), auth should still work."""
+        repo_dir, mock_bin = mock_server
+        manifest = tmp_repo / "manifest.txt"
+
+        auth_log = tmp_repo / "auth_log.txt"
+        mock_curl = mock_bin / "curl"
+        mock_curl.write_text(f"""\
+#!/bin/bash
+output=""
+url=""
+auth_header=""
+for arg in "$@"; do
+    if [ "$prev_was_o" = "1" ]; then
+        output="$arg"
+        prev_was_o=0
+        continue
+    fi
+    if [ "$prev_was_H" = "1" ]; then
+        auth_header="$arg"
+        prev_was_H=0
+        continue
+    fi
+    if [ "$arg" = "-o" ]; then
+        prev_was_o=1
+        continue
+    fi
+    if [ "$arg" = "-H" ]; then
+        prev_was_H=1
+        continue
+    fi
+    if [[ "$arg" != -* ]]; then
+        url="$arg"
+    fi
+done
+
+echo "$auth_header" > "{auth_log}"
+
+path=$(echo "$url" | sed 's|https://raw.githubusercontent.com/[^/]*/[^/]*/[^/]*/||')
+src="{repo_dir}/$path"
+if [ -f "$src" ]; then
+    if [ -n "$output" ]; then
+        cp "$src" "$output"
+    else
+        cat "$src"
+    fi
+else
+    echo "Mock curl: not found: $src" >&2
+    exit 1
+fi
+""")
+        mock_curl.chmod(0o755)
+
+        result = run_helper_script(
+            tmp_repo, mock_bin,
+            'fetch_file "script.sh" "out/script.sh"',
+            {
+                "VENDOR_MANIFEST": str(manifest),
+                "VENDOR_PAT": "my-pat-token",
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        logged_header = auth_log.read_text().strip()
+        assert "my-pat-token" in logged_header
+
+
 class TestVendorLibFallback:
     """Test that VENDOR_LIB not being set is a graceful fallback scenario."""
 
