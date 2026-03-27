@@ -39,9 +39,18 @@ _vendor_download() {
 
     mkdir -p "$(dirname "$dest")"
 
+    # Try gh API first (handles private repos well), fall back to curl.
+    # gh can fail due to bad creds, rate limits, or missing config — curl
+    # is the reliable fallback.
     if [ -n "$auth_header" ] && command -v gh &>/dev/null; then
-        gh api "repos/$repo/contents/$repo_path?ref=$ref" --jq '.content' | base64 -d > "$dest"
-    elif [ -n "$auth_header" ]; then
+        local gh_content
+        if gh_content=$(gh api "repos/$repo/contents/$repo_path?ref=$ref" --jq '.content' 2>/dev/null); then
+            echo "$gh_content" | base64 -d > "$dest"
+            return 0
+        fi
+    fi
+
+    if [ -n "$auth_header" ]; then
         curl -fsSL -H "$auth_header" \
             "https://raw.githubusercontent.com/$repo/$ref/$repo_path" \
             -o "$dest"
