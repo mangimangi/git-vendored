@@ -47,7 +47,7 @@ fetch_file() {
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
 # Create directories
-mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .github/workflows
+mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .vendored/lib .github/workflows
 
 # Download vendored scripts
 echo "Downloading .vendored/install..."
@@ -65,6 +65,17 @@ fetch_file "templates/remove" ".vendored/remove"
 chmod +x .vendored/remove
 INSTALLED_FILES+=(".vendored/remove")
 
+# Download vendor helper library
+echo "Downloading .vendored/feedback..."
+fetch_file "templates/feedback" ".vendored/feedback"
+chmod +x .vendored/feedback
+INSTALLED_FILES+=(".vendored/feedback")
+
+echo "Downloading .vendored/lib/vendor-helpers.sh..."
+fetch_file "templates/lib/vendor-helpers.sh" ".vendored/lib/vendor-helpers.sh"
+chmod +x .vendored/lib/vendor-helpers.sh
+INSTALLED_FILES+=(".vendored/lib/vendor-helpers.sh")
+
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
 
@@ -72,6 +83,11 @@ echo "Downloading .vendored/hooks/pre-commit..."
 fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
 chmod +x .vendored/hooks/pre-commit
 INSTALLED_FILES+=(".vendored/hooks/pre-commit")
+
+echo "Downloading .vendored/hooks/vendored-session.sh..."
+fetch_file "templates/hooks/vendored-session.sh" ".vendored/hooks/vendored-session.sh"
+chmod +x .vendored/hooks/vendored-session.sh
+INSTALLED_FILES+=(".vendored/hooks/vendored-session.sh")
 
 # Install pre-commit hook into .git/hooks/ (symlink, idempotent)
 if [ -d .git/hooks ]; then
@@ -135,6 +151,9 @@ write_manifest() {
 }
 
 write_manifest
+
+# Set up agent hooks (auto-detect claude/codex)
+python3 .vendored/install --setup-hooks
 
 echo ""
 echo "Done! git-vendored v$VERSION installed."
