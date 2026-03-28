@@ -28,6 +28,11 @@ on:
         description: 'Version to install (default: latest)'
         required: false
         default: 'latest'
+      private:
+        description: 'Vendor repo is private (use VENDOR_PAT)'
+        type: boolean
+        required: false
+        default: false
   workflow_call:
     inputs:
       vendor:
@@ -36,6 +41,9 @@ on:
       version:
         type: string
         default: 'latest'
+      private:
+        type: boolean
+        default: false
     secrets:
       token:
         required: false
@@ -59,4 +67,8 @@ jobs:
         run: |
           VENDOR="${{ inputs.vendor || 'all' }}"
           VERSION="${{ inputs.version || 'latest' }}"
-          python3 .vendored/install "$VENDOR" --version "$VERSION" --pr --deps=install
+          PRIVATE_FLAG=""
+          if [ "${{ inputs.private }}" = "true" ]; then
+            PRIVATE_FLAG="--private"
+          fi
+          python3 .vendored/install "$VENDOR" --version "$VERSION" --pr --deps=install $PRIVATE_FLAG
