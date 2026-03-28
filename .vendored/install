@@ -145,9 +145,9 @@ def save_config(config):
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
 
-def get_auth_token(vendor_config=None):
+def get_auth_token(vendor_config=None, private=False):
     """Get the appropriate auth token for a vendor."""
-    if vendor_config and vendor_config.get("private"):
+    if private or (vendor_config and vendor_config.get("private")):
         token = os.environ.get("VENDOR_PAT", "")
         if not token:
             print("::error::VENDOR_PAT required for private vendor repos")
@@ -1430,6 +1430,10 @@ def main():
         help="List hook script paths for TYPE (start or resume) in dependency order"
     )
     parser.add_argument(
+        "--private", action="store_true",
+        help="Treat vendor as private (use VENDOR_PAT for auth)"
+    )
+    parser.add_argument(
         "--setup-hooks", nargs="?", const="auto", default=None,
         metavar="AGENT", dest="setup_hooks",
         help="Set up agent hooks (claude, codex, or auto-detect)"
@@ -1503,7 +1507,7 @@ def main():
         output_results(results)
     elif _is_repo_spec(args.target):
         # New vendor (owner/repo format) — add path
-        token = get_auth_token()
+        token = get_auth_token(private=args.private)
         result = install_new_vendor(args.target, args.version, token, args.name,
                                     deps_mode=args.deps)
         output_result(result)
