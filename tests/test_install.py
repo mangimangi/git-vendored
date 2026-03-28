@@ -239,6 +239,20 @@ class TestGetAuthToken:
         token = inst.get_auth_token()
         assert token == "my-token"
 
+    def test_private_flag_uses_vendor_pat(self, monkeypatch):
+        """get_auth_token with private=True (new private vendor)."""
+        monkeypatch.setenv("VENDOR_PAT", "pat-secret-new")
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token-123")
+        token = inst.get_auth_token(private=True)
+        assert token == "pat-secret-new"
+
+    def test_private_flag_missing_pat_exits(self, monkeypatch):
+        """get_auth_token with private=True but no VENDOR_PAT."""
+        monkeypatch.delenv("VENDOR_PAT", raising=False)
+        with pytest.raises(SystemExit) as exc_info:
+            inst.get_auth_token(private=True)
+        assert exc_info.value.code == 1
+
 
 # ── Tests: Pre-validation (add path) ──────────────────────────────────────
 
