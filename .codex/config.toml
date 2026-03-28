@@ -1,0 +1,3 @@
+
+[hooks.session-start]
+command = ".vendored/hooks/vendored-session.sh --start"
