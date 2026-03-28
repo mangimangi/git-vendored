@@ -1683,6 +1683,7 @@ class TestAutoInstallAndCycleDetection:
         call_args = mock_install_new.call_args
         assert call_args[0][0] == "mangimangi/git-semver"
         assert call_args[0][1] == "latest"
+        assert call_args[1]["name"] == "git-semver"
 
     @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
