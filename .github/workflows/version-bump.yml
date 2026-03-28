@@ -1,12 +1,14 @@
 # .github/workflows/version-bump.yml
-# Bumps version and creates GitHub Releases when implementation files change
-# on merge to main (patch), or when triggered manually via workflow_dispatch
-# (major|minor|patch).
+# Two-job workflow: bump and publish are mutually exclusive.
 #
-# All logic lives in .vendored/pkg/git-semver/bump-and-release (updated via vendor install).
+# Bump job:  Runs on non-bump pushes to main and workflow_dispatch.
+#            Calls `release bump` which handles protected branch fallback.
+# Publish job: Runs when a `chore: bump version` commit lands on main.
+#              Calls `release publish` to create tags and GitHub releases.
+#
+# All logic lives in .vendored/pkg/git-semver/release (updated via vendor install).
 # This workflow is a thin shell: triggers, permissions, and context passing.
 #
-# Skips automated commits (chore: bump version, chore: install).
 # Uses GITHUB_TOKEN — no PAT required.
 
 name: Bump & Release
@@ -43,7 +45,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bump-and-release:
+  bump:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -57,11 +59,28 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Bump & Release
+      - name: Bump
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
           INPUT_BUMP_TYPE: ${{ inputs.bump_type || '' }}
           INPUT_SUBDIRECTORY: ${{ inputs.subdirectory || '' }}
           INPUT_CHANGELOG_DESCRIPTION: ${{ inputs.changelog_description || '' }}
-        run: python3 .vendored/pkg/git-semver/bump-and-release
+        run: python3 .vendored/pkg/git-semver/release bump
+
+  publish:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.event.head_commit.message, 'chore: bump version')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .vendored/pkg/git-semver/release publish
