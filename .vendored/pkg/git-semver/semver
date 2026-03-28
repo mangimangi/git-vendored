@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""semver — CI orchestration for git-semver.
+
+Subcommands:
+    bump      Version bump (push or dispatch event handling)
+    publish   Create tags and GitHub releases for bump commits
+
+Called by the version-bump.yml workflow. Reads GitHub Actions context from
+environment variables and orchestrates version bumps, PR creation, and
+GitHub Release creation.
+
+Environment variables (set by the workflow or GitHub Actions):
+    GITHUB_EVENT_NAME           "push" or "workflow_dispatch"
+    GITHUB_EVENT_BEFORE         Before-SHA for push events
+    GITHUB_SHA                  Current commit SHA
+    INPUT_BUMP_TYPE             patch|minor|major (dispatch only)
+    INPUT_SUBDIRECTORY          Subdirectory to bump (dispatch only, optional)
+    INPUT_CHANGELOG_DESCRIPTION Changelog entry text (dispatch only, optional)
+    GH_TOKEN                    GitHub token (for gh CLI)
+    GITHUB_REPOSITORY           owner/repo (for gh release create)
+    GITHUB_REF                  Current branch ref
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SEMVER_SCRIPT = str(Path(__file__).parent / "git-semver")
+CONFIG_PATH = ".semver/config.json"
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def run(*cmd, check=True, capture=True):
+    """Run a command and return the CompletedProcess."""
+    result = subprocess.run(
+        list(cmd), capture_output=capture, text=True, check=False,
+    )
+    if check and result.returncode != 0:
+        stderr = result.stderr.strip() if capture else ""
+        print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
+        if stderr:
+            print(stderr, file=sys.stderr)
+        sys.exit(1)
+    return result
+
+
+def read_config():
+    """Read install settings from .semver/config.json.
+
+    Returns (on_merge: bool, automerge: bool).
+    """
+    path = Path(CONFIG_PATH)
+    if not path.exists():
+        return True, True
+    try:
+        config = json.loads(path.read_text())
+        install = config.get("install", {})
+        return bool(install.get("on_merge", True)), bool(install.get("automerge", True))
+    except (json.JSONDecodeError, AttributeError):
+        return True, True
+
+
+def configure_git():
+    """Set git user for automated commits."""
+    run("git", "config", "user.name", "github-actions[bot]")
+    run("git", "config", "user.email", "github-actions[bot]@users.noreply.github.com")
+
+
+def sync_branch():
+    """Fast-forward to latest remote to pick up version bumps from queued runs.
+
+    When multiple pushes trigger queued workflow runs (concurrency group with
+    cancel-in-progress: false), each run checks out the SHA from event creation
+    time. A prior run may have already bumped the version and pushed. Without
+    syncing, this run would read a stale VERSION file and try to create a tag
+    that already exists.
+    """
+    ref = os.environ.get("GITHUB_REF", "refs/heads/main")
+    branch = ref.split("/", 2)[-1] if ref.startswith("refs/heads/") else "main"
+    result = run("git", "pull", "--ff-only", "origin", branch, check=False, capture=True)
+    if result.returncode != 0:
+        print(f"Warning: could not fast-forward to latest {branch}, "
+              "proceeding with current checkout")
+
+
+def git_semver(*args):
+    """Call .semver/git-semver with arguments."""
+    return run(SEMVER_SCRIPT, *args, capture=False)
+
+
+def create_pr(branch, title, body, base="main"):
+    """Create a branch, push it, and open a GitHub PR."""
+    run("git", "checkout", "-b", branch)
+    run("git", "push", "-u", "origin", branch)
+    run("gh", "pr", "create", "--title", title, "--body", body, "--base", base)
+
+
+def is_protected_branch_error(result):
+    """Check if a push failure is due to branch protection."""
+    stderr = result.stderr if result.stderr else ""
+    return "GH006" in stderr or "protected branch" in stderr.lower()
+
+
+def try_push_or_pr(commit_title):
+    """Attempt git push; on protected branch failure, fall back to PR.
+
+    Returns True if push succeeded, False if PR was created.
+    """
+    result = run("git", "push", check=False, capture=True)
+    if result.returncode == 0:
+        return True
+
+    if is_protected_branch_error(result):
+        print("Push rejected by branch protection, falling back to PR")
+        branch = f"chore/bump-version-{int(time.time())}"
+        create_pr(branch, commit_title, "Automated version bump")
+        return False
+
+    # Non-protection push failure — surface error
+    print(f"Push failed: {result.stderr.strip()}", file=sys.stderr)
+    sys.exit(1)
+
+
+def create_releases():
+    """Create GitHub Releases for tags pointing at HEAD."""
+    result = run("git", "tag", "--points-at", "HEAD", capture=True)
+    tags = [t for t in result.stdout.strip().split("\n") if t and t != "latest"]
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    for tag in tags:
+        print(f"Creating release for {tag}")
+        run("gh", "release", "create", tag,
+            "--repo", repo, "--title", tag, "--generate-notes")
+
+
+# ── Bump subcommand ───────────────────────────────────────────────────────
+
+def handle_push_bump(automerge):
+    """Handle push-to-main event for bump subcommand."""
+    before = os.environ.get("GITHUB_EVENT_BEFORE", "")
+    if not before:
+        print("Error: GITHUB_EVENT_BEFORE not set", file=sys.stderr)
+        sys.exit(1)
+
+    configure_git()
+    sync_branch()
+
+    # Always bump without push — we handle push separately
+    pre_bump_sha = run("git", "rev-parse", "HEAD", capture=True).stdout.strip()
+    git_semver("bump-all", "--since", before, "--no-push")
+    head_sha = run("git", "rev-parse", "HEAD", capture=True).stdout.strip()
+
+    if head_sha == pre_bump_sha:
+        # No bump was needed
+        return
+
+    commit_title = run("git", "log", "-1", "--pretty=%s", capture=True).stdout.strip()
+
+    if not automerge:
+        # automerge=false: go straight to PR, no push attempt
+        branch = f"chore/bump-version-{int(time.time())}"
+        create_pr(branch, commit_title, "Automated version bump")
+        return
+
+    try_push_or_pr(commit_title)
+
+
+def handle_dispatch_bump(automerge):
+    """Handle workflow_dispatch event for bump subcommand."""
+    bump_type = os.environ.get("INPUT_BUMP_TYPE", "patch")
+    subdirectory = os.environ.get("INPUT_SUBDIRECTORY", "")
+    description = os.environ.get("INPUT_CHANGELOG_DESCRIPTION", "")
+
+    configure_git()
+
+    # Always bump without push — we handle push separately
+    args = [bump_type, "--no-push"]
+    if subdirectory:
+        args += ["--subdir", subdirectory]
+    if description:
+        args += ["--description", description]
+
+    git_semver("bump", *args)
+
+    commit_title = run("git", "log", "-1", "--pretty=%s", capture=True).stdout.strip()
+
+    if not automerge:
+        # Determine tag for branch naming
+        result = run("git", "describe", "--tags", "--exact-match", "HEAD",
+                     check=False, capture=True)
+        tag = result.stdout.strip() if result.returncode == 0 else "unknown"
+        branch = f"chore/bump-version-{tag.replace('/', '-')}"
+        create_pr(
+            branch,
+            f"chore: bump version to {tag}",
+            f"Automated version bump to {tag}",
+        )
+        return
+
+    try_push_or_pr(commit_title)
+
+
+def cmd_bump():
+    """Bump subcommand: handle version bumping with protected branch fallback."""
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    on_merge, automerge = read_config()
+
+    if event_name == "push":
+        if not on_merge:
+            print("on_merge is false, skipping")
+            return
+        handle_push_bump(automerge)
+    elif event_name == "workflow_dispatch":
+        handle_dispatch_bump(automerge)
+    else:
+        print(f"Unknown event: {event_name}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ── Publish subcommand ────────────────────────────────────────────────────
+
+def cmd_publish():
+    """Publish subcommand: create tags and GitHub releases."""
+    git_semver("tag", "--push")
+    create_releases()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: semver <bump|publish>", file=sys.stderr)
+        sys.exit(1)
+
+    subcommand = sys.argv[1]
+    if subcommand == "bump":
+        cmd_bump()
+    elif subcommand == "publish":
+        cmd_publish()
+    else:
+        print(f"Unknown subcommand: {subcommand}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
