@@ -733,12 +733,35 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
                 json.dump(raw_config, f, indent=2)
                 f.write("\n")
 
+    # Auto-register: if install.sh didn't write a config or wrote one without
+    # _vendor fields, the framework generates the registry entry from what it
+    # already knows (repo, manifest files, vendor name).
     if new_key is None:
-        print("::error::install.sh did not register a vendor in config.")
-        print("install.sh must self-register by adding an entry to .vendored/config.json")
-        sys.exit(1)
+        # install.sh wrote no config — derive vendor name from repo
+        new_key = name if name else repo.split("/")[-1]
+        new_entry = {}
 
-    validate_entry(new_key, new_entry)
+    # Fill in missing registry fields
+    if "repo" not in new_entry:
+        new_entry["repo"] = repo
+    if "install_branch" not in new_entry:
+        new_entry["install_branch"] = f"chore/install-{new_key}"
+    if "protected" not in new_entry:
+        # Derive from manifest: collect unique directory prefixes
+        protected = set()
+        if manifest_files:
+            for f in manifest_files:
+                # Use the top-level directory as a glob pattern
+                parts = f.split("/")
+                if len(parts) > 1:
+                    protected.add(f"{parts[0]}/**")
+                else:
+                    protected.add(f)
+        if not protected:
+            protected = {f".vendored/pkg/{new_key}/**"}
+        new_entry["protected"] = sorted(protected)
+
+    save_vendor_config(new_key, new_entry)
 
     # Process manifest if install.sh wrote one
     if manifest_files:
