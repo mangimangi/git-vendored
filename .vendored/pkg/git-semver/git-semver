@@ -6,6 +6,7 @@ Subcommands:
     check [--since <commit>]         Check if a bump is needed (exit 0=yes, 1=no)
     bump [patch|minor|major] [opts]  Bump version, commit, tag, push
     bump-all --since <commit> [opts] Check all components, bump all triggered
+    tag [--push] [--subdir <name>]   Create version tags from VERSION files
 
 Config: .semver/config.json (see README for schema)
 """
@@ -487,14 +488,14 @@ def cmd_bump(args):
     git("commit", "-m", f"chore: bump version to {tag}")
     print(f"Committed: chore: bump version to {tag}")
 
+    if args.no_push:
+        print(f"\nVersion bumped to {new_version} (no push)")
+        return
+
     # Tag
     git("tag", "-a", tag, "-m", tag)
     git("tag", "-f", "latest")
     print(f"Tagged: {tag} + latest")
-
-    if args.no_push:
-        print(f"\nVersion bumped to {new_version} (no push)")
-        return
 
     # Push
     git("push", check=True)
@@ -561,20 +562,94 @@ def cmd_bump_all(args):
     git("commit", "-m", f"chore: bump version {tags_str}")
     print(f"Committed: chore: bump version {tags_str}")
 
+    if args.no_push:
+        print(f"\nBumped {len(bumps)} component(s) (no push)")
+        return
+
     # Create tags
     for _, _, _, tag in bumps:
         git("tag", "-a", tag, "-m", tag)
     git("tag", "-f", "latest")
     print(f"Tagged: {tags_str} + latest")
 
-    if args.no_push:
-        print(f"\nBumped {len(bumps)} component(s) (no push)")
-        return
-
     # Push
     git("push", check=True)
     git("push", "--tags", "--force", check=True)
     print(f"\nBumped {len(bumps)} component(s) and pushed")
+
+
+def cmd_tag(args):
+    """Create version tags from VERSION files.
+
+    Reads the current version from each component's version_file and creates
+    annotated tags. Idempotent: if the tag already exists at HEAD, no error.
+    """
+    config = load_config(args.config)
+    subdir = getattr(args, "subdir", None)
+
+    components = []  # list of (subdir, version, tag_name)
+
+    if subdir:
+        effective = get_subdir_config(config, subdir)
+        version = read_version(get_version_file(effective))
+        components.append((subdir, version, format_tag(version, subdir)))
+    else:
+        # Root config (if it has a version_file)
+        root_vf = get_version_file(config)
+        if Path(root_vf).exists():
+            version = read_version(root_vf)
+            components.append((None, version, format_tag(version)))
+
+        # All subdirectories
+        for name, subconfig in get_subdirectories(config).items():
+            vf = get_version_file(subconfig)
+            if Path(vf).exists():
+                version = read_version(vf)
+                components.append((name, version, format_tag(version, name)))
+
+    if not components:
+        print("No version files found")
+        return
+
+    tags_created = []
+    for comp_subdir, version, tag_name in components:
+        # Check if tag already exists at HEAD
+        result = git("tag", "-l", tag_name, check=False)
+        if result.stdout.strip() == tag_name:
+            # Tag exists — check if it points at HEAD
+            tag_commit = git("rev-list", "-n1", tag_name, check=False)
+            head_commit = git("rev-parse", "HEAD", check=False)
+            if tag_commit.stdout.strip() == head_commit.stdout.strip():
+                label = comp_subdir or "root"
+                print(f"Tag {tag_name} already exists at HEAD ({label}), skipping")
+                tags_created.append(tag_name)
+                continue
+            # Tag exists at a different commit
+            label = comp_subdir or "root"
+            existing = tag_commit.stdout.strip()[:8]
+            current = head_commit.stdout.strip()[:8]
+            raise SemverError(
+                f"Tag {tag_name} ({label}) already exists at commit {existing}, "
+                f"but HEAD is {current}. Delete it first with: git tag -d {tag_name}"
+            )
+        git("tag", "-a", tag_name, "-m", tag_name)
+        label = comp_subdir or "root"
+        print(f"Tagged {label}: {tag_name}")
+        tags_created.append(tag_name)
+
+    # Always update latest tag
+    git("tag", "-f", "latest")
+
+    if not tags_created:
+        print("No tags created")
+        return
+
+    tags_str = ", ".join(tags_created)
+    print(f"Created tags: {tags_str} + latest")
+
+    if getattr(args, "push", False):
+        git("push", "--tags", "--force", check=True)
+        print("Tags pushed")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -609,7 +684,7 @@ def build_parser():
     )
     bump_parser.add_argument("--subdir", default=None, help="Subdirectory name")
     bump_parser.add_argument("--description", default=None, help="Changelog description override")
-    bump_parser.add_argument("--no-push", action="store_true", help="Skip push")
+    bump_parser.add_argument("--no-push", action="store_true", help="Skip tag and push")
     bump_parser.add_argument("--no-commit", action="store_true", help="Skip commit and push")
 
     # bump-all
@@ -627,10 +702,15 @@ def build_parser():
     bump_all_parser.add_argument(
         "--description", default=None, help="Changelog description override",
     )
-    bump_all_parser.add_argument("--no-push", action="store_true", help="Skip push")
+    bump_all_parser.add_argument("--no-push", action="store_true", help="Skip tag and push")
     bump_all_parser.add_argument(
         "--no-commit", action="store_true", help="Skip commit and push",
     )
+
+    # tag
+    tag_parser = subparsers.add_parser("tag", help="Create version tags from VERSION files")
+    tag_parser.add_argument("--push", action="store_true", help="Push tags after creation")
+    tag_parser.add_argument("--subdir", default=None, help="Subdirectory name (tags all if omitted)")
 
     return parser
 
@@ -647,6 +727,7 @@ def main():
         "check": cmd_check,
         "bump": cmd_bump,
         "bump-all": cmd_bump_all,
+        "tag": cmd_tag,
     }
 
     try:
