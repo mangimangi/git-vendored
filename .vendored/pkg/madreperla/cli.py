@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any, cast
 
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 
 VALID_MODES = {"planning", "refine", "estimate", "implement", "oneshot", "eval", "cleanup"}
 
@@ -52,81 +52,101 @@ def _find_project_root() -> Path:
 def load_config(project_root: Path | None = None) -> dict[str, Any]:
     """Load madreperla config from .vendored/configs/madreperla.json.
 
-    Returns dict with keys: provider, prompts, sessions, eval.
-    Returns empty dict with defaults if config file is missing.
+    Returns dict with keys: description, docs, providers, prompts, sessions, eval.
+    Returns empty dict if config file is missing.
     Strips _vendor metadata before returning.
     """
     if project_root is None:
         project_root = _find_project_root()
     config_path = project_root / ".vendored" / "configs" / "madreperla.json"
     if not config_path.exists():
-        return {"provider": "pearls"}
+        return {}
     try:
         with open(config_path, "r") as f:
             raw: dict[str, Any] = json.load(f)
         return {k: v for k, v in raw.items() if k != "_vendor"}
     except json.JSONDecodeError as e:
         print(f"Warning: {config_path} is not valid JSON: {e}", file=sys.stderr)
-        return {"provider": "pearls"}
-
-
-def load_provider_config(provider: str = "pearls", project_root: Path | None = None) -> dict[str, Any]:
-    """Load provider config from .vendored/configs/<provider>.json.
-
-    The provider name comes from madreperla's own config.
-    Returns dict with keys: prefix, epics, description, docs, models, etc.
-    """
-    if project_root is None:
-        project_root = _find_project_root()
-    config_path = project_root / ".vendored" / "configs" / f"{provider}.json"
-    if not config_path.exists():
-        print(
-            f"Error: provider config not found at {config_path}.\n"
-            f'Create .vendored/configs/{provider}.json with: {{"prefix": "your-project"}}',
-            file=sys.stderr,
-        )
         return {}
-    try:
-        with open(config_path, "r") as f:
-            raw: dict[str, Any] = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"Error: {config_path} is not valid JSON: {e}", file=sys.stderr)
-        return {}
-    # Strip _vendor metadata
-    return {k: v for k, v in raw.items() if k != "_vendor"}
-
-
-def merge_config(madp_config: dict[str, Any], provider_config: dict[str, Any]) -> dict[str, Any]:
-    """Merge madreperla config with provider config.
-
-    Madreperla config is the primary source for: description, docs, providers,
-    prompts, sessions, eval, models.
-    Provider config supplies: prefix, epics (issue-tracker-specific metadata).
-    Provider config is NOT used for description/docs — those come from madreperla.
-    """
-    merged: dict[str, Any] = {}
-    # Issue-tracker metadata from provider
-    for key in ("prefix", "epics"):
-        if key in provider_config:
-            merged[key] = provider_config[key]
-    # Everything else from madreperla config
-    for key in ("description", "docs", "providers", "prompts", "sessions", "eval", "models"):
-        if key in madp_config:
-            merged[key] = madp_config[key]
-    return merged
 
 
 # ── Prompt Functions ─────────────────────────────────────────────────────────
 
 
 def get_prompt_header() -> str:
-    """Return version/command context appended to all prompt outputs."""
-    return f"prl v{VERSION} configured — use `prl` commands to manage issues (not python3 prl.py)"
+    """Return version/command context for all prompt outputs.
+
+    Note: madp does NOT announce vendored tools — they self-announce
+    via their own session hooks (e.g., pearls emits its own prl header).
+    """
+    return f"madp v{VERSION}"
 
 
 def get_prompt_intro(description: str, docs_str: str) -> str:
     """Return the shared intro line used by all prompt modes."""
     return f"hi claude - this is {description}...check out {docs_str} to understand the contributing workflow"
+
+
+# ── Provider Announcements ──────────────────────────────────────────────────
+
+_DOCS_PROVIDER_DEFAULTS: dict[str, str] = {
+    "planning": "docs/planning",
+    "epics": "docs/planning/epics",
+    "designs": "docs/designs",
+}
+
+
+def _is_vendored_provider(provider_config: dict[str, Any]) -> bool:
+    """Check if a provider is vendored (has docs pointing into .vendored/)."""
+    docs = provider_config.get("docs", [])
+    return any(str(d).startswith(".vendored/") for d in docs)
+
+
+def get_provider_announcements(config: dict[str, Any]) -> str:
+    """Generate announcement lines for non-vendored providers.
+
+    Vendored providers self-announce via their own session hooks.
+    Non-vendored providers are announced by madp from config.
+
+    Returns empty string if no announcements to make.
+    """
+    providers = config.get("providers", {})
+    announcements: list[str] = []
+
+    for slot, provider_config in providers.items():
+        if not isinstance(provider_config, dict):
+            continue
+        # Skip vendored providers — they self-announce
+        if _is_vendored_provider(provider_config):
+            continue
+
+        name = provider_config.get("name", slot)
+
+        # docs provider: announce per-type artifact paths
+        if slot == "docs":
+            paths = {
+                doc_type: provider_config.get(doc_type, default)
+                for doc_type, default in _DOCS_PROVIDER_DEFAULTS.items()
+            }
+            parts = " | ".join(f"{t} \u2192 {p}/" for t, p in paths.items())
+            announcements.append(f"{name}: {parts}")
+        else:
+            # Other non-vendored providers: simple name announcement
+            announcements.append(f"{name}: configured")
+
+    return "\n".join(announcements)
+
+
+def get_docs_provider_paths(config: dict[str, Any]) -> dict[str, str]:
+    """Resolve docs provider paths from config, with defaults.
+
+    Returns dict with keys: planning, epics, designs.
+    """
+    docs_config = config.get("providers", {}).get("docs", {})
+    return {
+        doc_type: docs_config.get(doc_type, default)
+        for doc_type, default in _DOCS_PROVIDER_DEFAULTS.items()
+    }
 
 
 def validate_prompt_config(config: dict[str, Any]) -> bool:
@@ -370,19 +390,13 @@ def run(args: list[str] | None = None) -> int:
         print(f"Updated {settings_path.relative_to(project_root)}")
         return 0
 
-    # --resume: header only
-    if parsed.resume:
+    # --resume without mode: header only (backward-compatible)
+    if parsed.resume and parsed.mode is None:
         print(get_prompt_header())
         return 0
 
-    # Load configs: madreperla's own + provider
-    madp_config = load_config()
-    provider = madp_config.get("provider", "pearls")
-    provider_config = load_provider_config(provider)
-    if not provider_config:
-        return 1
-
-    config = merge_config(madp_config, provider_config)
+    # Load config
+    config = load_config()
 
     if not validate_prompt_config(config):
         return 1
@@ -392,9 +406,15 @@ def run(args: list[str] | None = None) -> int:
     docs_str = " ".join(docs)
     header = get_prompt_header()
 
-    # No mode: header + intro
+    # Build announcements for non-vendored providers
+    announcements = get_provider_announcements(config)
+
+    # No mode: header + intro (+ announcements if any)
     if parsed.mode is None:
-        print(f"{header}\n\n{get_prompt_intro(description, docs_str)}")
+        parts = [header, get_prompt_intro(description, docs_str)]
+        if announcements:
+            parts.append(announcements)
+        print("\n\n".join(parts))
         return 0
 
     # Validate mode
@@ -424,11 +444,20 @@ def run(args: list[str] | None = None) -> int:
         m = importlib.util.module_from_spec(s)
         sys.modules['madreperla'] = m
         s.loader.exec_module(m)
-    from madreperla import get_prompt_body  # type: ignore[import-not-found]
+    from madreperla import get_prompt_body, get_prompt_resume_body  # type: ignore[import-not-found]
 
     intro = get_prompt_intro(description, docs_str)
-    body: str = get_prompt_body(parsed.mode, config)
-    print(f"{header}\n\n{intro}\n\n{body}")
+    if parsed.resume:
+        # --resume <mode>: header + intro + announcements + resume body
+        body: str = get_prompt_resume_body(parsed.mode, config)
+    else:
+        # <mode>: header + intro + announcements + start body
+        body = get_prompt_body(parsed.mode, config)
+    parts = [header, intro]
+    if announcements:
+        parts.append(announcements)
+    parts.append(body)
+    print("\n\n".join(parts))
     return 0
 
 
