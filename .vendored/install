@@ -665,6 +665,8 @@ def validate_entry(vendor_name, entry):
 def install_new_vendor(repo, version, token, name=None, deps_mode=None,
                        installing_set=None):
     """First-time add: pre-validate, run install.sh, post-validate."""
+    if not name:
+        name = repo.split("/")[-1]
     if installing_set is None:
         installing_set = []
     if repo in installing_set:
@@ -689,17 +691,16 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     vendors = config.get("vendors", {})
 
     # Check not already registered
-    if name and name in vendors:
+    if name in vendors:
         print(f"::error::Vendor '{name}' is already registered.")
         print("Use .vendored/install <vendor> to update existing vendors.")
         sys.exit(1)
 
-    if not name:
-        for vname, vcfg in vendors.items():
-            if vcfg.get("repo") == repo:
-                print(f"::error::Vendor '{vname}' already registered for {repo}.")
-                print("Use .vendored/install <vendor> to update existing vendors.")
-                sys.exit(1)
+    for vname, vcfg in vendors.items():
+        if vcfg.get("repo") == repo:
+            print(f"::error::Vendor '{vname}' already registered for {repo}.")
+            print("Use .vendored/install <vendor> to update existing vendors.")
+            sys.exit(1)
 
     # Snapshot config before
     before_vendors = dict(vendors)
