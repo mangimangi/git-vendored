@@ -810,6 +810,41 @@ class TestVendorInstallDir:
         env = bash_calls[0][1].get("env", {})
         assert "VENDOR_INSTALL_DIR" not in env
 
+    @patch("vendored_install.subprocess.run")
+    def test_sets_github_token_from_auth_token(self, mock_run, tmp_repo, monkeypatch):
+        """GITHUB_TOKEN is set in install.sh env so curl-based scripts can auth."""
+        import base64 as b64
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "owner/tool", "1.0.0", "my-private-pat",
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+        )
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        assert len(bash_calls) >= 1
+        env = bash_calls[0][1].get("env", {})
+        assert env.get("GITHUB_TOKEN") == "my-private-pat"
+        assert env.get("GH_TOKEN") == "my-private-pat"
+
+    @patch("vendored_install.subprocess.run")
+    def test_private_token_overrides_github_token(self, mock_run, tmp_repo, monkeypatch):
+        """When using VENDOR_PAT, GITHUB_TOKEN in subprocess is overridden."""
+        import base64 as b64
+        monkeypatch.setenv("GITHUB_TOKEN", "low-priv-token")
+        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+
+        inst.download_and_run_install(
+            "owner/tool", "1.0.0", "vendor-pat-token",
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+        )
+        bash_calls = [c for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash"]
+        env = bash_calls[0][1].get("env", {})
+        assert env.get("GITHUB_TOKEN") == "vendor-pat-token"
+
 
 # ── Tests: output_result ──────────────────────────────────────────────────
 
@@ -1684,6 +1719,18 @@ class TestAutoInstallAndCycleDetection:
         assert call_args[0][0] == "mangimangi/git-semver"
         assert call_args[0][1] == "latest"
         assert call_args[1]["name"] == "git-semver"
+
+    @patch("vendored_install.install_new_vendor")
+    def test_resolve_deps_propagates_private_token(self, mock_install_new, tmp_repo, capsys):
+        """Private token (VENDOR_PAT) propagates to dependency installs."""
+        mock_install_new.return_value = {"changed": True}
+        deps = {"pearls": {"repo": "mangimangi/pearls"}}
+
+        inst.resolve_deps(deps, "my-vendor-pat", "install")
+        mock_install_new.assert_called_once()
+        call_args = mock_install_new.call_args
+        # Token (positional arg 2) must be the private token
+        assert call_args[0][2] == "my-vendor-pat"
 
     @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")

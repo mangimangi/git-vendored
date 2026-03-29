@@ -552,6 +552,12 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
     try:
         run_env = env.copy()
         run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
+        # Also set GITHUB_TOKEN so vendor install.sh scripts that use curl
+        # (rather than gh CLI) can authenticate against the GitHub API.
+        # Without this, --private installs fail because VENDOR_PAT only
+        # flows through GH_TOKEN but install.sh scripts read GITHUB_TOKEN.
+        if token:
+            run_env["GITHUB_TOKEN"] = token
         # v2 contract env vars
         run_env["VENDOR_REPO"] = repo
         run_env["VENDOR_REF"] = ref
