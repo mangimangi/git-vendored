@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Vendor config validation audit.
+
+Validates consumer config files against installed vendor schemas.
+Separate from check: check = file protection (binary pass/fail, every PR).
+audit = config validation (advisory warnings, on-demand).
+
+Usage:
+    python3 .vendored/audit
+
+Checks performed:
+    1. Required fields -- every required field in schema is present in config
+    2. Unknown fields -- config has fields not in any installed vendor schema
+    3. Cross-vendor misplacement -- field exists in wrong vendor's config
+    4. Type checking -- basic type validation (string, array, object, number, boolean)
+
+Exit codes:
+    0 - No errors (warnings are OK)
+    1 - Errors found (missing required fields or type mismatches)
+"""
+
+import json
+import os
+import sys
+
+
+MANIFESTS_DIR = ".vendored/manifests"
+CONFIGS_DIR = ".vendored/configs"
+
+# Fields managed by the framework, not user config
+FRAMEWORK_FIELDS = {"_vendor"}
+
+TYPE_MAP = {
+    "string": str,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def load_schemas():
+    """Load all installed vendor schemas.
+
+    Returns dict of {vendor_name: schema_dict}.
+    """
+    schemas = {}
+    if not os.path.isdir(MANIFESTS_DIR):
+        return schemas
+    for filename in sorted(os.listdir(MANIFESTS_DIR)):
+        if not filename.endswith(".schema"):
+            continue
+        vendor_name = filename[:-7]  # strip .schema
+        filepath = os.path.join(MANIFESTS_DIR, filename)
+        with open(filepath) as f:
+            schemas[vendor_name] = json.load(f)
+    return schemas
+
+
+def load_configs():
+    """Load all per-vendor config files.
+
+    Returns dict of {vendor_name: config_dict}.
+    """
+    configs = {}
+    if not os.path.isdir(CONFIGS_DIR):
+        return configs
+    for filename in sorted(os.listdir(CONFIGS_DIR)):
+        if not filename.endswith(".json"):
+            continue
+        vendor_name = filename[:-5]  # strip .json
+        filepath = os.path.join(CONFIGS_DIR, filename)
+        with open(filepath) as f:
+            configs[vendor_name] = json.load(f)
+    return configs
+
+
+def get_user_fields(config):
+    """Extract user-owned fields from a config (exclude framework metadata)."""
+    return {k: v for k, v in config.items() if k not in FRAMEWORK_FIELDS}
+
+
+def build_field_index(schemas):
+    """Build a reverse index: field_name -> set of vendor names that define it."""
+    index = {}
+    for vendor_name, schema in schemas.items():
+        for field_name in schema.get("fields", {}):
+            if field_name not in index:
+                index[field_name] = set()
+            index[field_name].add(vendor_name)
+    return index
+
+
+def check_type(value, expected_type):
+    """Check if a value matches the expected schema type.
+
+    Returns True if the type matches, False otherwise.
+    """
+    python_type = TYPE_MAP.get(expected_type)
+    if python_type is None:
+        return True  # unknown type in schema, skip validation
+    # In JSON, booleans are not numbers even though Python bool is subclass of int
+    if expected_type == "number" and isinstance(value, bool):
+        return False
+    return isinstance(value, python_type)
+
+
+def audit_config(vendor_name, config, schema, field_index):
+    """Audit a single vendor's config against its schema.
+
+    Returns list of (level, message) tuples where level is 'pass', 'error',
+    or 'warning'.
+    """
+    user_fields = get_user_fields(config)
+    fields_spec = schema.get("fields", {})
+
+    results = []
+
+    # Check 1 & 4: Required/optional fields + type validation
+    for field_name, field_def in fields_spec.items():
+        if field_def.get("required") and field_name not in user_fields:
+            results.append(("error", f"[FAIL] {field_name}: required field missing"))
+        elif field_name in user_fields:
+            expected_type = field_def.get("type")
+            if expected_type and not check_type(user_fields[field_name], expected_type):
+                actual = type(user_fields[field_name]).__name__
+                results.append(
+                    ("error", f"[FAIL] {field_name}: expected {expected_type}, got {actual}")
+                )
+            else:
+                desc = field_def.get("description", "valid field")
+                if field_def.get("required"):
+                    results.append(("pass", f"[PASS] {field_name}: required field present"))
+                else:
+                    results.append(("pass", f"[PASS] {field_name}: valid optional field"))
+        else:
+            # Optional field not present — that's fine, don't report
+            pass
+
+    # Check 2 & 3: Unknown fields and cross-vendor misplacement
+    for field_name in user_fields:
+        if field_name in fields_spec:
+            continue  # already handled above
+        # Check if this field belongs to another vendor's schema
+        owners = field_index.get(field_name, set())
+        other_owners = owners - {vendor_name}
+        if other_owners:
+            owner_list = ", ".join(sorted(other_owners))
+            results.append(
+                ("warning",
+                 f"[WARN] {field_name}: defined in {owner_list} schema, not {vendor_name}")
+            )
+        else:
+            results.append(
+                ("warning",
+                 f"[WARN] {field_name}: unknown field (not in {vendor_name} schema)")
+            )
+
+    return results
+
+
+def main():
+    schemas = load_schemas()
+
+    if not schemas:
+        print("No vendor schemas installed.")
+        sys.exit(0)
+
+    configs = load_configs()
+    field_index = build_field_index(schemas)
+
+    total_errors = 0
+    total_warnings = 0
+    any_output = False
+
+    for vendor_name, schema in sorted(schemas.items()):
+        config = configs.get(vendor_name, {})
+        results = audit_config(vendor_name, config, schema, field_index)
+
+        if results:
+            config_file = f"{vendor_name}.json"
+            print(f"  {config_file}")
+            for level, message in results:
+                print(f"    {message}")
+                if level == "error":
+                    total_errors += 1
+                elif level == "warning":
+                    total_warnings += 1
+            print()
+            any_output = True
+
+    if any_output:
+        parts = []
+        if total_warnings:
+            parts.append(f"{total_warnings} warning{'s' if total_warnings != 1 else ''}")
+        if total_errors:
+            parts.append(f"{total_errors} error{'s' if total_errors != 1 else ''}")
+        if not parts:
+            parts.append("all checks passed")
+        print(f"  Summary: {', '.join(parts)}")
+
+    sys.exit(1 if total_errors > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()
