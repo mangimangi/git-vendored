@@ -17,7 +17,7 @@ if [ -z "$MODE" ]; then
     exit 1
 fi
 
-PROJECT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || cd "$(dirname "$0")/../.." && pwd)"
+PROJECT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
 VENDORED_INSTALL="$PROJECT_DIR/.vendored/install"
 
 if [ ! -f "$VENDORED_INSTALL" ]; then
