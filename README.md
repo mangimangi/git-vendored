@@ -141,6 +141,40 @@ A vendor repo must provide:
 - Write version files (the framework handles this via `.vendored/manifests/<vendor>.version`)
 - Modify `.vendored/config.json` (the framework handles vendor registration)
 
+### Dependencies (`deps.json`)
+
+A vendor repo may include a `deps.json` at its root to declare dependencies on other vendors. When a consumer installs the vendor with `--deps=install`, missing dependencies are automatically installed.
+
+```json
+{
+  "pearls": {"repo": "mangimangi/pearls", "private": true},
+  "some-tool": {"repo": "owner/some-tool"}
+}
+```
+
+Each key is the dependency's vendor name, and the value is an object with:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `repo` | yes | GitHub repository (`owner/name`) |
+| `private` | no | If `true`, the dependency requires `VENDOR_PAT` for access. When omitted, inherits the parent vendor's `--private` flag |
+
+Usage:
+
+```bash
+# Auto-install dependencies
+python3 .vendored/install owner/my-tool --deps=install
+
+# Private vendor with private dependencies
+VENDOR_PAT=<token> python3 .vendored/install owner/my-tool --private --deps=install
+```
+
+Dependency modes (`--deps`):
+- `error` (default) — exit if any dependencies are missing
+- `warn` — print a warning and continue
+- `skip` — ignore dependencies entirely
+- `install` — auto-install missing dependencies
+
 ## Protection Rules
 
 `.vendored/check` runs on every PR via `check-vendor.yml`:

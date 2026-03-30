@@ -1785,6 +1785,44 @@ class TestAutoInstallAndCycleDetection:
         content = workflow_path.read_text()
         assert "--deps=install" in content
 
+    @patch("vendored_install.install_new_vendor")
+    def test_resolve_deps_install_passes_private_from_dep_info(
+        self, mock_install_new, tmp_repo, monkeypatch
+    ):
+        """deps.json private field is passed to install_new_vendor."""
+        monkeypatch.setenv("VENDOR_PAT", "pat-secret")
+        mock_install_new.return_value = {"changed": True}
+        deps = {"priv-dep": {"repo": "owner/priv-dep", "private": True}}
+
+        inst.resolve_deps(deps, "public-token", "install", private=False)
+        call_kwargs = mock_install_new.call_args[1]
+        assert call_kwargs["private"] is True
+
+    @patch("vendored_install.install_new_vendor")
+    def test_resolve_deps_install_inherits_parent_private(
+        self, mock_install_new, tmp_repo
+    ):
+        """When dep has no private field, inherits parent's private flag."""
+        mock_install_new.return_value = {"changed": True}
+        deps = {"dep": {"repo": "owner/dep"}}
+
+        inst.resolve_deps(deps, "token", "install", private=True)
+        call_kwargs = mock_install_new.call_args[1]
+        assert call_kwargs["private"] is True
+
+    @patch("vendored_install.install_new_vendor")
+    def test_resolve_deps_install_dep_private_overrides_parent(
+        self, mock_install_new, tmp_repo, monkeypatch
+    ):
+        """Per-dep private=false overrides parent's private=true."""
+        monkeypatch.setenv("GH_TOKEN", "gh-token")
+        mock_install_new.return_value = {"changed": True}
+        deps = {"pub-dep": {"repo": "owner/pub-dep", "private": False}}
+
+        inst.resolve_deps(deps, "parent-pat-token", "install", private=True)
+        call_kwargs = mock_install_new.call_args[1]
+        assert call_kwargs["private"] is False
+
 
 # ── Tests: Recursive auto-install integration ────────────────────────────
 
@@ -2213,6 +2251,52 @@ class TestPostInstallOnly:
         with patch("sys.argv", ["install", "tool", "--post-install-only"]):
             with pytest.raises(SystemExit):
                 inst.main()
+
+
+    def test_post_install_only_aggregates_all_vendors(self, tmp_repo, make_config):
+        """--post-install-only builds results for ALL vendors with manifest versions."""
+        make_config({"vendors": {
+            "tool": SAMPLE_VENDOR,
+            "dep": {"repo": "owner/dep", "install_branch": "chore/install-dep",
+                    "protected": [".dep/**"]},
+        }})
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True, exist_ok=True)
+        (manifests / "tool.version").write_text("2.0.0\n")
+        (manifests / "dep.version").write_text("1.0.0\n")
+
+        with patch("sys.argv", ["install", "tool", "--post-install-only", "--pr"]):
+            with patch("vendored_install.output_result") as mock_output:
+                with patch("vendored_install.create_pull_request") as mock_pr:
+                    inst.main()
+                    # Both vendors should have results
+                    assert mock_output.call_count == 2
+                    vendors_in_results = {
+                        call[0][0]["vendor"] for call in mock_output.call_args_list
+                    }
+                    assert vendors_in_results == {"tool", "dep"}
+                    # PR should be called with both results
+                    pr_results = mock_pr.call_args[0][0]
+                    assert len(pr_results) == 2
+
+    def test_post_install_only_skips_vendors_without_manifest(self, tmp_repo, make_config):
+        """--post-install-only only includes vendors that have manifest versions."""
+        make_config({"vendors": {
+            "tool": SAMPLE_VENDOR,
+            "other": {"repo": "owner/other", "install_branch": "chore/install-other",
+                      "protected": [".other/**"]},
+        }})
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True, exist_ok=True)
+        (manifests / "tool.version").write_text("2.0.0\n")
+        # "other" has no .version file
+
+        with patch("sys.argv", ["install", "tool", "--post-install-only"]):
+            with patch("vendored_install.output_result") as mock_output:
+                with patch("vendored_install.create_pull_request"):
+                    inst.main()
+                    assert mock_output.call_count == 1
+                    assert mock_output.call_args[0][0]["vendor"] == "tool"
 
 
 class TestInstallExistingVendorBootstrap:
