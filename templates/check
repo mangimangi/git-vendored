@@ -31,12 +31,31 @@ import sys
 CONFIGS_DIR = ".vendored/configs"
 
 
-def _extract_vendor_registry(raw):
+MANIFESTS_DIR_PATH = ".vendored/manifests"
+
+
+def _read_registry(vendor_name):
+    """Read vendor registry from .vendored/manifests/<vendor>.registry.
+
+    Returns parsed dict or None if no .registry file exists.
+    """
+    registry_path = os.path.join(MANIFESTS_DIR_PATH, f"{vendor_name}.registry")
+    if not os.path.isfile(registry_path):
+        return None
+    with open(registry_path) as f:
+        return json.load(f)
+
+
+def _extract_vendor_registry(raw, vendor_name=None):
     """Extract registry fields from a per-vendor config file's contents.
 
-    If the file has a _vendor key, use that. Otherwise treat all top-level
-    keys as registry fields (backwards compat with pre-_vendor configs).
+    Prefers .registry file in manifests/ (new path). Falls back to _vendor
+    key in config, then treats all top-level keys as registry fields.
     """
+    if vendor_name:
+        registry = _read_registry(vendor_name)
+        if registry is not None:
+            return registry
     if "_vendor" in raw:
         return dict(raw["_vendor"])
     return dict(raw)
@@ -49,8 +68,8 @@ def load_config(config_path=".vendored/config.json"):
     Falls back to monolithic config.json if configs/ dir doesn't exist
     or has no .json files.
 
-    When reading per-vendor configs with a _vendor key, extracts registry
-    fields from _vendor so callers see the same flat shape.
+    Registry fields are read from .vendored/manifests/<vendor>.registry
+    when available, falling back to _vendor key in the config file.
     """
     # Try per-vendor configs first
     if os.path.isdir(CONFIGS_DIR):
@@ -62,7 +81,7 @@ def load_config(config_path=".vendored/config.json"):
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
                     raw = json.load(f)
-                vendors[vendor_name] = _extract_vendor_registry(raw)
+                vendors[vendor_name] = _extract_vendor_registry(raw, vendor_name)
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json

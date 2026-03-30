@@ -209,6 +209,7 @@ This prevents accidental edits to vendor-managed files while allowing the automa
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
     my-tool.schema               # config schema (if vendor provides one)
+    my-tool.registry             # vendor registry metadata (repo, install_branch, etc.)
     pearls.files
     pearls.version
   hooks/

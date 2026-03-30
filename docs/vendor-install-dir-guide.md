@@ -10,9 +10,10 @@ git-vendored is consolidating per-vendor dotdirs (`.pearls/`, `.dogfood/`, `.sem
 .vendored/
   configs/<vendor>.json    # per-vendor config (replaces monolithic config.json)
   pkg/<vendor>/            # vendor-installed files (replaces dotdirs at repo root)
-  manifests/<vendor>.files # file manifest
+  manifests/<vendor>.files    # file manifest
   manifests/<vendor>.version
-  manifests/<vendor>.schema # config schema (if vendor ships templates/config.schema)
+  manifests/<vendor>.schema  # config schema (if vendor ships templates/config.schema)
+  manifests/<vendor>.registry # vendor registry metadata (repo, install_branch, etc.)
 ```
 
 ## VENDOR_INSTALL_DIR Contract
@@ -100,26 +101,21 @@ INSTALL_DIR="${VENDOR_INSTALL_DIR:-.my-tool}"
 
 ## Per-Vendor Config Schema
 
-Each vendor gets its own config file at `.vendored/configs/<vendor>.json`. The file contains two kinds of data:
+Each vendor gets its own config file at `.vendored/configs/<vendor>.json`. After migration, the config file contains **only project config** — registry metadata lives in `.vendored/manifests/<vendor>.registry`.
 
-- **`_vendor` key** — framework-owned registry fields. Written by `install`/`remove`, read by `check`. The underscore prefix signals "managed by the framework — don't edit."
-- **Top-level keys** — project-owned config, opaque to the framework, read by the vendor tool itself.
+### Registry File (`.registry`)
+
+Framework-owned metadata is stored at `.vendored/manifests/<vendor>.registry`:
 
 ```json
 {
-  "_vendor": {
-    "repo": "owner/my-tool",
-    "install_branch": "chore/install-my-tool",
-    "automerge": true,
-    "protected": [".vendored/pkg/my-tool/**"],
-    "allowed": [".vendored/configs/my-tool.json"]
-  },
-  "setting": "value",
-  "feature_flags": { "new_ui": true }
+  "repo": "owner/my-tool",
+  "install_branch": "chore/install-my-tool",
+  "automerge": true,
+  "protected": [".vendored/pkg/my-tool/**"],
+  "allowed": [".vendored/configs/my-tool.json"]
 }
 ```
-
-### `_vendor` Registry Fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -131,18 +127,21 @@ Each vendor gets its own config file at `.vendored/configs/<vendor>.json`. The f
 | `protected` | list | yes | Glob patterns of protected files |
 | `allowed` | list | no | Files users can edit (exceptions to protection) |
 
-### Project Config (Top-Level Keys)
+### Config File (project config)
 
-Top-level keys (everything except `_vendor`) belong to the vendor tool. The framework never reads, writes, or validates them. Examples:
+The config file at `.vendored/configs/<vendor>.json` is purely user-owned. The framework never reads, writes, or validates these keys:
 
 ```json
 {
-  "_vendor": { "repo": "owner/pearls", "install_branch": "chore/install-pearls" },
   "prefix": "gv",
   "docs": ["AGENTS.md", "README.md"],
   "models": { "implementer": "claude-opus-4-6" }
 }
 ```
+
+### Backwards Compatibility
+
+The framework reads registry data with fallback: `.registry` file > `_vendor` key in config > flat top-level keys. Existing repos with `_vendor` in their configs continue to work. The next `install` run migrates `_vendor` out of the config file.
 
 ## Reading Project Config from Vendor Tools
 
@@ -180,13 +179,13 @@ fi
 MY_SETTING=$(jq -r '.my_setting // empty' "$CONFIG_FILE")
 ```
 
-### Backwards Compatibility
+### Config Backwards Compatibility
 
 | Scenario | Behavior |
 |----------|----------|
-| `.vendored/configs/<vendor>.json` exists | Read from vendored config, ignore `_vendor` |
+| `.vendored/configs/<vendor>.json` exists | Read project config from top-level keys |
 | `.vendored/configs/<vendor>.json` missing | Fall back to legacy `.<vendor>/config.json` |
-| Pre-`_vendor` flat config (no `_vendor` key) | All keys treated as registry fields by framework |
+| Registry read order | `.registry` file > `_vendor` key in config > flat top-level keys |
 
 ## Data Files
 

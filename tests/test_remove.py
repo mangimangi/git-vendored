@@ -146,6 +146,16 @@ class TestGetFilesToRemove:
         files = rem.get_files_to_remove("tool")
         assert ".vendored/manifests/tool.schema" not in files
 
+    def test_includes_registry_file(self, tmp_repo):
+        """get_files_to_remove includes .registry file when it exists."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.registry").write_text('{"repo": "owner/tool"}\n')
+
+        files = rem.get_files_to_remove("tool")
+        assert ".vendored/manifests/tool.registry" in files
+
     def test_error_when_no_manifest(self, tmp_repo):
         """Without a manifest, get_files_to_remove should exit with error."""
         with pytest.raises(SystemExit) as exc_info:
