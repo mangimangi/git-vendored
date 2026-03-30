@@ -355,7 +355,7 @@ def check_deps(deps):
     return satisfied, missing
 
 
-def resolve_deps(deps, token, mode, installing_set=None):
+def resolve_deps(deps, token, mode, installing_set=None, private=False):
     """Apply dependency mode for resolved deps.
 
     Modes:
@@ -389,11 +389,15 @@ def resolve_deps(deps, token, mode, installing_set=None):
             if not dep_repo:
                 print(f"::error::Dependency '{dep_name}' has no repo field")
                 sys.exit(1)
+            # Per-dep private field in deps.json, falling back to parent's flag
+            dep_private = dep_info.get("private", private)
+            dep_token = get_auth_token(private=dep_private) if dep_private != private else token
             print(f"  {dep_name}: not installed, auto-installing...")
-            result = install_new_vendor(dep_repo, "latest", token,
+            result = install_new_vendor(dep_repo, "latest", dep_token,
                                         name=dep_name,
                                         deps_mode="install",
-                                        installing_set=installing_set)
+                                        installing_set=installing_set,
+                                        private=dep_private)
             print(f"  Added vendor: {dep_name}")
         return
 
@@ -663,7 +667,7 @@ def validate_entry(vendor_name, entry):
 # ── Core install logic ────────────────────────────────────────────────────
 
 def install_new_vendor(repo, version, token, name=None, deps_mode=None,
-                       installing_set=None):
+                       installing_set=None, private=False):
     """First-time add: pre-validate, run install.sh, post-validate."""
     if not name:
         name = repo.split("/")[-1]
@@ -685,7 +689,7 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     deps = download_deps(repo, ref, token)
     if deps:
         mode = deps_mode if deps_mode is not None else "error"
-        resolve_deps(deps, token, mode, installing_set)
+        resolve_deps(deps, token, mode, installing_set, private=private)
 
     config = load_config()
     vendors = config.get("vendors", {})
@@ -1496,22 +1500,23 @@ def main():
     if args.post_install_only:
         # Self-bootstrap re-exec: install already happened, just do
         # post-install steps (output, PR creation) with the new coordinator.
-        vendor_name = args.target
-        if vendor_name not in vendors:
-            print(f"::error::Unknown vendor for post-install: {vendor_name}")
+        # Build results for ALL vendors with manifest versions — the initial
+        # install may have written deps to disk before re-exec triggered.
+        results = []
+        for vname in vendors:
+            ver = read_manifest_version(vname)
+            if ver:
+                r = {
+                    "vendor": vname,
+                    "old_version": "unknown",
+                    "new_version": ver,
+                    "changed": True,
+                }
+                output_result(r)
+                results.append(r)
+        if not results:
+            print(f"::error::No manifest versions found for post-install")
             sys.exit(1)
-        current_version = read_manifest_version(vendor_name)
-        if not current_version:
-            print(f"::error::No manifest version found for {vendor_name}")
-            sys.exit(1)
-        result = {
-            "vendor": vendor_name,
-            "old_version": "unknown",
-            "new_version": current_version,
-            "changed": True,
-        }
-        output_result(result)
-        results = [result]
         if args.pr:
             create_pull_request(results)
         return
@@ -1534,7 +1539,8 @@ def main():
         # New vendor (owner/repo format) — add path
         token = get_auth_token(private=args.private)
         result = install_new_vendor(args.target, args.version, token, args.name,
-                                    deps_mode=args.deps)
+                                    deps_mode=args.deps,
+                                    private=args.private)
         output_result(result)
         results = [result]
     elif args.target in vendors:
