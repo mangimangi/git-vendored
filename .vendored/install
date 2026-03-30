@@ -389,8 +389,11 @@ def resolve_deps(deps, token, mode, installing_set=None):
             if not dep_repo:
                 print(f"::error::Dependency '{dep_name}' has no repo field")
                 sys.exit(1)
+            # Use private-repo token if the dep declares private: true
+            dep_private = dep_info.get("private", False)
+            dep_token = get_auth_token(private=dep_private) if dep_private else token
             print(f"  {dep_name}: not installed, auto-installing...")
-            result = install_new_vendor(dep_repo, "latest", token,
+            result = install_new_vendor(dep_repo, "latest", dep_token,
                                         name=dep_name,
                                         deps_mode="install",
                                         installing_set=installing_set)
@@ -551,7 +554,11 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
 
     try:
         run_env = env.copy()
-        run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
+        effective_token = token if token else run_env.get("GH_TOKEN", "")
+        run_env["GH_TOKEN"] = effective_token
+        # Propagate auth so vendor install.sh scripts that use GITHUB_TOKEN
+        # (e.g. for curl calls) can authenticate against private repos.
+        run_env["GITHUB_TOKEN"] = effective_token
         # v2 contract env vars
         run_env["VENDOR_REPO"] = repo
         run_env["VENDOR_REF"] = ref
