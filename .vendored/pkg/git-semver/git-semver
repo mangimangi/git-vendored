@@ -97,6 +97,9 @@ def parse_changelog_config(config, subdir=None):
         # Inherit from root — but always use subdir's default file path
         root_cl = config.get("changelog", True)
         if isinstance(root_cl, dict):
+            enabled = root_cl.get("enabled", True)
+            if not enabled:
+                return False, None, []
             return (
                 True,
                 default_file,
@@ -110,6 +113,11 @@ def parse_changelog_config(config, subdir=None):
 def _parse_changelog_value(cl, default_file="CHANGELOG.md"):
     """Parse a single changelog config value.
 
+    Accepts:
+        - Boolean true/false (backward compat, deprecated)
+        - None (treated as enabled with defaults)
+        - Object with optional keys: enabled, file, ignore_prefixes
+
     Returns:
         (enabled: bool, file: str | None, ignore_prefixes: list[str])
     """
@@ -118,6 +126,9 @@ def _parse_changelog_value(cl, default_file="CHANGELOG.md"):
     if cl is True or cl is None:
         return True, default_file, []
     # Object form
+    enabled = cl.get("enabled", True)
+    if not enabled:
+        return False, None, []
     return (
         True,
         cl.get("file", default_file),

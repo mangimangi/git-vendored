@@ -1,94 +1,38 @@
 #!/usr/bin/env python3
-"""Dogfood resolver — finds the vendor entry for the current repository.
+"""Dogfood resolver — derives the vendor name from GITHUB_REPOSITORY.
 
-Scans .vendored/configs/ for per-vendor JSON files first, falling back
-to monolithic .vendored/config.json.  Matches GITHUB_REPOSITORY against
-each vendor's repo field.  Outputs the vendor name in GITHUB_OUTPUT
-format (vendor=<name>).
+Convention: the vendor name is the repository name (the part after '/').
+For GITHUB_REPOSITORY=acme/my-tool, the vendor is "my-tool".
+
+Outputs the vendor name in GITHUB_OUTPUT format (vendor=<name>).
 
 Usage:
     python3 .vendored/pkg/git-dogfood/resolve
 
 Exit codes:
-    0 - Always (outputs vendor=<name> if found, empty otherwise)
+    0 - Always (outputs vendor=<name> if set, empty otherwise)
 """
 
-import json
 import os
 import sys
 
-CONFIGS_DIR = ".vendored/configs"
-CONFIG_PATH = ".vendored/config.json"
 
+def vendor_from_repo(github_repo):
+    """Derive vendor name from a GitHub repository slug.
 
-def _extract_vendor_registry(raw):
-    """Extract registry fields from a per-vendor config file.
-
-    If the file has a _vendor key, use that.  Otherwise treat all
-    top-level keys as registry fields (backwards compat).
+    Convention: vendor name = repo name (part after '/').
     """
-    if "_vendor" in raw:
-        return dict(raw["_vendor"])
-    return dict(raw)
-
-
-def load_vendor_config(config_path=CONFIG_PATH):
-    """Load the vendored config.
-
-    Scans .vendored/configs/ for per-vendor <vendor>.json files first.
-    Falls back to monolithic config.json if configs/ dir doesn't exist
-    or has no .json files.
-
-    Return format: {"vendors": {"name": {...}, ...}}
-    """
-    # Try per-vendor configs first
-    if os.path.isdir(CONFIGS_DIR):
-        json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
-        if json_files:
-            vendors = {}
-            for filename in sorted(json_files):
-                vendor_name = filename[:-5]  # strip .json
-                filepath = os.path.join(CONFIGS_DIR, filename)
-                with open(filepath) as f:
-                    raw = json.load(f)
-                vendors[vendor_name] = _extract_vendor_registry(raw)
-            return {"vendors": vendors}
-
-    # Fallback to monolithic config.json
-    if not os.path.isfile(config_path):
-        return None
-    with open(config_path) as f:
-        return json.load(f)
-
-
-def find_dogfood_vendor(config, github_repo):
-    """Find the vendor whose repo matches GITHUB_REPOSITORY.
-
-    Returns vendor key or None.
-    """
-    vendors = config.get("vendors", {})
-    for name, entry in vendors.items():
-        if entry.get("repo") == github_repo:
-            return name
-    return None
+    return github_repo.split("/")[-1]
 
 
 def main():
-    config = load_vendor_config()
-    if config is None:
-        print("No vendor config found", file=sys.stderr)
-        return
-
     github_repo = os.environ.get("GITHUB_REPOSITORY", "")
     if not github_repo:
         print("GITHUB_REPOSITORY not set", file=sys.stderr)
         return
 
-    vendor = find_dogfood_vendor(config, github_repo)
-    if vendor:
-        print(f"vendor={vendor}")
-    else:
-        print(f"No vendor matches {github_repo}", file=sys.stderr)
+    vendor = vendor_from_repo(github_repo)
+    print(f"vendor={vendor}")
 
 
 if __name__ == "__main__":
