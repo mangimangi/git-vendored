@@ -333,6 +333,27 @@ class TestGetProtectedFiles:
         # Config patterns should NOT be in the result
         assert ".tool/**" not in result
 
+    def test_protects_schema_file_when_present(self, tmp_repo):
+        """Schema file is protected when it exists alongside manifest."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.schema").write_text('{"vendor": "tool"}\n')
+
+        vendor_config = {"protected": [".tool/**"]}
+        result = check.get_protected_files("tool", vendor_config)
+        assert ".vendored/manifests/tool.schema" in result
+
+    def test_no_schema_protection_when_missing(self, tmp_repo):
+        """Schema file is not in protected list when it doesn't exist."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+
+        vendor_config = {"protected": [".tool/**"]}
+        result = check.get_protected_files("tool", vendor_config)
+        assert ".vendored/manifests/tool.schema" not in result
+
 
 # ── Tests: load_config ─────────────────────────────────────────────────────
 

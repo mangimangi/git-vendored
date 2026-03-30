@@ -12,6 +12,7 @@ git-vendored is consolidating per-vendor dotdirs (`.pearls/`, `.dogfood/`, `.sem
   pkg/<vendor>/            # vendor-installed files (replaces dotdirs at repo root)
   manifests/<vendor>.files # file manifest
   manifests/<vendor>.version
+  manifests/<vendor>.schema # config schema (if vendor ships templates/config.schema)
 ```
 
 ## VENDOR_INSTALL_DIR Contract

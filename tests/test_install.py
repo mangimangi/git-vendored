@@ -1669,6 +1669,142 @@ class TestDependencyResolution:
         assert "git-semver" in deps_file.read_text()
 
 
+# ── Tests: Schema Handling ────────────────────────────────────────────────
+
+class TestSchemaHandling:
+    @patch("vendored_install.subprocess.run")
+    def test_download_schema_returns_dict(self, mock_run):
+        """download_schema parses templates/config.schema from vendor repo."""
+        import base64 as b64
+        schema = {
+            "vendor": "my-tool",
+            "fields": {
+                "prefix": {"required": True, "type": "string", "description": "Command prefix"}
+            }
+        }
+        encoded = b64.b64encode(json.dumps(schema).encode()).decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=encoded + "\n", stderr="")
+
+        result = inst.download_schema("owner/tool", "v1.0.0", "token")
+        assert result == schema
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_schema_returns_none_when_missing(self, mock_run):
+        """download_schema returns None when no schema exists (404)."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
+
+        result = inst.download_schema("owner/tool", "v1.0.0", "token")
+        assert result is None
+
+    def test_write_schema(self, tmp_repo):
+        """write_schema creates .schema file with JSON content."""
+        schema = {
+            "vendor": "tool",
+            "fields": {
+                "prefix": {"required": True, "type": "string", "description": "Prefix"}
+            }
+        }
+        inst.write_schema("tool", schema)
+
+        schema_path = tmp_repo / ".vendored" / "manifests" / "tool.schema"
+        assert schema_path.is_file()
+        loaded = json.loads(schema_path.read_text())
+        assert loaded == schema
+
+    def test_write_schema_creates_manifests_dir(self, tmp_repo):
+        """write_schema creates manifests/ directory if needed."""
+        # Remove manifests dir if it exists
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        if manifests_dir.exists():
+            import shutil
+            shutil.rmtree(manifests_dir)
+
+        inst.write_schema("tool", {"vendor": "tool", "fields": {}})
+        assert (manifests_dir / "tool.schema").is_file()
+
+    def test_write_schema_overwrites_on_update(self, tmp_repo):
+        """write_schema overwrites existing schema (framework-managed)."""
+        old_schema = {"vendor": "tool", "fields": {"a": {"required": True, "type": "string"}}}
+        new_schema = {"vendor": "tool", "fields": {"b": {"required": False, "type": "number"}}}
+
+        inst.write_schema("tool", old_schema)
+        inst.write_schema("tool", new_schema)
+
+        schema_path = tmp_repo / ".vendored" / "manifests" / "tool.schema"
+        loaded = json.loads(schema_path.read_text())
+        assert loaded == new_schema
+
+    @patch("vendored_install.download_schema")
+    @patch("vendored_install.download_deps")
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.subprocess.run")
+    def test_schema_installed_on_update(self, mock_run, mock_download_install,
+                                         mock_download_deps, mock_download_schema,
+                                         tmp_repo):
+        """install_existing_vendor downloads and writes schema."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        mock_download_install.return_value = [".tool/script.sh"]
+        mock_download_deps.return_value = None
+
+        schema = {"vendor": "tool", "fields": {"prefix": {"required": True, "type": "string"}}}
+        mock_download_schema.return_value = schema
+
+        # Create the file so validate_manifest passes
+        tool_dir = tmp_repo / ".tool"
+        tool_dir.mkdir(parents=True)
+        (tool_dir / "script.sh").write_text("#!/bin/bash")
+
+        result = inst.install_existing_vendor(
+            "tool", SAMPLE_VENDOR, "2.0.0", force=True
+        )
+
+        assert result["changed"] is True
+        schema_path = manifests_dir / "tool.schema"
+        assert schema_path.is_file()
+        loaded = json.loads(schema_path.read_text())
+        assert loaded == schema
+
+    @patch("vendored_install.download_schema")
+    @patch("vendored_install.download_deps")
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.subprocess.run")
+    def test_no_schema_no_file(self, mock_run, mock_download_install,
+                                mock_download_deps, mock_download_schema,
+                                tmp_repo):
+        """install_existing_vendor with no schema skips writing .schema file."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        mock_download_install.return_value = [".tool/script.sh"]
+        mock_download_deps.return_value = None
+        mock_download_schema.return_value = None
+
+        tool_dir = tmp_path = tmp_repo / ".tool"
+        tool_dir.mkdir(parents=True)
+        (tool_dir / "script.sh").write_text("#!/bin/bash")
+
+        inst.install_existing_vendor(
+            "tool", SAMPLE_VENDOR, "2.0.0", force=True
+        )
+
+        schema_path = manifests_dir / "tool.schema"
+        assert not schema_path.exists()
+
+
 # ── Tests: Auto-install mode and cycle detection ─────────────────────────
 
 class TestAutoInstallAndCycleDetection:

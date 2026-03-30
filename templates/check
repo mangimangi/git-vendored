@@ -169,6 +169,9 @@ def get_protected_files(vendor_name, vendor_config):
         protected = list(manifest_files)
         protected.append(os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"))
         protected.append(os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"))
+        schema_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.schema")
+        if os.path.isfile(schema_path):
+            protected.append(schema_path)
         return protected
     # v1 fallback: glob patterns from config
     return vendor_config.get("protected", [])

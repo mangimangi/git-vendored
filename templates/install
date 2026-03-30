@@ -331,6 +331,35 @@ def download_deps(repo, ref, token):
         return None
 
 
+def download_schema(repo, ref, token):
+    """Download templates/config.schema from a vendor repo at the given ref.
+
+    Returns parsed dict or None if no schema exists (404 is expected).
+    """
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/templates/config.schema?ref={ref}",
+         "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        content = base64.b64decode(result.stdout.strip()).decode()
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def write_schema(vendor_name, schema):
+    """Write a vendor's config schema to .vendored/manifests/<vendor>.schema."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    schema_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.schema")
+    with open(schema_path, "w") as f:
+        json.dump(schema, f, indent=2)
+        f.write("\n")
+
+
 def check_deps(deps):
     """Check which declared deps are satisfied.
 
@@ -778,6 +807,11 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     if deps:
         write_deps(new_key, list(deps.keys()))
 
+    # Download and install schema if vendor provides one
+    schema = download_schema(repo, ref, token)
+    if schema:
+        write_schema(new_key, schema)
+
     # Run post-install hook
     install_dir = f".vendored/pkg/{new_key}" if not new_entry.get("dogfood") else None
     run_post_install_hook(new_key, install_dir, resolved_version)
@@ -851,6 +885,11 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     # Cache resolved deps
     if deps:
         write_deps(vendor_name, list(deps.keys()))
+
+    # Download and install schema if vendor provides one
+    schema = download_schema(repo, ref, token)
+    if schema:
+        write_schema(vendor_name, schema)
 
     # Run post-install hook
     is_dogfood = vendor_config.get("dogfood", False)

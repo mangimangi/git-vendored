@@ -206,6 +206,7 @@ This prevents accidental edits to vendor-managed files while allowing the automa
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
+    my-tool.schema               # config schema (if vendor provides one)
     pearls.files
     pearls.version
   hooks/
