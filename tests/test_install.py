@@ -156,27 +156,36 @@ class TestSaveConfig:
         assert "tool" in loaded["vendors"]
 
     def test_saves_per_vendor_configs(self, tmp_repo):
-        """save_config writes individual files with _vendor key when configs/ in use."""
+        """save_config writes individual config files and .registry files."""
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
         (configs_dir / "existing.json").write_text(json.dumps({"_vendor": EXISTING_VENDOR}))
         config = {"vendors": {"tool": SAMPLE_VENDOR, "existing": EXISTING_VENDOR}}
         inst.save_config(config)
         assert (configs_dir / "tool.json").is_file()
+        # Config file should not have _vendor (registry is in .registry)
         loaded = json.loads((configs_dir / "tool.json").read_text())
-        assert "_vendor" in loaded
-        assert loaded["_vendor"]["repo"] == "owner/tool"
+        assert "_vendor" not in loaded
+        # Registry should be in .registry file
+        registry_path = tmp_repo / ".vendored" / "manifests" / "tool.registry"
+        assert registry_path.is_file()
+        registry = json.loads(registry_path.read_text())
+        assert registry["repo"] == "owner/tool"
 
     def test_save_vendor_config(self, tmp_repo):
-        """save_vendor_config writes config with _vendor key."""
+        """save_vendor_config writes config and .registry file."""
         inst.save_vendor_config("tool", SAMPLE_VENDOR)
         filepath = tmp_repo / ".vendored" / "configs" / "tool.json"
         assert filepath.is_file()
         loaded = json.loads(filepath.read_text())
-        assert "_vendor" in loaded
-        assert loaded["_vendor"]["repo"] == "owner/tool"
-        # Registry fields should NOT be at top level
+        # Config should not have _vendor or registry fields at top level
+        assert "_vendor" not in loaded
         assert "repo" not in loaded
+        # Registry should be in .registry file
+        registry_path = tmp_repo / ".vendored" / "manifests" / "tool.registry"
+        assert registry_path.is_file()
+        registry = json.loads(registry_path.read_text())
+        assert registry["repo"] == "owner/tool"
 
     def test_save_vendor_config_preserves_project_config(self, tmp_repo):
         """save_vendor_config preserves existing top-level project config keys."""
@@ -188,9 +197,12 @@ class TestSaveConfig:
         new_registry = dict(SAMPLE_VENDOR, automerge=True)
         inst.save_vendor_config("tool", new_registry)
         loaded = json.loads((configs_dir / "tool.json").read_text())
-        assert loaded["_vendor"]["automerge"] is True
+        assert "_vendor" not in loaded
         assert loaded["prefix"] == "gv"
         assert loaded["docs"] == ["README.md"]
+        # Registry should be in .registry file
+        registry = json.loads((tmp_repo / ".vendored" / "manifests" / "tool.registry").read_text())
+        assert registry["automerge"] is True
 
     def test_delete_vendor_config(self, tmp_repo):
         """delete_vendor_config removes the vendor's config file."""
@@ -687,10 +699,15 @@ class TestInstallNewVendor:
         assert result["vendor"] == "new-tool"
         assert result["changed"] is True
 
-        # New entry should be migrated to per-vendor config with _vendor key
+        # New entry should be migrated to per-vendor config (no _vendor) + .registry
         assert (configs_dir / "new-tool.json").is_file()
         migrated = json.loads((configs_dir / "new-tool.json").read_text())
-        assert migrated["_vendor"]["repo"] == "owner/new-tool"
+        assert "_vendor" not in migrated
+        # Registry should be in .registry file
+        registry_path = tmp_repo / ".vendored" / "manifests" / "new-tool.registry"
+        assert registry_path.is_file()
+        registry = json.loads(registry_path.read_text())
+        assert registry["repo"] == "owner/new-tool"
 
         # config.json should be cleaned up
         raw = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
@@ -1184,11 +1201,96 @@ class TestCreatePullRequest:
         assert env.get("GH_TOKEN") == "repo-token"
 
 
+# ── Tests: registry files ─────────────────────────────────────────────────
+
+class TestRegistryFiles:
+    def test_write_and_read_registry(self, tmp_repo):
+        """write_registry creates .registry file, read_registry reads it back."""
+        registry = {"repo": "owner/tool", "install_branch": "chore/install-tool"}
+        inst.write_registry("tool", registry)
+
+        result = inst.read_registry("tool")
+        assert result == registry
+
+        # Verify file location
+        registry_path = tmp_repo / ".vendored" / "manifests" / "tool.registry"
+        assert registry_path.is_file()
+
+    def test_read_registry_returns_none_when_missing(self, tmp_repo):
+        """read_registry returns None when no .registry file exists."""
+        result = inst.read_registry("nonexistent")
+        assert result is None
+
+    def test_load_config_prefers_registry_file(self, tmp_repo):
+        """load_config reads from .registry file over _vendor in config."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        # Config has old _vendor data
+        old_config = {"_vendor": {"repo": "owner/old-repo", "install_branch": "old"}}
+        (configs_dir / "tool.json").write_text(json.dumps(old_config))
+
+        # Registry has updated data
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        registry = {"repo": "owner/new-repo", "install_branch": "new"}
+        (manifests_dir / "tool.registry").write_text(json.dumps(registry))
+
+        config = inst.load_config()
+        assert config["vendors"]["tool"]["repo"] == "owner/new-repo"
+
+    def test_load_config_falls_back_to_vendor_key(self, tmp_repo):
+        """load_config falls back to _vendor when no .registry file exists."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        old_config = {"_vendor": {"repo": "owner/tool", "install_branch": "chore/install-tool"}}
+        (configs_dir / "tool.json").write_text(json.dumps(old_config))
+
+        config = inst.load_config()
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+
+    def test_load_config_falls_back_to_flat_keys(self, tmp_repo):
+        """load_config falls back to flat keys when no .registry or _vendor."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        flat_config = {"repo": "owner/tool", "install_branch": "chore/install-tool"}
+        (configs_dir / "tool.json").write_text(json.dumps(flat_config))
+
+        config = inst.load_config()
+        assert config["vendors"]["tool"]["repo"] == "owner/tool"
+
+    def test_save_vendor_config_writes_registry(self, tmp_repo):
+        """save_vendor_config writes .registry file alongside config."""
+        inst.save_vendor_config("tool", SAMPLE_VENDOR)
+
+        registry_path = tmp_repo / ".vendored" / "manifests" / "tool.registry"
+        assert registry_path.is_file()
+        registry = json.loads(registry_path.read_text())
+        assert registry["repo"] == "owner/tool"
+
+    def test_save_vendor_config_strips_vendor_from_config(self, tmp_repo):
+        """save_vendor_config does not write _vendor to config file."""
+        inst.save_vendor_config("tool", SAMPLE_VENDOR)
+
+        config_path = tmp_repo / ".vendored" / "configs" / "tool.json"
+        loaded = json.loads(config_path.read_text())
+        assert "_vendor" not in loaded
+
+    def test_registry_overwrite_on_update(self, tmp_repo):
+        """write_registry overwrites existing .registry file."""
+        old = {"repo": "owner/old", "install_branch": "old"}
+        new = {"repo": "owner/new", "install_branch": "new"}
+        inst.write_registry("tool", old)
+        inst.write_registry("tool", new)
+
+        result = inst.read_registry("tool")
+        assert result["repo"] == "owner/new"
+
+
 # ── Tests: config migration ───────────────────────────────────────────────
 
 class TestMigrateConfig:
     def test_splits_vendors_into_configs_dir(self, tmp_repo, make_config):
-        """migrate_config creates individual files in configs/ with _vendor key."""
+        """migrate_config creates individual config files and .registry files."""
         make_config({"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}})
         raw = {"vendors": {"tool": SAMPLE_VENDOR, "other": EXISTING_VENDOR}}
         inst.migrate_config(raw)
@@ -1197,9 +1299,14 @@ class TestMigrateConfig:
         assert (configs_dir / "tool.json").is_file()
         assert (configs_dir / "other.json").is_file()
 
+        # Config should not have _vendor (registry is in .registry)
         tool_config = json.loads((configs_dir / "tool.json").read_text())
-        assert "_vendor" in tool_config
-        assert tool_config["_vendor"]["repo"] == "owner/tool"
+        assert "_vendor" not in tool_config
+        # Registry should be in .registry file
+        registry_path = tmp_repo / ".vendored" / "manifests" / "tool.registry"
+        assert registry_path.is_file()
+        registry = json.loads(registry_path.read_text())
+        assert registry["repo"] == "owner/tool"
 
     def test_removes_vendors_key_from_config(self, tmp_repo, make_config):
         """migrate_config removes vendors key from config.json."""
@@ -1242,15 +1349,16 @@ class TestMigrateConfig:
         assert inst._should_migrate_config() is False
 
     def test_preserves_protected_field(self, tmp_repo, make_config):
-        """Protected field is preserved under _vendor key for v1 fallback."""
+        """Protected field is preserved in .registry file."""
         vendor = dict(SAMPLE_VENDOR, protected=[".tool/**"])
         make_config({"vendors": {"tool": vendor}})
         raw = {"vendors": {"tool": vendor}}
         inst.migrate_config(raw)
 
-        configs_dir = tmp_repo / ".vendored" / "configs"
-        tool_config = json.loads((configs_dir / "tool.json").read_text())
-        assert tool_config["_vendor"]["protected"] == [".tool/**"]
+        registry_path = tmp_repo / ".vendored" / "manifests" / "tool.registry"
+        assert registry_path.is_file()
+        registry = json.loads(registry_path.read_text())
+        assert registry["protected"] == [".tool/**"]
 
     def test_logs_migration(self, tmp_repo, make_config, capsys):
         """Migration logs to stderr for visibility."""
@@ -1667,6 +1775,142 @@ class TestDependencyResolution:
         deps_file = manifests_dir / "tool.deps"
         assert deps_file.is_file()
         assert "git-semver" in deps_file.read_text()
+
+
+# ── Tests: Schema Handling ────────────────────────────────────────────────
+
+class TestSchemaHandling:
+    @patch("vendored_install.subprocess.run")
+    def test_download_schema_returns_dict(self, mock_run):
+        """download_schema parses templates/config.schema from vendor repo."""
+        import base64 as b64
+        schema = {
+            "vendor": "my-tool",
+            "fields": {
+                "prefix": {"required": True, "type": "string", "description": "Command prefix"}
+            }
+        }
+        encoded = b64.b64encode(json.dumps(schema).encode()).decode()
+        mock_run.return_value = MagicMock(returncode=0, stdout=encoded + "\n", stderr="")
+
+        result = inst.download_schema("owner/tool", "v1.0.0", "token")
+        assert result == schema
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_schema_returns_none_when_missing(self, mock_run):
+        """download_schema returns None when no schema exists (404)."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
+
+        result = inst.download_schema("owner/tool", "v1.0.0", "token")
+        assert result is None
+
+    def test_write_schema(self, tmp_repo):
+        """write_schema creates .schema file with JSON content."""
+        schema = {
+            "vendor": "tool",
+            "fields": {
+                "prefix": {"required": True, "type": "string", "description": "Prefix"}
+            }
+        }
+        inst.write_schema("tool", schema)
+
+        schema_path = tmp_repo / ".vendored" / "manifests" / "tool.schema"
+        assert schema_path.is_file()
+        loaded = json.loads(schema_path.read_text())
+        assert loaded == schema
+
+    def test_write_schema_creates_manifests_dir(self, tmp_repo):
+        """write_schema creates manifests/ directory if needed."""
+        # Remove manifests dir if it exists
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        if manifests_dir.exists():
+            import shutil
+            shutil.rmtree(manifests_dir)
+
+        inst.write_schema("tool", {"vendor": "tool", "fields": {}})
+        assert (manifests_dir / "tool.schema").is_file()
+
+    def test_write_schema_overwrites_on_update(self, tmp_repo):
+        """write_schema overwrites existing schema (framework-managed)."""
+        old_schema = {"vendor": "tool", "fields": {"a": {"required": True, "type": "string"}}}
+        new_schema = {"vendor": "tool", "fields": {"b": {"required": False, "type": "number"}}}
+
+        inst.write_schema("tool", old_schema)
+        inst.write_schema("tool", new_schema)
+
+        schema_path = tmp_repo / ".vendored" / "manifests" / "tool.schema"
+        loaded = json.loads(schema_path.read_text())
+        assert loaded == new_schema
+
+    @patch("vendored_install.download_schema")
+    @patch("vendored_install.download_deps")
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.subprocess.run")
+    def test_schema_installed_on_update(self, mock_run, mock_download_install,
+                                         mock_download_deps, mock_download_schema,
+                                         tmp_repo):
+        """install_existing_vendor downloads and writes schema."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        mock_download_install.return_value = [".tool/script.sh"]
+        mock_download_deps.return_value = None
+
+        schema = {"vendor": "tool", "fields": {"prefix": {"required": True, "type": "string"}}}
+        mock_download_schema.return_value = schema
+
+        # Create the file so validate_manifest passes
+        tool_dir = tmp_repo / ".tool"
+        tool_dir.mkdir(parents=True)
+        (tool_dir / "script.sh").write_text("#!/bin/bash")
+
+        result = inst.install_existing_vendor(
+            "tool", SAMPLE_VENDOR, "2.0.0", force=True
+        )
+
+        assert result["changed"] is True
+        schema_path = manifests_dir / "tool.schema"
+        assert schema_path.is_file()
+        loaded = json.loads(schema_path.read_text())
+        assert loaded == schema
+
+    @patch("vendored_install.download_schema")
+    @patch("vendored_install.download_deps")
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.subprocess.run")
+    def test_no_schema_no_file(self, mock_run, mock_download_install,
+                                mock_download_deps, mock_download_schema,
+                                tmp_repo):
+        """install_existing_vendor with no schema skips writing .schema file."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        mock_download_install.return_value = [".tool/script.sh"]
+        mock_download_deps.return_value = None
+        mock_download_schema.return_value = None
+
+        tool_dir = tmp_path = tmp_repo / ".tool"
+        tool_dir.mkdir(parents=True)
+        (tool_dir / "script.sh").write_text("#!/bin/bash")
+
+        inst.install_existing_vendor(
+            "tool", SAMPLE_VENDOR, "2.0.0", force=True
+        )
+
+        schema_path = manifests_dir / "tool.schema"
+        assert not schema_path.exists()
 
 
 # ── Tests: Auto-install mode and cycle detection ─────────────────────────

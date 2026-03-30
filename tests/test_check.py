@@ -333,6 +333,27 @@ class TestGetProtectedFiles:
         # Config patterns should NOT be in the result
         assert ".tool/**" not in result
 
+    def test_protects_schema_file_when_present(self, tmp_repo):
+        """Schema file is protected when it exists alongside manifest."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.schema").write_text('{"vendor": "tool"}\n')
+
+        vendor_config = {"protected": [".tool/**"]}
+        result = check.get_protected_files("tool", vendor_config)
+        assert ".vendored/manifests/tool.schema" in result
+
+    def test_no_schema_protection_when_missing(self, tmp_repo):
+        """Schema file is not in protected list when it doesn't exist."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+
+        vendor_config = {"protected": [".tool/**"]}
+        result = check.get_protected_files("tool", vendor_config)
+        assert ".vendored/manifests/tool.schema" not in result
+
 
 # ── Tests: load_config ─────────────────────────────────────────────────────
 
@@ -370,6 +391,33 @@ class TestLoadConfig:
         assert config["vendors"]["git-vendored"]["repo"] == "mangimangi/git-vendored"
         # Project config should not leak into vendor registry
         assert "project_setting" not in config["vendors"]["git-vendored"]
+
+    def test_prefers_registry_file_over_vendor_key(self, tmp_repo):
+        """load_config() reads from .registry file when available."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        gv_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        vendor_file = {"_vendor": dict(gv_config, repo="old/repo")}
+        (configs_dir / "git-vendored.json").write_text(json.dumps(vendor_file))
+
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        registry = dict(gv_config, repo="new/repo")
+        (manifests_dir / "git-vendored.registry").write_text(json.dumps(registry))
+
+        config = check.load_config()
+        assert config["vendors"]["git-vendored"]["repo"] == "new/repo"
+
+    def test_falls_back_to_vendor_key_without_registry(self, tmp_repo):
+        """load_config() falls back to _vendor when no .registry file."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        gv_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        vendor_file = {"_vendor": gv_config}
+        (configs_dir / "git-vendored.json").write_text(json.dumps(vendor_file))
+
+        config = check.load_config()
+        assert config["vendors"]["git-vendored"]["repo"] == "mangimangi/git-vendored"
 
     def test_empty_configs_dir_falls_back(self, tmp_repo, make_config):
         """Empty configs/ dir falls back to monolithic config.json."""

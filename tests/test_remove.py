@@ -126,6 +126,36 @@ class TestGetFilesToRemove:
         assert ".vendored/manifests/tool.files" in files
         assert ".vendored/manifests/tool.version" in files
 
+    def test_includes_schema_file(self, tmp_repo):
+        """get_files_to_remove includes .schema file when it exists."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+        (manifests_dir / "tool.schema").write_text('{"vendor": "tool"}\n')
+
+        files = rem.get_files_to_remove("tool")
+        assert ".vendored/manifests/tool.schema" in files
+
+    def test_skips_missing_schema_file(self, tmp_repo):
+        """get_files_to_remove does not include .schema when it doesn't exist."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+
+        files = rem.get_files_to_remove("tool")
+        assert ".vendored/manifests/tool.schema" not in files
+
+    def test_includes_registry_file(self, tmp_repo):
+        """get_files_to_remove includes .registry file when it exists."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.registry").write_text('{"repo": "owner/tool"}\n')
+
+        files = rem.get_files_to_remove("tool")
+        assert ".vendored/manifests/tool.registry" in files
+
     def test_error_when_no_manifest(self, tmp_repo):
         """Without a manifest, get_files_to_remove should exit with error."""
         with pytest.raises(SystemExit) as exc_info:

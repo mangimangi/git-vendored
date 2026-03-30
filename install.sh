@@ -71,6 +71,11 @@ fetch_file "templates/feedback" ".vendored/feedback"
 chmod +x .vendored/feedback
 INSTALLED_FILES+=(".vendored/feedback")
 
+echo "Downloading .vendored/audit..."
+fetch_file "templates/audit" ".vendored/audit"
+chmod +x .vendored/audit
+INSTALLED_FILES+=(".vendored/audit")
+
 echo "Downloading .vendored/lib/vendor-helpers.sh..."
 fetch_file "templates/lib/vendor-helpers.sh" ".vendored/lib/vendor-helpers.sh"
 chmod +x .vendored/lib/vendor-helpers.sh

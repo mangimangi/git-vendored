@@ -25,6 +25,7 @@ This creates:
 - `.vendored/install` — add new vendors or update existing ones
 - `.vendored/check` — enforce file protection rules
 - `.vendored/remove` — cleanly uninstall a vendor
+- `.vendored/audit` — validate configs against vendor schemas
 - `.vendored/config.json` — framework-level config (legacy vendor registry)
 - `.vendored/configs/` — per-vendor config files (`<vendor>.json`)
 - `.vendored/pkg/` — vendor-installed files (`<vendor>/`)
@@ -193,6 +194,7 @@ This prevents accidental edits to vendor-managed files while allowing the automa
   install                        # framework command: add/update vendors
   check                          # framework command: file protection checks
   remove                         # framework command: uninstall vendors
+  audit                          # framework command: validate configs against schemas
   config.json                    # framework-level config (legacy)
   configs/
     my-tool.json                 # per-vendor config
@@ -206,6 +208,8 @@ This prevents accidental edits to vendor-managed files while allowing the automa
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
+    my-tool.schema               # config schema (if vendor provides one)
+    my-tool.registry             # vendor registry metadata (repo, install_branch, etc.)
     pearls.files
     pearls.version
   hooks/
@@ -215,6 +219,37 @@ This prevents accidental edits to vendor-managed files while allowing the automa
 Vendor data files (e.g. `.pearls/issues.jsonl`, `.semver/.version`) remain in their original `.<vendor>/` directories — these are vendor-owned, not framework-managed. After migration, dot-directories become data-only zones. See `docs/vendor-install-dir-guide.md` for details.
 
 Manifest `.files` are plain text, one-path-per-line. Easy to `cat`, `diff`, `grep`.
+
+## Config Schemas
+
+Vendor repos can ship a `templates/config.schema` file to declare the expected fields in their consumer config. During install, the framework copies it to `.vendored/manifests/<vendor>.schema`.
+
+### Schema Format
+
+```json
+{
+  "vendor": "<vendor-name>",
+  "fields": {
+    "field_name": {
+      "required": true,
+      "type": "string",
+      "description": "Human-readable description"
+    }
+  }
+}
+```
+
+Top-level fields only. Types: `string`, `number`, `boolean`, `array`, `object`.
+
+### Audit Command
+
+Run `.vendored/audit` to validate all consumer configs against installed schemas:
+
+```bash
+python3 .vendored/audit
+```
+
+Reports required-missing fields as errors (non-zero exit), unknown/misplaced fields as warnings (zero exit).
 
 ## Migration
 

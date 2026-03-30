@@ -43,12 +43,29 @@ REGISTRY_FIELDS = {"repo", "install_branch", "protected", "allowed",
 
 # ── Config helpers ────────────────────────────────────────────────────────
 
-def _extract_vendor_registry(raw):
+def read_registry(vendor_name):
+    """Read vendor registry from .vendored/manifests/<vendor>.registry.
+
+    Returns parsed dict or None if no .registry file exists.
+    """
+    registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+    if not os.path.isfile(registry_path):
+        return None
+    with open(registry_path) as f:
+        return json.load(f)
+
+
+def _extract_vendor_registry(raw, vendor_name=None):
     """Extract registry fields from a per-vendor config file's contents.
 
-    If the file has a _vendor key, use that. Otherwise treat all top-level
-    keys as registry fields (backwards compat with pre-_vendor configs).
+    Prefers .registry file in manifests/ (new path). Falls back to _vendor
+    key in config, then treats all top-level keys as registry fields
+    (backwards compat with pre-_vendor configs).
     """
+    if vendor_name:
+        registry = read_registry(vendor_name)
+        if registry is not None:
+            return registry
     if "_vendor" in raw:
         return dict(raw["_vendor"])
     return dict(raw)
@@ -63,8 +80,8 @@ def load_config(config_path=CONFIG_PATH):
 
     Return format: {"vendors": {"name": {...}, ...}}
 
-    When reading per-vendor configs with a _vendor key, extracts registry
-    fields from _vendor so callers see the same flat shape.
+    Registry fields are read from .vendored/manifests/<vendor>.registry
+    when available, falling back to _vendor key in the config file.
     """
     # Try per-vendor configs first
     if os.path.isdir(CONFIGS_DIR):
@@ -76,7 +93,7 @@ def load_config(config_path=CONFIG_PATH):
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
                     raw = json.load(f)
-                vendors[vendor_name] = _extract_vendor_registry(raw)
+                vendors[vendor_name] = _extract_vendor_registry(raw, vendor_name)
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json
@@ -87,11 +104,22 @@ def load_config(config_path=CONFIG_PATH):
         return json.load(f)
 
 
-def save_vendor_config(vendor_name, vendor_config):
-    """Write a single vendor's config to configs/<vendor>.json.
+def write_registry(vendor_name, registry):
+    """Write vendor registry metadata to .vendored/manifests/<vendor>.registry."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+    with open(registry_path, "w") as f:
+        json.dump(registry, f, indent=2)
+        f.write("\n")
 
-    Nests registry fields under _vendor key. Preserves any existing
-    top-level project config keys that aren't registry fields.
+
+def save_vendor_config(vendor_name, vendor_config):
+    """Write a single vendor's config to configs/<vendor>.json and registry.
+
+    Registry fields are written to .vendored/manifests/<vendor>.registry.
+    The config file retains only project config (no _vendor key).
+    For backwards compatibility, _vendor is also kept in the config file
+    until all consumers have migrated.
     """
     os.makedirs(CONFIGS_DIR, exist_ok=True)
     filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
@@ -105,13 +133,17 @@ def save_vendor_config(vendor_name, vendor_config):
     # Build registry dict from the vendor_config
     registry = {k: v for k, v in vendor_config.items() if k in REGISTRY_FIELDS}
 
+    # Write registry to dedicated .registry file
+    write_registry(vendor_name, registry)
+
     # Start with existing top-level keys (project config), excluding _vendor
     merged = {k: v for k, v in existing.items() if k != "_vendor"}
     # Remove any registry fields that leaked to top level (from flat configs)
     for key in REGISTRY_FIELDS:
         merged.pop(key, None)
-    # Set _vendor with the registry fields
-    merged["_vendor"] = registry
+
+    # Strip _vendor from config (registry now lives in .registry file)
+    # Config file becomes purely user-owned project config
 
     with open(filepath, "w") as f:
         json.dump(merged, f, indent=2)
@@ -329,6 +361,35 @@ def download_deps(repo, ref, token):
         return json.loads(content)
     except Exception:
         return None
+
+
+def download_schema(repo, ref, token):
+    """Download templates/config.schema from a vendor repo at the given ref.
+
+    Returns parsed dict or None if no schema exists (404 is expected).
+    """
+    env = _gh_env(token)
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/templates/config.schema?ref={ref}",
+         "--jq", ".content"],
+        capture_output=True, text=True, env=env
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        content = base64.b64decode(result.stdout.strip()).decode()
+        return json.loads(content)
+    except Exception:
+        return None
+
+
+def write_schema(vendor_name, schema):
+    """Write a vendor's config schema to .vendored/manifests/<vendor>.schema."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    schema_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.schema")
+    with open(schema_path, "w") as f:
+        json.dump(schema, f, indent=2)
+        f.write("\n")
 
 
 def check_deps(deps):
@@ -778,6 +839,11 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     if deps:
         write_deps(new_key, list(deps.keys()))
 
+    # Download and install schema if vendor provides one
+    schema = download_schema(repo, ref, token)
+    if schema:
+        write_schema(new_key, schema)
+
     # Run post-install hook
     install_dir = f".vendored/pkg/{new_key}" if not new_entry.get("dogfood") else None
     run_post_install_hook(new_key, install_dir, resolved_version)
@@ -851,6 +917,11 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     # Cache resolved deps
     if deps:
         write_deps(vendor_name, list(deps.keys()))
+
+    # Download and install schema if vendor provides one
+    schema = download_schema(repo, ref, token)
+    if schema:
+        write_schema(vendor_name, schema)
 
     # Run post-install hook
     is_dogfood = vendor_config.get("dogfood", False)
@@ -1068,11 +1139,13 @@ def migrate_config(raw_config):
     os.makedirs(CONFIGS_DIR, exist_ok=True)
     for vendor_name, vendor_config in vendors.items():
         filepath = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
-        # Nest registry fields under _vendor key
+        # Extract registry fields and write to .registry file
         registry = {k: v for k, v in vendor_config.items() if k in REGISTRY_FIELDS}
-        file_data = {"_vendor": registry}
+        write_registry(vendor_name, registry)
+        # Config file gets only non-registry fields (empty for pure-registry configs)
+        project_keys = {k: v for k, v in vendor_config.items() if k not in REGISTRY_FIELDS}
         with open(filepath, "w") as f:
-            json.dump(file_data, f, indent=2)
+            json.dump(project_keys, f, indent=2)
             f.write("\n")
         print(f"  Migrated config: {vendor_name} -> {filepath}", file=sys.stderr)
 

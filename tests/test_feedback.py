@@ -96,6 +96,23 @@ class TestLoadVendors:
         vendors = fb.load_vendors()
         assert vendors == {}
 
+    def test_prefers_registry_file(self, tmp_repo):
+        """load_vendors reads from .registry file when available."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True, exist_ok=True)
+        (configs_dir / "tool.json").write_text(json.dumps(
+            {"_vendor": {"repo": "owner/old"}}
+        ))
+
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        (manifests_dir / "tool.registry").write_text(json.dumps(
+            {"repo": "owner/new"}
+        ))
+
+        vendors = fb.load_vendors()
+        assert vendors["tool"]["repo"] == "owner/new"
+
 
 class TestGetInstalledVendors:
     def test_finds_installed(self, make_vendor):
