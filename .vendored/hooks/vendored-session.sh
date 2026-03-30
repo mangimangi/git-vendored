@@ -84,5 +84,6 @@ while IFS= read -r hook_path; do
     VENDOR_NAME="$vendor_name" \
     VENDOR_PKG_DIR="$vendor_dir" \
     PROJECT_DIR="$PROJECT_DIR" \
+    MADP_MODE="${MADP_MODE:-}" \
     bash "$hook_path"
 done <<< "$HOOK_PATHS"
