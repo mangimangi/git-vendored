@@ -1,0 +1,29 @@
+{
+  "fields": {
+    "version_file": {
+      "type": "string",
+      "required": false,
+      "description": "Path to file storing the current version string (default: VERSION)"
+    },
+    "files": {
+      "type": "array",
+      "required": false,
+      "description": "Glob patterns for files whose changes trigger automatic patch bumps on merge"
+    },
+    "updates": {
+      "type": "object",
+      "required": false,
+      "description": "File path to update action mapping for version bumps"
+    },
+    "changelog": {
+      "type": "object",
+      "required": false,
+      "description": "Changelog generation config (enabled, file, ignore_prefixes)"
+    },
+    "install": {
+      "type": "object",
+      "required": false,
+      "description": "Installed workflow behavior (on_merge, automerge)"
+    }
+  }
+}
