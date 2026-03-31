@@ -165,7 +165,11 @@ def handle_push_bump(automerge):
         create_pr(branch, commit_title, "Automated version bump")
         return
 
-    try_push_or_pr(commit_title)
+    pushed = try_push_or_pr(commit_title)
+    if pushed:
+        # Unprotected branch — publish job won't fire, so tag+release here
+        git_semver("tag", "--push")
+        create_releases()
 
 
 def handle_dispatch_bump(automerge):
@@ -200,7 +204,11 @@ def handle_dispatch_bump(automerge):
         )
         return
 
-    try_push_or_pr(commit_title)
+    pushed = try_push_or_pr(commit_title)
+    if pushed:
+        # Unprotected branch — publish job won't fire, so tag+release here
+        git_semver("tag", "--push")
+        create_releases()
 
 
 def cmd_bump():
