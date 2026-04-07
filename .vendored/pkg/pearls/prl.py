@@ -6,7 +6,8 @@ Issues stored in .pearls/issues.jsonl (JSONL, no database, git-versioned).
 
 Commands:
     prl create --title="..." [--type=task] [--priority=2] [--parent=<id>]
-    prl list [--status=open] [--type=task] [--implementer=...]
+    prl edit <id> [--title=...] [--body=...] [--priority=N] [--type=...]
+    prl list [--status=open] [--type=task] [--implementer=...] [--parent=<id>]
     prl show <id>
     prl start <id>
     prl estimate <id> -e <model> -m <model> -i <tokens> -o <tokens>
@@ -47,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict, NotRequired, cast
 
-VERSION = "0.2.36"
+VERSION = "0.2.39"
 
 # ── Type aliases ─────────────────────────────────────────────────────────────
 
@@ -126,12 +127,8 @@ class EpicEntry(TypedDict):
 class Config(TypedDict):
     prefix: str
     epics: NotRequired[list[str | EpicEntry]]
-    description: NotRequired[str]
-    docs: NotRequired[list[str]]
-    models: NotRequired[dict[str, str]]
     install: NotRequired[dict[str, object]]
     eval: NotRequired[dict[str, Any]]
-    prompts: NotRequired[dict[str, Any]]
     sessions: NotRequired[dict[str, Any]]
 
 VALID_STATUSES = ["open", "in_progress", "implemented", "closed"]
@@ -231,8 +228,7 @@ def load_prefix() -> str:
     except json.JSONDecodeError as e:
         print(f"Error: {config_path} is not valid JSON: {e}", file=sys.stderr)
         sys.exit(1)
-    config = {k: v for k, v in raw.items() if k != "_vendor"}
-    prefix: str | None = config.get("prefix")
+    prefix: str | None = raw.get("prefix")
     if not prefix:
         print(
             f'Error: "prefix" key missing or empty in {config_path}.',
@@ -247,14 +243,10 @@ def load_config() -> Config:
 
     Returns Config with keys:
         - prefix (str, required): Issue ID prefix
-        - description (str, optional): Project description
-        - docs (list[str], optional): Paths to reference docs
         - epics (list[str | EpicEntry], optional): First-class epic slugs or
           objects with slug/alias/title/body (e.g. ["1shots", {"slug": "enhncmnts", "title": "Enhancements"}])
-        - models (dict[str, str], optional): Default model overrides
         - install (dict[str, object], optional): Install behavior overrides
         - eval (dict, optional): Eval config (e.g. {"threshold": 80})
-        - prompts (dict, optional): Prompt body overrides and template vars
         - sessions (dict, optional): Session config per mode (model, max_turns)
     """
     config_path = _config_path()
@@ -271,15 +263,14 @@ def load_config() -> Config:
     except json.JSONDecodeError as e:
         print(f"Error: {config_path} is not valid JSON: {e}", file=sys.stderr)
         sys.exit(1)
-    config = {k: v for k, v in raw.items() if k != "_vendor"}
-    prefix = config.get("prefix")
+    prefix = raw.get("prefix")
     if not prefix:
         print(
             f'Error: "prefix" key missing or empty in {config_path}.',
             file=sys.stderr,
         )
         sys.exit(1)
-    return cast(Config, config)
+    return cast(Config, raw)
 
 
 # Hardcoded session defaults per mode
@@ -962,6 +953,52 @@ def cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_edit(args: argparse.Namespace) -> int:
+    """Edit fields on an existing issue."""
+    # Check that at least one edit flag was provided
+    has_edit = any([
+        args.title is not None,
+        args.body is not None,
+        args.priority is not None,
+        args.type is not None,
+    ])
+    if not has_edit:
+        print("Error: At least one edit flag is required (--title, --body, --priority, --type)", file=sys.stderr)
+        return 1
+
+    issues_path = find_issues_file()
+    issues = read_issues(issues_path)
+
+    # Check archived issues first
+    archived = read_all_archived()
+    archived_issue = find_issue(archived, args.issue_id)
+    if archived_issue:
+        print(f"Error: Issue '{args.issue_id}' is archived and cannot be edited", file=sys.stderr)
+        return 1
+
+    issue = require_issue(issues, args.issue_id)
+    if not issue:
+        return 1
+
+    changes: list[str] = []
+    if args.title is not None:
+        issue["title"] = args.title
+        changes.append(f"title → {args.title}")
+    if args.body is not None:
+        issue["body"] = args.body
+        changes.append("body updated")
+    if args.priority is not None:
+        issue["priority"] = args.priority
+        changes.append(f"priority → P{args.priority}")
+    if args.type is not None:
+        issue["issue_type"] = cast(IssueType, args.type)
+        changes.append(f"type → {args.type}")
+
+    write_issues(issues_path, issues)
+    print(f"Edited {args.issue_id}: {', '.join(changes)}")
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     if getattr(args, 'archived', False):
         issues = read_all_archived()
@@ -974,6 +1011,12 @@ def cmd_list(args: argparse.Namespace) -> int:
         return 0
 
     filtered = issues
+    if getattr(args, 'parent', None):
+        parent = find_issue(issues, args.parent)
+        if not parent:
+            print(f"Error: Parent issue '{args.parent}' not found", file=sys.stderr)
+            return 1
+        filtered = [i for i in filtered if i.get("parent") == args.parent]
     if args.status:
         filtered = [i for i in filtered if i.get("status") == args.status]
     if args.type:
@@ -2014,11 +2057,21 @@ def main() -> int:
     p_create.add_argument("--created-by", help="Identity of the creator (freeform string)")
     p_create.set_defaults(func=cmd_create)
 
+    # edit
+    p_edit = sub.add_parser("edit", help="Edit fields on an existing issue")
+    p_edit.add_argument("issue_id", help="Issue ID")
+    p_edit.add_argument("--title", "-t", help="New title")
+    p_edit.add_argument("--body", "-b", help="New body/description")
+    p_edit.add_argument("--priority", "-p", type=int, choices=range(1, 6), help="New priority (1-5)")
+    p_edit.add_argument("--type", choices=VALID_TYPES, help="New issue type")
+    p_edit.set_defaults(func=cmd_edit)
+
     # list
     p_list = sub.add_parser("list", help="List issues")
     p_list.add_argument("--status", "-s", choices=VALID_STATUSES, help="Filter by status")
     p_list.add_argument("--type", choices=VALID_TYPES, help="Filter by type")
     p_list.add_argument("--implementer", "-a", help="Filter by implementer")
+    p_list.add_argument("--parent", help="Filter to children of this issue")
     p_list.add_argument("--archived", action="store_true", help="List archived issues instead of active")
     p_list.set_defaults(func=cmd_list)
 
