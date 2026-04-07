@@ -1,0 +1,31 @@
+{
+  "vendor": "madreperla",
+  "fields": {
+    "description": {
+      "required": true,
+      "type": "string",
+      "description": "Project description for prompt context"
+    },
+    "docs": {
+      "required": true,
+      "type": "array",
+      "description": "Documentation file paths for prompt context"
+    },
+    "providers": {
+      "type": "object",
+      "description": "Provider configuration (issues, docs)"
+    },
+    "prompts": {
+      "type": "object",
+      "description": "Prompt body overrides per mode"
+    },
+    "models": {
+      "type": "object",
+      "description": "Model overrides per role (evaluator, implementer)"
+    },
+    "eval": {
+      "type": "object",
+      "description": "Evaluation config (threshold, dimensions)"
+    }
+  }
+}

@@ -37,8 +37,10 @@ If you must edit `issues.jsonl` directly (e.g., `prl` is broken), note that this
 ```bash
 prl list                    # List all issues
 prl list --status=open      # List open issues
+prl list --parent=<id>      # List children of an issue
 prl ready                   # Show issues ready for work
 prl show <id>               # Show issue details
+prl edit <id> --title "x"   # Edit issue fields (--title, --body, --priority, --type)
 prl start <id>              # Mark as in_progress (--agent <name> for identity)
 prl impl <id> -a <model> -i <input> -o <output>  # Mark as implemented
 prl eval <id> --evaluator <model> --score correctness=N --score completeness=N --score quality=N --score testing=N --score documentation=N -i <input> -o <output>

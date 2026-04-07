@@ -6,6 +6,26 @@
         "hooks": [
           {
             "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/vendored-session.sh --start",
+            "statusMessage": "Configuring vendored tools..."
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/vendored-session.sh --resume",
+            "statusMessage": "Configuring vendored tools..."
+          }
+        ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.vendored/hooks/vendored-session.sh --start",
             "statusMessage": "Configuring vendored tools..."
           }

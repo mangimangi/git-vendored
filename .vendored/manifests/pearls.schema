@@ -1,0 +1,30 @@
+{
+  "vendor": "pearls",
+  "fields": {
+    "prefix": {
+      "required": true,
+      "type": "string",
+      "description": "Issue ID prefix (e.g. 'prl' produces prl-a3f8)"
+    },
+    "epics": {
+      "required": false,
+      "type": "array",
+      "description": "First-class epic slugs or objects with slug/alias/title/body"
+    },
+    "sessions": {
+      "required": false,
+      "type": "object",
+      "description": "Session config per mode (model, max_turns)"
+    },
+    "eval": {
+      "required": false,
+      "type": "object",
+      "description": "Eval config (e.g. threshold)"
+    },
+    "install": {
+      "required": false,
+      "type": "object",
+      "description": "Install behavior overrides (hooks, agents_md)"
+    }
+  }
+}
