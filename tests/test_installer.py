@@ -55,7 +55,7 @@ fetch_file() {{
 
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
-mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .vendored/lib .github/workflows
+mkdir -p .vendored .vendored/manifests .vendored/configs .vendored/pkg .vendored/lib .github/workflows
 
 echo "Downloading .vendored/install..."
 fetch_file "templates/install" ".vendored/install"
@@ -84,16 +84,6 @@ INSTALLED_FILES+=(".vendored/lib/vendor-helpers.sh")
 
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
-
-echo "Downloading .vendored/hooks/pre-commit..."
-fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
-chmod +x .vendored/hooks/pre-commit
-INSTALLED_FILES+=(".vendored/hooks/pre-commit")
-
-echo "Downloading .vendored/hooks/vendored-session.sh..."
-fetch_file "templates/hooks/vendored-session.sh" ".vendored/hooks/vendored-session.sh"
-chmod +x .vendored/hooks/vendored-session.sh
-INSTALLED_FILES+=(".vendored/hooks/vendored-session.sh")
 
 # Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
 rm -f .vendored/.version
@@ -299,7 +289,7 @@ class TestManifest:
         assert ".vendored/install" in content
         assert ".vendored/check" in content
         assert ".vendored/remove" in content
-        assert ".vendored/hooks/pre-commit" in content
+        assert ".vendored/lib/vendor-helpers.sh" in content
         # .vendored/.version should NOT be in manifest (deprecated)
         assert ".vendored/.version" not in content
 
