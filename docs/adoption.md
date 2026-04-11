@@ -104,47 +104,16 @@ python3 .vendored/feedback            # all installed vendors
 python3 .vendored/feedback <vendor>   # specific vendor
 ```
 
-The orchestrator also emits a breadcrumb at session start listing installed
-vendors with feedback loops.
-
 ---
 
-## 3. Codex Compatibility
+## 3. Session-Hook Orchestration (Removed)
 
-### No `$CLAUDE_PROJECT_DIR`
+Session-hook orchestration (`vendored-session.sh`, `--setup-hooks`, agent
+session hooks in `.claude/settings.json` and `.codex/config.toml`) was removed
+in phase 4.5. Target repos now use the image-baked model where health checks
+run via `session.sh` in the medici image.
 
-Hook scripts must NOT rely on `$CLAUDE_PROJECT_DIR`. This variable is
-Claude-specific and is not set by Codex. Replace with:
-
-```bash
-PROJECT_DIR="${PROJECT_DIR:-$(git rev-parse --show-toplevel)}"
-```
-
-The framework sets `$PROJECT_DIR` when invoking vendor hooks, so this pattern
-works as both a direct reference and a safe fallback.
-
-### Framework-owned orchestrator
-
-The framework now owns the session orchestrator at
-`.vendored/hooks/vendored-session.sh`. This script:
-
-1. Runs a post-install safety net (re-runs stale post-install hooks)
-2. Emits the vendor feedback breadcrumb on `--start`
-3. Discovers and runs vendor session hooks in dependency order
-
-Vendor repos should not ship their own orchestrator. Instead, provide hooks at
-`.vendored/pkg/<vendor>/hooks/` and let the framework invoke them.
-
-### `--setup-hooks` configures both agents
-
-```
-python3 .vendored/install --setup-hooks          # configures both Claude and Codex
-python3 .vendored/install --setup-hooks claude    # Claude only
-python3 .vendored/install --setup-hooks codex     # Codex only
-```
-
-When called without an agent argument, both agents are configured unconditionally
-(directories are created as needed). This writes:
-
-- `.claude/settings.json` -- Claude session hooks pointing to the orchestrator
-- `.codex/config.toml` -- Codex session hooks pointing to the orchestrator
+git-vendored's scope is now limited to:
+- Host-side tool installs (git-semver, git-dogfood)
+- File-protection checks (`.vendored/check`)
+- Vendor feedback (``.vendored/feedback``)

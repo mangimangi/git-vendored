@@ -44,7 +44,6 @@ When `VENDOR_INSTALL_DIR` is NOT set, vendor `install.sh` SHOULD:
 Some files must live in specific locations regardless of `VENDOR_INSTALL_DIR`:
 
 - **GitHub workflows** → `.github/workflows/`
-- **Git hooks** → `.vendored/hooks/` or `.git/hooks/`
 - **Config files** the user edits → wherever they currently live
 
 All files MUST appear in the manifest regardless of location.

@@ -126,7 +126,7 @@ A vendor repo must provide:
 | `VENDOR_INSTALL_DIR` | Target directory for vendor files (e.g., `.vendored/pkg/<vendor>`) |
 | `GH_TOKEN` | Auth token (when available) |
 
-`VENDOR_INSTALL_DIR` is set for non-dogfood vendors. Vendors SHOULD install their primary files under this directory but MAY install to other paths (workflows, hooks) when the target system requires specific locations. If not set, the vendor falls back to its original file layout.
+`VENDOR_INSTALL_DIR` is set for non-dogfood vendors. Vendors SHOULD install their primary files under this directory but MAY install to other paths (workflows) when the target system requires specific locations. If not set, the vendor falls back to its original file layout.
 
 ### Manifest
 
@@ -212,9 +212,13 @@ This prevents accidental edits to vendor-managed files while allowing the automa
     my-tool.registry             # vendor registry metadata (repo, install_branch, etc.)
     pearls.files
     pearls.version
-  hooks/
-    pre-commit                   # shared pre-commit hook
 ```
+
+> **Note:** Session-hook orchestration (`.vendored/hooks/vendored-session.sh`,
+> `--setup-hooks`, agent session hooks) was removed in phase 4.5. Target repos
+> now use the image-baked model where health checks run via `session.sh` in the
+> medici image. git-vendored's scope is now limited to host-side tool installs
+> (git-semver, git-dogfood) and file-protection checks.
 
 Vendor data files (e.g. `.pearls/issues.jsonl`, `.semver/.version`) remain in their original `.<vendor>/` directories — these are vendor-owned, not framework-managed. After migration, dot-directories become data-only zones. See `docs/vendor-install-dir-guide.md` for details.
 

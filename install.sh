@@ -12,8 +12,7 @@
 #   VENDOR_MANIFEST  - Path to write manifest of installed files (v2 contract).
 #
 # Behavior:
-#   - Always updates: .vendored/install, .vendored/check, .vendored/remove,
-#     .vendored/hooks/pre-commit
+#   - Always updates: .vendored/install, .vendored/check, .vendored/remove
 #   - Always updates: workflow templates in .github/workflows/
 #   - Preserves .vendored/config.json (only creates if missing)
 #   - Writes manifest to $VENDOR_MANIFEST and .vendored/manifests/ (v2 contract)
@@ -47,7 +46,7 @@ fetch_file() {
 echo "Installing git-vendored v$VERSION from $VENDORED_REPO"
 
 # Create directories
-mkdir -p .vendored .vendored/hooks .vendored/manifests .vendored/configs .vendored/pkg .vendored/lib .github/workflows
+mkdir -p .vendored .vendored/manifests .vendored/configs .vendored/pkg .vendored/lib .github/workflows
 
 # Download vendored scripts
 echo "Downloading .vendored/install..."
@@ -83,34 +82,6 @@ INSTALLED_FILES+=(".vendored/lib/vendor-helpers.sh")
 
 # Clean up old add/update scripts (merged into install)
 rm -f .vendored/add .vendored/update
-
-echo "Downloading .vendored/hooks/pre-commit..."
-fetch_file "templates/hooks/pre-commit" ".vendored/hooks/pre-commit"
-chmod +x .vendored/hooks/pre-commit
-INSTALLED_FILES+=(".vendored/hooks/pre-commit")
-
-echo "Downloading .vendored/hooks/vendored-session.sh..."
-fetch_file "templates/hooks/vendored-session.sh" ".vendored/hooks/vendored-session.sh"
-chmod +x .vendored/hooks/vendored-session.sh
-INSTALLED_FILES+=(".vendored/hooks/vendored-session.sh")
-
-# Install pre-commit hook into .git/hooks/ (symlink, idempotent)
-if [ -d .git/hooks ]; then
-    HOOK_DST=".git/hooks/pre-commit"
-    HOOK_REL="../../.vendored/hooks/pre-commit"
-    if [ -L "$HOOK_DST" ]; then
-        # Already a symlink — update if it points elsewhere
-        if [ "$(readlink "$HOOK_DST")" != "$HOOK_REL" ]; then
-            ln -sf "$HOOK_REL" "$HOOK_DST"
-            echo "Updated .git/hooks/pre-commit symlink"
-        fi
-    elif [ -f "$HOOK_DST" ]; then
-        echo "Warning: .git/hooks/pre-commit already exists (not a symlink), skipping" >&2
-    else
-        ln -s "$HOOK_REL" "$HOOK_DST"
-        echo "Installed .git/hooks/pre-commit"
-    fi
-fi
 
 # Clean up deprecated .vendored/.version (replaced by manifests/<vendor>.version)
 rm -f .vendored/.version
@@ -156,9 +127,6 @@ write_manifest() {
 }
 
 write_manifest
-
-# Set up agent hooks (auto-detect claude/codex)
-python3 .vendored/install --setup-hooks
 
 echo ""
 echo "Done! git-vendored v$VERSION installed."
