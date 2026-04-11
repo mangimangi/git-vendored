@@ -1,0 +1,12 @@
+prefix: gv
+description: "Automated vendor install control for repo-embedded tools via GitHub workflows"
+docs: [AGENTS.md, README.md, docs/]
+eval:
+  threshold: 80
+providers:
+  issues:
+    name: pearls
+    docs: "cat .vendored/pkg/pearls/AGENTS.md"
+  docs:
+    name: repo
+    docs: "cat docs/README.md"
