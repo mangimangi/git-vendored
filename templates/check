@@ -8,12 +8,10 @@ install_branch prefix.
 Usage:
     python3 .vendored/check [--base <ref>]
     python3 .vendored/check --staged
-    python3 .vendored/check --install-hook
 
 Modes:
     (default)       Diff against base ref (for CI / PR checks)
-    --staged        Check staged files only (for pre-commit hook)
-    --install-hook  Install pre-commit hook into .git/hooks/
+    --staged        Check staged files only
 
 Exit codes:
     0 - No violations (or all changes are allowed)
@@ -215,25 +213,6 @@ def check_vendor(vendor_name, vendor_config, changed_files, branch):
     return violations
 
 
-def install_hook():
-    """Install the pre-commit hook by symlinking into .git/hooks/."""
-    hook_src = os.path.join(".vendored", "hooks", "pre-commit")
-    hook_dst = os.path.join(".git", "hooks", "pre-commit")
-
-    if not os.path.isfile(hook_src):
-        print(f"Error: {hook_src} not found. Run the install-vendored workflow first.")
-        sys.exit(1)
-
-    os.makedirs(os.path.join(".git", "hooks"), exist_ok=True)
-
-    # Force-overwrite any existing hook (file or symlink)
-    if os.path.islink(hook_dst) or os.path.isfile(hook_dst):
-        os.remove(hook_dst)
-
-    os.symlink(os.path.join("..", "..", ".vendored", "hooks", "pre-commit"), hook_dst)
-    print(f"Installed pre-commit hook: {hook_dst} -> {hook_src}")
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Check for unauthorized vendor file modifications"
@@ -244,18 +223,9 @@ def main():
     )
     parser.add_argument(
         "--staged", action="store_true",
-        help="Check staged files only (for pre-commit hook)"
-    )
-    parser.add_argument(
-        "--install-hook", action="store_true",
-        help="Install pre-commit hook into .git/hooks/"
+        help="Check staged files only"
     )
     args = parser.parse_args()
-
-    # --install-hook mode: just install and exit
-    if args.install_hook:
-        install_hook()
-        sys.exit(0)
 
     config = load_config()
     vendors = config.get("vendors", {})

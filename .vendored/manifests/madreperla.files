@@ -1,6 +1,3 @@
-.claude/hooks/vendored-session.sh
 .vendored/pkg/madreperla/__init__.py
 .vendored/pkg/madreperla/cli.py
-.vendored/pkg/madreperla/hooks/session-resume.sh
-.vendored/pkg/madreperla/hooks/session-start.sh
 .vendored/pkg/madreperla/prompt.py
