@@ -1,0 +1,18 @@
+{
+  "prefix": "gv",
+  "_vendor": {
+    "repo": "mangimangi/pearls",
+    "install_branch": "chore/install-pearls",
+    "protected": [
+      ".pearls/prl.py",
+      ".pearls/merge-driver.py",
+      ".pearls/.gitignore",
+      ".pearls/.gitattributes",
+      ".pearls/AGENTS.md"
+    ],
+    "allowed": [
+      ".pearls/config.json",
+      ".pearls/issues.jsonl"
+    ]
+  }
+}
