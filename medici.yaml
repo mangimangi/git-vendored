@@ -6,7 +6,8 @@ eval:
 providers:
   issues:
     name: pearls
-    docs: "cat .vendored/pkg/pearls/AGENTS.md"
+    config: "prl configure"
+    docs: "prl docs"
   docs:
     name: repo
     docs: "cat docs/README.md"
