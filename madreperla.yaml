@@ -4,7 +4,12 @@ providers:
   issues:
     name: pearls
     config: "prl configure"
-    docs: "prl docs"
+    usage: "prl docs"
   docs:
     name: repo
-    docs: "cat docs/README.md"
+    usage: "cat docs/README.md"
+    planning: docs/planning
+    epics: docs/planning/epics
+    ideas: docs/planning/ideas
+    headaches: docs/planning/headaches
+    retro: docs/planning

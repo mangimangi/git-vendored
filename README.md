@@ -18,7 +18,7 @@ Bootstrap git-vendored in a new repo:
 
 ```bash
 # Download and run the bootstrap installer
-curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.1.0/install.sh | bash -s 0.1.0
+curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.28/install.sh | bash -s 0.0.28
 ```
 
 This creates:
