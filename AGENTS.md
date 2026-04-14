@@ -29,6 +29,8 @@ python3 .vendored/install all --pr            # update all + open PR
 python3 .vendored/remove <vendor>             # uninstall a vendor
 python3 .vendored/check                       # run file protection checks
 python3 .vendored/audit                       # validate configs against schemas
+python3 .vendored/feedback                    # vendor support/bug-report info
+python3 .vendored/install --list              # list installed vendors
 ```
 
 ## Tests

@@ -26,10 +26,12 @@ This creates:
 - `.vendored/check` — enforce file protection rules
 - `.vendored/remove` — cleanly uninstall a vendor
 - `.vendored/audit` — validate configs against vendor schemas
+- `.vendored/feedback` — show support and bug-reporting info for installed vendors
 - `.vendored/config.json` — framework-level config (legacy vendor registry)
 - `.vendored/configs/` — per-vendor config files (`<vendor>.json`)
 - `.vendored/pkg/` — vendor-installed files (`<vendor>/`)
 - `.vendored/manifests/` — manifest storage (file lists + versions)
+- `.vendored/lib/` — shared helper modules
 - `.github/workflows/install-vendored.yml` — automated update workflow
 - `.github/workflows/check-vendor.yml` — PR protection checks
 
@@ -195,7 +197,10 @@ This prevents accidental edits to vendor-managed files while allowing the automa
   check                          # framework command: file protection checks
   remove                         # framework command: uninstall vendors
   audit                          # framework command: validate configs against schemas
+  feedback                       # framework command: vendor support/bug-report info
   config.json                    # framework-level config (legacy)
+  lib/                           # shared helper modules
+    vendor-helpers.sh
   configs/
     my-tool.json                 # per-vendor config
     pearls.json
@@ -209,7 +214,7 @@ This prevents accidental edits to vendor-managed files while allowing the automa
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
     my-tool.schema               # config schema (if vendor provides one)
-    my-tool.registry             # vendor registry metadata (repo, install_branch, etc.)
+    my-tool.deps                 # dependency list (if vendor declares deps)
     pearls.files
     pearls.version
 ```
