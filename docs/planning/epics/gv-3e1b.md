@@ -2,6 +2,10 @@
 
 > Per-repo planning doc for epic `gv-3e1b`
 
+## Scope
+
+- `gv-3e1b.1` — Migrate docs to `.pearls/docs/` and simplify providers config (atomic: config + move + regenerate + verify)
+
 ## Design decisions
 
 - **One issue**: entire migration is one atomic issue — config + move + regenerate + verify. No partial states.
