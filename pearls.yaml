@@ -1,3 +1,23 @@
 prefix: gv
 eval:
   threshold: 80
+  dimensions:
+    correctness:
+      description: "Does it work as specified?"
+    completeness:
+      description: "Are all acceptance criteria met?"
+    quality:
+      description: "Is it clean, maintainable, well-structured?"
+    testing:
+      description: "Are changes adequately tested?"
+    documentation:
+      description: "Are changes documented where needed?"
+    hygiene:
+      description: "No build artifacts, generated files, secrets, credentials, or large binary blobs in the diff."
+      threshold: 100
+docs:
+  planning: .pearls/docs
+  epics: .pearls/docs/epics
+  ideas: .pearls/docs/ideas
+  headaches: .pearls/docs/headaches
+  retros: .pearls/docs/retros

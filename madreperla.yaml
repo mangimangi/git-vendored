@@ -1,15 +1,5 @@
 description: "Automated vendor install control for repo-embedded tools via GitHub workflows"
 docs: [AGENTS.md, README.md, docs/]
 providers:
-  issues:
-    name: pearls
-    config: "prl configure"
-    usage: "prl docs"
-  docs:
-    name: repo
-    usage: "cat docs/README.md"
-    planning: docs/planning
-    epics: docs/planning/epics
-    ideas: docs/planning/ideas
-    headaches: docs/planning/headaches
-    retro: docs/planning
+  issues: pearls
+  docs: pearls
