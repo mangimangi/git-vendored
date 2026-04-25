@@ -12,7 +12,14 @@
     ]
   },
   "version_file": "VERSION",
-  "files": ["install.sh", "validate", "templates/**"],
+  "files": [
+    "install.sh",
+    "validate",
+    "templates/**",
+    "docs/**",
+    "AGENTS.md",
+    "README.md"
+  ],
   "updates": {},
   "changelog": true
 }
