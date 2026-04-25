@@ -12,7 +12,7 @@
     ]
   },
   "version_file": "VERSION",
-  "files": ["install.sh", "templates/*"],
+  "files": ["install.sh", "validate", "templates/**"],
   "updates": {},
   "changelog": true
 }
