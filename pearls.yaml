@@ -15,9 +15,3 @@ eval:
     hygiene:
       description: "No build artifacts, generated files, secrets, credentials, or large binary blobs in the diff."
       threshold: 100
-docs:
-  planning: .pearls/docs
-  epics: .pearls/docs/epics
-  ideas: .pearls/docs/ideas
-  headaches: .pearls/docs/headaches
-  retros: .pearls/docs/retros
