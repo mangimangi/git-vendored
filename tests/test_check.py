@@ -149,6 +149,30 @@ class TestCheckVendor:
         )
         assert ".vendored/install" in violations
 
+    def test_multi_vendor_install_branch_skips_every_vendor(self, tmp_repo):
+        """The installer's own multi-vendor branch may change any vendor's files."""
+        for name in ("git-vendored", "pearls"):
+            vendor_config = SAMPLE_CONFIG["vendors"][name]
+            protected = check.get_protected_files(name, vendor_config)
+            violations = check.check_vendor(
+                name, vendor_config, [".vendored/install"] + [
+                    p for p in protected if "*" not in p],
+                "chore/install-vendors",
+            )
+            assert violations == []
+
+    def test_branch_merely_resembling_the_multi_vendor_branch_is_checked(self, tmp_repo):
+        vendor_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        violations = check.check_vendor(
+            "git-vendored", vendor_config,
+            [".vendored/install"], "feature/chore/install-vendors"
+        )
+        assert ".vendored/install" in violations
+
+    def test_installer_and_check_agree_on_the_multi_vendor_branch(self):
+        installer = (Path(__file__).parent.parent / "templates" / "install").read_text()
+        assert f'MULTI_VENDOR_INSTALL_BRANCH = "{check.MULTI_VENDOR_INSTALL_BRANCH}"' in installer
+
     def test_pearls_allowed_files(self, tmp_repo):
         vendor_config = SAMPLE_CONFIG["vendors"]["pearls"]
         violations = check.check_vendor(
