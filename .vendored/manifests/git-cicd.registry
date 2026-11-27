@@ -1,0 +1,11 @@
+{
+  "repo": "mangimangi/git-cicd",
+  "install_branch": "chore/install-git-cicd",
+  "protected": [
+    ".vendored/pkg/git-cicd/**"
+  ],
+  "allowed": [
+    ".vendored/configs/git-cicd.json",
+    ".github/workflows/git-cicd-*.yml"
+  ]
+}
