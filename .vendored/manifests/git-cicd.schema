@@ -1,0 +1,19 @@
+{
+  "fields": {
+    "jobs": {
+      "type": "object",
+      "required": true,
+      "description": "Job name (letters, digits, - and _) -> job. A job declares: name (optional display name, a non-empty single line of printable characters, shown exactly as written; write it in title case, e.g. Unit Tests; default: the job name in title case, - and _ as spaces, e.g. unit-tests shows as Unit Tests; rows show as <name> / <repo>:<job>), on (array of open, merge, cron; none means manual-only), branches (required, non-empty array of patterns; literal names for cron jobs), paths (array of patterns), setup (one executable repository file), steps (required, ordered, non-empty; each a file or [file, fixed args...], run without a shell), cron (five-field expression, required exactly when on contains cron), manual (boolean, default true), blocking (boolean, default true). Unknown fields are refused; enforced by git-cicd validate."
+    },
+    "needs_nothing": {
+      "type": "array",
+      "required": false,
+      "description": "Path patterns (*, **, ?) of files that need no job, such as documents and tracker records (default: empty)"
+    },
+    "max_parallel": {
+      "type": "integer",
+      "required": false,
+      "description": "How many job runners run at once (positive integer, default: 3)"
+    }
+  }
+}

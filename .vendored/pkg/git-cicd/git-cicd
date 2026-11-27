@@ -1,0 +1,1425 @@
+#!/usr/bin/env python3
+"""git-cicd - decide which jobs a change needs, run them, and report.
+
+A repository declares jobs in .vendored/configs/git-cicd.json. Each job is a
+setup script and ordered steps, every one a plain file the repository owns.
+git-cicd knows nothing about what the checks are: it decides from a change
+which jobs are needed, runs them, and reports every decision, so that
+"nothing ran" is never read as "passed".
+
+Python 3 standard library and the git CLI only.
+
+Subcommands:
+  validate   load and validate the config
+  decide     decide which jobs a change needs on a trigger
+  run-job    run one job: setup when asked, then its steps
+  generate   write the generated workflows (one per trigger) from the config
+  verify     check that the generated workflows match the config
+  report     one line per job with times, and one verdict
+  check      decide, run and report locally, without GitHub
+"""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+CONFIG_PATH = ".vendored/configs/git-cicd.json"
+# One generated workflow per trigger: (workflow name, file). The names and the
+# files are fixed for good, so no adopter has to rename a file again. Only the
+# triggers in GENERATED_TRIGGERS are written; adding one adds its template under
+# templates/workflows/ and its word here, and changes no other file.
+WORKFLOWS = {
+    "open": ("Open", ".github/workflows/git-cicd-open.yml"),
+    "merge": ("Merge", ".github/workflows/git-cicd-merge.yml"),
+    "cron": ("Cron", ".github/workflows/git-cicd-cron.yml"),
+    "manual": ("Manual", ".github/workflows/git-cicd-manual.yml"),
+}
+GENERATED_TRIGGERS = ("open",)
+# The single workflow file of git-cicd before the per-trigger files; generate
+# removes it and verify fails while it is there.
+LEGACY_WORKFLOW_PATH = ".github/workflows/git-cicd.yml"
+TEMPLATE_DIR = os.path.join("templates", "workflows")
+
+# The commit status a reader waits on, named `<name> / <owner>:<job>` like
+# every row (git-cicd's own rows, in the templates, are
+# `Decide / git-cicd:decide` and `Report / git-cicd:report`).
+VERDICT_STATUS = "Verdict / git-cicd:verdict"
+
+TRIGGERS = ("open", "merge", "cron")
+DEFAULT_MAX_PARALLEL = 3
+
+TOP_LEVEL_FIELDS = ("_vendor", "jobs", "needs_nothing", "max_parallel")
+JOB_FIELDS = ("name", "on", "branches", "paths", "setup", "steps", "cron", "manual",
+              "blocking")
+
+JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+GLOB_CHARS = ("*", "?", "[")
+
+
+class ConfigError(Exception):
+    """The config breaks the interface. Carries every error found."""
+
+    def __init__(self, errors):
+        self.errors = list(errors)
+        super().__init__("\n".join(self.errors))
+
+
+class UsageError(Exception):
+    """A request the tool refuses (exit 2)."""
+
+
+def default_title(name):
+    """The display name of a job without `name`: its job name with `-` and
+    `_` as spaces and each word capitalised (`unit-tests` -> `Unit Tests`).
+    A `name` the repository wrote is never passed through this."""
+    words = [w for w in re.split(r"[-_]+", name) if w]
+    return " ".join(w[:1].upper() + w[1:] for w in words) or name
+
+
+# ── Patterns ────────────────────────────────────────────────────────────────
+
+_PATTERN_CACHE = {}
+
+
+def compile_pattern(pattern):
+    """Compile a glob pattern to a regex.
+
+    `**` matches any sequence including `/` (`dir/**` matches everything
+    under dir; a `**/` segment may also match no directory at all), `*`
+    matches any sequence without `/`, `?` matches one character other than
+    `/`. Everything else is literal. fnmatch is not used: its `*` crosses `/`.
+    """
+    cached = _PATTERN_CACHE.get(pattern)
+    if cached is not None:
+        return cached
+    out = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < n and pattern[i + 1] == "*":
+                at_segment_start = i == 0 or pattern[i - 1] == "/"
+                if at_segment_start and i + 2 < n and pattern[i + 2] == "/":
+                    out.append("(?:.*/)?")
+                    i += 3
+                else:
+                    out.append(".*")
+                    i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    regex = re.compile("".join(out) + r"\Z", re.DOTALL)
+    _PATTERN_CACHE[pattern] = regex
+    return regex
+
+
+def match(pattern, path):
+    """True when path matches the glob pattern as a whole."""
+    return compile_pattern(pattern).match(path) is not None
+
+
+def match_any(patterns, path):
+    return any(match(p, path) for p in patterns)
+
+
+# ── Repository ──────────────────────────────────────────────────────────────
+
+def git(*args, cwd=None, check=False):
+    """Run git with a list argv (never through a shell)."""
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                          text=True, check=check)
+
+
+def repo_root(cwd=None):
+    result = git("rev-parse", "--show-toplevel", cwd=cwd)
+    if result.returncode != 0:
+        raise UsageError("not inside a git repository: "
+                         + result.stderr.strip())
+    return result.stdout.strip()
+
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+def _is_str_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _check_file(root, path, where):
+    """Errors for a setup or step file: a repository path to an executable
+    regular file, relative, without `..` segments."""
+    if path == "":
+        return [f"{where}: empty path"]
+    if os.path.isabs(path):
+        return [f"{where}: {path} is an absolute path; use a path relative "
+                "to the repository root"]
+    if ".." in path.replace("\\", "/").split("/"):
+        return [f"{where}: {path} contains a '..' segment"]
+    full = os.path.join(root, path)
+    if not os.path.isfile(full):
+        return [f"{where}: {path} is not a file in the repository"]
+    if not os.access(full, os.X_OK):
+        return [f"{where}: {path} is not executable (chmod +x it)"]
+    return []
+
+
+def _validate_step(root, step, where):
+    if isinstance(step, str):
+        if step.strip() != step or any(ch.isspace() for ch in step):
+            return [f"{where}: {step!r} contains whitespace; a step is a file "
+                    "plus fixed arguments, never a shell command line - use "
+                    "the array form [\"file\", \"arg\", ...]"]
+        return _check_file(root, step, where)
+    if isinstance(step, list):
+        if not step:
+            return [f"{where}: empty array; a step is a file plus fixed "
+                    "arguments"]
+        if not _is_str_list(step):
+            return [f"{where}: every element of an array step must be a "
+                    "string"]
+        return _check_file(root, step[0], where)
+    return [f"{where}: a step must be a file (string) or an array of a file "
+            "and fixed arguments"]
+
+
+def _validate_job(root, name, job):
+    """Return (errors, normalized job)."""
+    errors = []
+    prefix = f"job {name}"
+    if not JOB_NAME_RE.match(name):
+        errors.append(f"{prefix}: invalid job name (letters, digits, - and _ "
+                      "only)")
+    if not isinstance(job, dict):
+        return errors + [f"{prefix}: a job must be an object"], None
+
+    for key in job:
+        if key not in JOB_FIELDS:
+            errors.append(f"{prefix}: unknown field {key}")
+
+    # name (the display name; data, never part of a command line)
+    title = job.get("name", default_title(name))
+    if "name" in job:
+        if not isinstance(title, str):
+            errors.append(f"{prefix}: name must be a string (a short "
+                          "human-readable display name)")
+            title = default_title(name)
+        elif not title.strip():
+            errors.append(f"{prefix}: name is empty; give a short "
+                          "human-readable display name or leave the field "
+                          "out")
+            title = default_title(name)
+        elif not all(ch.isprintable() for ch in title):
+            errors.append(f"{prefix}: name {title!r} must be a single line "
+                          "of printable characters (no newline, tab or "
+                          "other control character)")
+            title = default_title(name)
+
+    # on
+    on = job.get("on", [])
+    if not _is_str_list(on):
+        errors.append(f"{prefix}: on must be an array of triggers "
+                      f"({', '.join(TRIGGERS)})")
+        on = []
+    else:
+        for trigger in on:
+            if trigger not in TRIGGERS:
+                errors.append(f"{prefix}: unknown trigger {trigger!r} in on "
+                              f"(allowed: {', '.join(TRIGGERS)})")
+        dupes = sorted({m for m in on if on.count(m) > 1})
+        for trigger in dupes:
+            errors.append(f"{prefix}: trigger {trigger} listed more than once "
+                          "in on")
+
+    # branches
+    branches = job.get("branches")
+    if "branches" not in job:
+        errors.append(f"{prefix}: missing required field branches")
+        branches = []
+    elif not _is_str_list(branches):
+        errors.append(f"{prefix}: branches must be an array of strings")
+        branches = []
+    elif not branches:
+        errors.append(f"{prefix}: missing required field branches (the list "
+                      "is empty)")
+    elif any(b == "" for b in branches):
+        errors.append(f"{prefix}: branches contains an empty pattern")
+
+    # cron
+    has_cron = "cron" in on
+    cron = job.get("cron")
+    if "cron" in job:
+        if not has_cron:
+            errors.append(f"{prefix}: cron is set but on does not contain "
+                          "cron")
+        elif not isinstance(cron, str):
+            errors.append(f"{prefix}: cron must be a string cron expression")
+        elif len(cron.split()) != 5:
+            errors.append(f"{prefix}: cron {cron!r} is not a cron expression "
+                          "(five space-separated fields)")
+    elif has_cron:
+        errors.append(f"{prefix}: on contains cron but no cron expression is "
+                      "given")
+    if has_cron:
+        for b in branches:
+            if any(ch in b for ch in GLOB_CHARS):
+                errors.append(f"{prefix}: a cron job's branches are literal "
+                              f"names; {b!r} is a pattern")
+
+    # paths
+    paths = job.get("paths")
+    if "paths" in job and not _is_str_list(paths):
+        errors.append(f"{prefix}: paths must be an array of strings")
+        paths = None
+
+    # setup
+    setup = job.get("setup")
+    if "setup" in job:
+        if not isinstance(setup, str):
+            errors.append(f"{prefix}: setup must be one repository path "
+                          "(a string)")
+            setup = None
+        elif any(ch.isspace() for ch in setup):
+            errors.append(f"{prefix}: setup {setup!r} contains whitespace; "
+                          "setup is one file, never a shell command line")
+        else:
+            errors.extend(_check_file(root, setup, f"{prefix}: setup"))
+
+    # steps
+    steps = job.get("steps")
+    norm_steps = []
+    if "steps" not in job:
+        errors.append(f"{prefix}: missing required field steps")
+    elif not isinstance(steps, list) or not steps:
+        errors.append(f"{prefix}: steps must be a non-empty array")
+    else:
+        for i, step in enumerate(steps, 1):
+            step_errors = _validate_step(root, step, f"{prefix}: step {i}")
+            errors.extend(step_errors)
+            if not step_errors:
+                norm_steps.append([step] if isinstance(step, str)
+                                  else list(step))
+
+    # flags
+    for flag in ("manual", "blocking"):
+        if flag in job and not isinstance(job[flag], bool):
+            errors.append(f"{prefix}: {flag} must be a boolean")
+
+    normalized = {
+        "name": name,
+        "title": title,
+        "on": list(on),
+        "branches": list(branches),
+        "paths": list(paths) if paths is not None else None,
+        "setup": setup,
+        "steps": norm_steps,
+        "cron": cron if has_cron else None,
+        "manual": job.get("manual", True) is not False,
+        "blocking": job.get("blocking", True) is not False,
+    }
+    return errors, normalized
+
+
+def validate_config(data, root):
+    """Validate a parsed config. Return the normalized config or raise
+    ConfigError with every error found."""
+    errors = []
+    if not isinstance(data, dict):
+        raise ConfigError(["config: the top level must be a JSON object"])
+
+    for key in data:
+        if key not in TOP_LEVEL_FIELDS:
+            errors.append(f"config: unknown field {key}")
+
+    jobs = {}
+    raw_jobs = data.get("jobs")
+    if "jobs" not in data:
+        errors.append("config: missing required field jobs")
+    elif not isinstance(raw_jobs, dict):
+        errors.append("config: jobs must be an object (job name -> job)")
+    else:
+        for name, job in raw_jobs.items():
+            job_errors, normalized = _validate_job(root, name, job)
+            errors.extend(job_errors)
+            if normalized is not None:
+                jobs[name] = normalized
+
+    needs_nothing = data.get("needs_nothing", [])
+    if not _is_str_list(needs_nothing):
+        errors.append("config: needs_nothing must be an array of path "
+                      "patterns")
+        needs_nothing = []
+
+    max_parallel = data.get("max_parallel", DEFAULT_MAX_PARALLEL)
+    if (not isinstance(max_parallel, int) or isinstance(max_parallel, bool)
+            or max_parallel < 1):
+        errors.append("config: max_parallel must be a positive integer")
+        max_parallel = DEFAULT_MAX_PARALLEL
+
+    if errors:
+        raise ConfigError(errors)
+    return {
+        "jobs": jobs,
+        "needs_nothing": list(needs_nothing),
+        "max_parallel": max_parallel,
+    }
+
+
+def load_config(root, path=None):
+    """Read and validate the config. Raise ConfigError on any problem."""
+    path = path or os.path.join(root, CONFIG_PATH)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise ConfigError([f"config: cannot read {path}: {e.strerror}"])
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ConfigError([f"config: {path} is not valid JSON: {e}"])
+    config = validate_config(data, root)
+    config["path"] = path
+    return config
+
+
+# ── Decide ──────────────────────────────────────────────────────────────────
+
+NOT_BUILT = "the {trigger} trigger is not built yet (git-cicd gcd-e74c builds open only)"
+ALL_TRIGGERS = TRIGGERS + ("manual",)
+
+
+def check_trigger(config, trigger):
+    """Raise UsageError for a trigger that is not built yet, naming the jobs
+    that declare it. Never silently succeed."""
+    if trigger == "open":
+        return
+    if trigger == "manual":
+        declaring = [n for n, j in config["jobs"].items() if j["manual"]]
+    else:
+        declaring = [n for n, j in config["jobs"].items() if trigger in j["on"]]
+    names = ", ".join(declaring) if declaring else "none"
+    raise UsageError(NOT_BUILT.format(trigger=trigger)
+                     + f"; jobs declaring it: {names}")
+
+
+def resolve_commit(root, rev):
+    """Resolve a revision to a commit sha, or None. The revision is passed
+    as one argv element after --end-of-options, never through a shell."""
+    if not rev:
+        return None
+    result = git("rev-parse", "--verify", "--quiet", "--end-of-options",
+                 rev + "^{commit}", cwd=root)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def changed_files(root, base, head):
+    """What the branch changed since it left the base: base...head.
+
+    Return (files, None) or (None, why) when the diff cannot be computed.
+    """
+    base_sha = resolve_commit(root, base)
+    if base_sha is None:
+        return None, f"base {base!r} is not a commit in this repository"
+    head_sha = resolve_commit(root, head)
+    if head_sha is None:
+        return None, f"head {head!r} is not a commit in this repository"
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--no-renames", "-z",
+         f"{base_sha}...{head_sha}"],
+        cwd=root, capture_output=True)
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", "replace").strip()
+        return None, "git diff failed: " + (err.splitlines()[0] if err
+                                              else f"exit {result.returncode}")
+    out = result.stdout.decode("utf-8", "surrogateescape")
+    return [f for f in out.split("\0") if f], None
+
+
+def _norm(path):
+    return os.path.normpath(path).replace(os.sep, "/")
+
+
+def job_scripts(config):
+    """Every file any job names (setup and step files), whatever its
+    triggers."""
+    files = set()
+    for job in config["jobs"].values():
+        if job["setup"]:
+            files.add(_norm(job["setup"]))
+        for step in job["steps"]:
+            files.add(_norm(step[0]))
+    return files
+
+
+def config_relpath(config, root):
+    path = config.get("path") or os.path.join(root, CONFIG_PATH)
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    return _norm(rel)
+
+
+def _name_files(files, limit=5):
+    shown = ", ".join(files[:limit])
+    if len(files) > limit:
+        shown += f" (and {len(files) - limit} more)"
+    return shown
+
+
+def decide(config, root, trigger, target, source, base, head, files=None,
+           diff_error=None):
+    """Decide every declared job for the trigger, one decision each, with a
+    reason. Return the decision record (what `decide --json` prints)."""
+    check_trigger(config, trigger)
+    if files is None and diff_error is None:
+        files, diff_error = changed_files(root, base, head)
+
+    needs_nothing = config["needs_nothing"]
+    force = None
+    if files is not None:
+        if not files:
+            force = "no changed files found"
+        else:
+            forcing = job_scripts(config) | {config_relpath(config, root),
+                                             CONFIG_PATH}
+            touched = [f for f in files if _norm(f) in forcing]
+            if touched:
+                force = "config or job script changed: " + _name_files(touched)
+            else:
+                covering = [j["paths"] for j in config["jobs"].values()
+                            if j["paths"] is not None]
+                uncovered = [f for f in files
+                             if not match_any(needs_nothing, f)
+                             and not any(match_any(p, f) for p in covering)]
+                if uncovered:
+                    verb = "is" if len(uncovered) == 1 else "are"
+                    force = (f"{_name_files(uncovered)} {verb} in no job's "
+                             "paths and not in needs_nothing")
+    else:
+        force = f"cannot compute the diff: {diff_error}"
+
+    relevant = [f for f in (files or []) if not match_any(needs_nothing, f)]
+    decisions = []
+    for name, job in config["jobs"].items():
+        if trigger not in job["on"]:
+            needed, reason = False, f"not an {trigger} job"
+        elif not match_any(job["branches"], target or ""):
+            needed, reason = False, f"target {target} does not match branches"
+        elif force:
+            needed, reason = True, force
+        elif not relevant:
+            needed, reason = False, "only needs_nothing files changed"
+        elif job["paths"] is None:
+            n = len(relevant)
+            needed = True
+            reason = (f"{n} changed file{'' if n == 1 else 's'} outside "
+                      "needs_nothing (the job has no paths)")
+        else:
+            hits = [f for f in relevant if match_any(job["paths"], f)]
+            if hits:
+                n = len(hits)
+                needed = True
+                reason = f"{n} changed file{'' if n == 1 else 's'} match paths"
+            else:
+                needed, reason = False, "no changed file matches paths"
+        decisions.append({"name": name, "title": job["title"],
+                          "needed": needed, "reason": reason,
+                          "blocking": job["blocking"]})
+
+    return {
+        "trigger": trigger,
+        "target": target,
+        "source": source,
+        "base": base,
+        "head": head,
+        "changed_files": list(files or []),
+        "jobs": decisions,
+        "max_parallel": config["max_parallel"],
+    }
+
+
+def needed_jobs(decision):
+    return [j["name"] for j in decision["jobs"] if j["needed"]]
+
+
+def format_decision(decision):
+    lines = [f"git-cicd decide: trigger {decision['trigger']}, target "
+             f"{decision['target']}, source {decision['source']}",
+             f"  base {decision['base']}, head {decision['head']}",
+             f"  {len(decision['changed_files'])} changed files"]
+    for j in decision["jobs"]:
+        state = "needed" if j["needed"] else "not needed"
+        lines.append(f"  {j['name']}: {state} ({j['reason']})")
+    return "\n".join(lines)
+
+
+def write_github_output(decision):
+    """Append the outputs the generated workflow reads, when in Actions."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"jobs={json.dumps(needed_jobs(decision))}\n")
+        names = {j["name"]: j.get("title") or default_title(j["name"])
+                 for j in decision["jobs"]}
+        f.write(f"names={json.dumps(names)}\n")
+        f.write(f"any={'true' if needed_jobs(decision) else 'false'}\n")
+        f.write(f"max_parallel={decision['max_parallel']}\n")
+
+
+def write_changed_files(path, files):
+    with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        for name in files:
+            f.write(name + "\n")
+
+
+# ── Run ─────────────────────────────────────────────────────────────────────
+
+def script_env(job_name, facts, changed_files_path):
+    """The inherited environment plus the CICD_ facts about the change.
+
+    GITHUB_TOKEN and VENDOR_PAT reach scripts unchanged through the inherited
+    environment; git-cicd itself never reads or logs them.
+    """
+    env = dict(os.environ)
+    env.update({
+        "CICD_TRIGGER": facts["trigger"],
+        "CICD_JOB": job_name,
+        "CICD_TARGET_BRANCH": facts["target"],
+        "CICD_SOURCE_BRANCH": facts["source"],
+        "CICD_BASE": facts["base"],
+        "CICD_HEAD": facts["head"],
+        "CICD_CHANGED_FILES": changed_files_path,
+    })
+    return env
+
+
+def _run_script(argv, root, env, header):
+    """Run one script directly (list argv, no shell), streaming its output.
+    Return (exit_code or None, error or None, seconds)."""
+    print(f"==> git-cicd: {header}", flush=True)
+    sys.stderr.flush()
+    start = time.monotonic()
+    try:
+        code = subprocess.run(argv, cwd=root, env=env).returncode
+        error = None
+    except OSError as e:
+        code, error = None, f"cannot execute {argv[0]}: {e.strerror or e}"
+        print(f"==> git-cicd: {error}", flush=True)
+    seconds = round(time.monotonic() - start, 3)
+    return code, error, seconds
+
+
+def run_job(config, root, name, facts, setup=False, files=None):
+    """Run a job: setup when asked, then each step in order, stopping at the
+    first failing step. Return the result record."""
+    check_trigger(config, facts["trigger"])
+    job = config["jobs"].get(name)
+    if job is None:
+        raise UsageError(f"unknown job {name!r} (declared: "
+                         f"{', '.join(config['jobs']) or 'none'})")
+    if files is None:
+        files, _ = changed_files(root, facts["base"], facts["head"])
+    fd, changed_path = tempfile.mkstemp(prefix="git-cicd-changed-",
+                                        suffix=".txt")
+    os.close(fd)
+    write_changed_files(changed_path, files or [])
+    env = script_env(name, facts, os.path.abspath(changed_path))
+
+    result = {"job": name, "state": "passed", "failed_step": None,
+              "exit_code": 0, "error": None, "setup": None,
+              "setup_skipped": bool(job["setup"]) and not setup,
+              "steps": [], "seconds": 0.0}
+    start = time.monotonic()
+    try:
+        if setup and job["setup"]:
+            code, error, seconds = _run_script(
+                [os.path.join(root, job["setup"])], root, env,
+                f"job {name}: setup {job['setup']}")
+            result["setup"] = {"script": job["setup"], "seconds": seconds,
+                               "exit_code": code, "error": error}
+            if code != 0:
+                result.update(state="could not run", exit_code=code,
+                              error=error)
+                return result
+        total = len(job["steps"])
+        for i, step in enumerate(job["steps"], 1):
+            label = shlex.join(step)
+            argv = [os.path.join(root, step[0]), *step[1:]]
+            code, error, seconds = _run_script(
+                argv, root, env, f"job {name}: step {i}/{total} {label}")
+            result["steps"].append({"step": label, "file": step[0],
+                                    "seconds": seconds,
+                                    "exit_code": code, "error": error})
+            if code != 0:
+                result.update(state="failed", failed_step=label,
+                              exit_code=code, error=error)
+                return result
+        return result
+    finally:
+        result["seconds"] = round(time.monotonic() - start, 3)
+        try:
+            os.unlink(changed_path)
+        except OSError:
+            pass
+
+
+# ── Workflow ────────────────────────────────────────────────────────────────
+
+TOOL_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def tool_path(root):
+    """The running script's path relative to the repository root: where the
+    tool is installed, never something the config decides."""
+    here = os.path.realpath(os.path.abspath(__file__))
+    rel = _norm(os.path.relpath(here, os.path.realpath(root)))
+    if rel.startswith("../") or rel == "..":
+        raise UsageError(f"git-cicd runs from {here}, outside the repository "
+                         f"{root}; the generated workflow needs the tool "
+                         "inside the repository (install it, or run the "
+                         "installed copy)")
+    if not TOOL_PATH_RE.match(rel):
+        raise UsageError(f"the tool path {rel!r} contains characters the "
+                         "generated workflow does not accept")
+    return rel
+
+
+def template_text(trigger):
+    path = os.path.join(os.path.dirname(os.path.realpath(
+        os.path.abspath(__file__))), TEMPLATE_DIR, f"{trigger}.yml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError as e:
+        raise UsageError(f"cannot read the workflow template {path}: "
+                         f"{e.strerror}")
+
+
+def schedule_block(config):
+    crons = sorted({j["cron"] for j in config["jobs"].values()
+                    if "cron" in j["on"] and j["cron"]})
+    if not crons:
+        return ""
+    lines = ["  schedule:"]
+    lines += [f"    - cron: {json.dumps(c)}" for c in crons]
+    return "\n".join(lines) + "\n"
+
+
+def render_workflow(config, tool, template):
+    """One workflow file from its template, deterministic byte for byte. A
+    template is fixed text; the only part that depends on the config is the
+    schedule block, which only the cron template holds (`__SCHEDULE__`). The
+    tool path depends on where the tool is installed."""
+    text = template.replace("__SCHEDULE__\n", schedule_block(config))
+    return text.replace("__TOOL__", tool)
+
+
+def render_workflows(config, tool, templates=None):
+    """{path: text} for every generated workflow, in trigger order."""
+    out = {}
+    for trigger in GENERATED_TRIGGERS:
+        template = (templates or {}).get(trigger)
+        if template is None:
+            template = template_text(trigger)
+        out[WORKFLOWS[trigger][1]] = render_workflow(config, tool, template)
+    return out
+
+
+def generated_paths():
+    return [WORKFLOWS[m][1] for m in GENERATED_TRIGGERS]
+
+
+def generate_command(tool):
+    return f"{tool} generate"
+
+
+def verify_workflow(config, root, tool=None):
+    """Regenerate every workflow in memory and compare each whole file; the
+    single file of earlier versions must be gone.
+
+    Return (ok, message); message holds a unified diff per file that differs
+    and the command to run when anything does not match."""
+    tool = tool or tool_path(root)
+    problems = []
+    for rel, expected in render_workflows(config, tool).items():
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8",
+                      newline="") as f:
+                actual = f.read()
+        except OSError:
+            actual = None
+        if actual == expected:
+            continue
+        if actual is None:
+            problems.append(f"{rel} is missing\n")
+        else:
+            problems.append("".join(difflib.unified_diff(
+                actual.splitlines(keepends=True),
+                expected.splitlines(keepends=True),
+                fromfile=f"{rel} (committed)",
+                tofile=f"{rel} (generated from the config)")))
+    commit = ", ".join(generated_paths())
+    if os.path.lexists(os.path.join(root, LEGACY_WORKFLOW_PATH)):
+        problems.append(f"{LEGACY_WORKFLOW_PATH} is still there (the single "
+                        "workflow of earlier git-cicd versions; generate "
+                        "removes it)\n")
+        commit += f" and the removal of {LEGACY_WORKFLOW_PATH}"
+    if not problems:
+        return True, "workflows match config"
+    return False, ("".join(problems) + "the workflows do not match the "
+                   f"config; run: {generate_command(tool)} and commit "
+                   f"{commit}")
+
+
+# ── Report ──────────────────────────────────────────────────────────────────
+
+def load_results(directory):
+    """Every run-job result JSON under directory (any nesting), by job."""
+    results = {}
+    if not directory or not os.path.isdir(directory):
+        return results
+    for dirpath, dirnames, filenames in os.walk(directory):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            if not filename.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(dirpath, filename),
+                          encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(data, dict) and isinstance(data.get("job"), str) \
+                    and "state" in data:
+                results[data["job"]] = data
+    return results
+
+
+def _secs(value):
+    return f"{value:.1f}s" if isinstance(value, (int, float)) else "-"
+
+
+def _exit_text(code, error):
+    return f"error: {error}" if error else f"exit {code}"
+
+
+SEMVER_CONFIG_PATH = ".vendored/configs/git-semver.json"
+VENDOR_PKG_PREFIX = ".vendored/pkg/"
+VENDOR_VERSION_PATH = ".vendored/manifests/{vendor}.version"
+
+
+def repo_name(root):
+    """The name of the repository the checks run in.
+
+    In Actions, the name part of GITHUB_REPOSITORY (the platform's own fact).
+    Locally, the last path segment of the `origin` remote's URL without
+    `.git`; with no such remote, the name of the checkout's top-level
+    directory."""
+    gh = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if gh:
+        return gh.rstrip("/").rsplit("/", 1)[-1]
+    url = _git_out(root, "config", "--get", "remote.origin.url")
+    if url:
+        name = re.split(r"[/:]", url.rstrip("/"))[-1]
+        if name.endswith(".git"):
+            name = name[:-len(".git")]
+        if name:
+            return name
+    return os.path.basename(os.path.abspath(root)) or "repository"
+
+
+def _read_version(root, rel):
+    """The first line of a version file, or None when there is none. A
+    version is read, never guessed."""
+    if not isinstance(rel, str) or not rel or os.path.isabs(rel) \
+            or ".." in rel.replace("\\", "/").split("/"):
+        return None
+    try:
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            line = f.readline().strip()
+    except (OSError, ValueError):
+        return None
+    if not line or not all(ch.isprintable() for ch in line):
+        return None
+    return line
+
+
+def repo_version_file(root):
+    """The version file the repository's git-semver config names (default
+    VERSION)."""
+    try:
+        with open(os.path.join(root, SEMVER_CONFIG_PATH),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("version_file"), str):
+        return data["version_file"]
+    return "VERSION"
+
+
+def step_owner(root, path, repo):
+    """(owner, version or None) of a setup or step file: the vendor for a
+    file under .vendored/pkg/<vendor>/ with the version from its manifest,
+    otherwise the repository with the version from its version file."""
+    rel = _norm(path or "")
+    if rel.startswith(VENDOR_PKG_PREFIX):
+        vendor = rel[len(VENDOR_PKG_PREFIX):].split("/", 1)[0]
+        if vendor:
+            return vendor, _read_version(
+                root, VENDOR_VERSION_PATH.format(vendor=vendor))
+    if root is None:
+        return repo, None
+    return repo, _read_version(root, repo_version_file(root))
+
+
+def row_name(title, repo, job):
+    """A job's row: `<name> / <repo>:<job>`. No version: a row name is what
+    anything waiting on a check refers to."""
+    return f"{title} / {repo}:{job}"
+
+
+def step_name(title, owner, version, job, path):
+    """A step's report line: `<name> / <owner>@<version>:<job>:<step>`, the
+    step being its file name; without `@<version>` when there is none."""
+    at = f"@{version}" if version else ""
+    return f"{title} / {owner}{at}:{job}:{os.path.basename(_norm(path))}"
+
+
+def _child_result(code, error):
+    if error:
+        return f"failed (error: {error})"
+    if code == 0:
+        return "passed"
+    return f"failed (exit {code})"
+
+
+def short_head(root, head):
+    """The head commit, short, for the report's header."""
+    if not head:
+        return "unknown"
+    if root is not None:
+        sha = resolve_commit(root, str(head))
+        if sha:
+            return _git_out(root, "rev-parse", "--short", sha) or sha[:7]
+    head = str(head)
+    if re.fullmatch(r"[0-9a-f]{7,40}", head):
+        return head[:7]
+    return head
+
+
+def job_rows(config, decision, results, root=None, repo=None):
+    """One row per declared job, in config order."""
+    repo = repo or (repo_name(root) if root is not None else "repository")
+    by_name = {j["name"]: j for j in (decision or {}).get("jobs", [])}
+    rows = []
+    for name, job in config["jobs"].items():
+        title = job.get("title") or default_title(name)
+        d = by_name.get(name)
+        row = {"name": name, "title": title,
+               "display": row_name(title, repo, name),
+               "blocking": job["blocking"], "seconds": None,
+               "children": [], "setup_skipped": False}
+        if d is None:
+            row.update(state="could not run", detail="no decision")
+        elif not d["needed"]:
+            row.update(state="not needed", detail=d["reason"])
+        else:
+            r = results.get(name)
+            if r is None:
+                row.update(state="could not run", detail="no result")
+            else:
+                row["seconds"] = r.get("seconds")
+                row["setup_skipped"] = bool(r.get("setup_skipped"))
+                setup = r.get("setup")
+                if setup:
+                    path = setup.get("script") or job["setup"] or "setup"
+                    owner, version = step_owner(root, path, repo)
+                    row["children"].append(
+                        (step_name(title, owner, version, name, path),
+                         setup.get("seconds"),
+                         _child_result(setup.get("exit_code"),
+                                       setup.get("error"))))
+                for step in r.get("steps", []):
+                    path = step.get("file")
+                    if not path:
+                        try:
+                            path = shlex.split(str(step.get("step")))[0]
+                        except (ValueError, IndexError):
+                            path = str(step.get("step"))
+                    owner, version = step_owner(root, path, repo)
+                    row["children"].append(
+                        (step_name(title, owner, version, name, path),
+                         step.get("seconds"),
+                         _child_result(step.get("exit_code"),
+                                       step.get("error"))))
+                state = r.get("state")
+                if state == "passed":
+                    row.update(state="passed", detail="")
+                elif state == "could not run":
+                    row.update(state="could not run", detail="setup failed")
+                else:
+                    row.update(state="failed", detail=(
+                        f"step {r.get('failed_step')}, "
+                        + _exit_text(r.get("exit_code"), r.get("error"))))
+        rows.append(row)
+    return rows
+
+
+def verdict_line(rows, decision, workflow_ok):
+    total = len(rows)
+    needed = [r for r in rows if r["state"] != "not needed"]
+    counts = {}
+    nonblocking_bad = 0
+    blocking_bad = False
+    for r in needed:
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+        if r["state"] in ("failed", "could not run"):
+            if r["blocking"]:
+                blocking_bad = True
+            else:
+                nonblocking_bad += 1
+    passed = not blocking_bad and workflow_ok and decision is not None
+    word = "PASSED" if passed else "FAILED"
+    if decision is None:
+        return passed, (f"{word} - no decisions: the decide step failed or "
+                        "did not run (see its log)")
+    if not needed:
+        reasons = []
+        for r in rows:
+            if r["detail"] not in reasons:
+                reasons.append(r["detail"])
+        why = "; ".join(reasons) if reasons else "no jobs are declared"
+        text = f"{word} - 0 of {total} jobs needed: {why}"
+    else:
+        parts = [f"{len(needed)} of {total} jobs needed"]
+        for state in ("passed", "failed", "could not run"):
+            if counts.get(state):
+                parts.append(f"{counts[state]} {state}")
+        text = f"{word} - " + ", ".join(parts)
+        if nonblocking_bad:
+            text += f" ({nonblocking_bad} non-blocking)"
+    if not workflow_ok:
+        text += "; the workflows do not match the config"
+    return passed, text
+
+
+def _state_text(row):
+    text = row["state"]
+    if row["detail"]:
+        text += f" ({row['detail']})"
+    if not row["blocking"]:
+        text += " (non-blocking)"
+    return text
+
+
+def header_text(repo, head):
+    return (f"git-cicd report: {repo} at {head} (the change under test; a "
+            "version below is its owner's last release)")
+
+
+def format_report(rows, verdict, workflow_text, setup_note=False,
+                  header="git-cicd report"):
+    width = max([len(r["display"]) for r in rows] + [4])
+    lines = [header]
+    for r in rows:
+        time_text = _secs(r["seconds"]) if r["seconds"] is not None else ""
+        lines.append(f"  {r['display']:<{width}}  {_state_text(r)}"
+                     + (f"  {time_text}" if time_text else ""))
+        for label, seconds, result in r["children"]:
+            lines.append(f"    {label}  {result}  {_secs(seconds)}")
+        if setup_note and r["setup_skipped"]:
+            lines.append("    setup skipped (pass --setup to run it)")
+    lines.append(workflow_text)
+    lines.append(verdict)
+    return "\n".join(lines) + "\n"
+
+
+def _md(text):
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def _md_code(text):
+    """Text as inline code, shown literally whatever it holds."""
+    text = _md(text)
+    fence = "`"
+    while fence in text:
+        fence += "`"
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def format_markdown(rows, verdict, workflow_text, setup_note=False,
+                    header="git-cicd report"):
+    word = verdict.split(" ", 1)[0]
+    lines = [f"## {VERDICT_STATUS}: {word}", "", f"**{_md(verdict)}**", "",
+             _md(header), "",
+             "| Job | State | Time | Detail |", "|---|---|---|---|"]
+    for r in rows:
+        state = r["state"] + ("" if r["blocking"] else " (non-blocking)")
+        time_text = _secs(r["seconds"]) if r["seconds"] is not None else ""
+        lines.append(f"| {_md_code(r['display'])} | {_md(state)} | "
+                     f"{time_text} | {_md(r['detail'])} |")
+        for label, seconds, result in r["children"]:
+            lines.append(f"| &nbsp;&nbsp;↳ {_md_code(label)} | {_md(result)} "
+                         f"| {_secs(seconds)} | |")
+        if setup_note and r["setup_skipped"]:
+            lines.append("| &nbsp;&nbsp;↳ setup | skipped | | pass --setup "
+                         "to run it |")
+    lines += ["", f"Workflow: {_md(workflow_text)}", ""]
+    return "\n".join(lines)
+
+
+def report(config, root, decision, results, workflow=None, setup_note=False,
+           out=None):
+    """Print the report, append it to GITHUB_STEP_SUMMARY when set, and
+    return (passed, verdict line)."""
+    out = out or sys.stdout
+    if workflow is None:
+        workflow = verify_workflow(config, root)
+    workflow_ok = workflow[0]
+    if workflow_ok:
+        workflow_text = "workflows match config"
+    else:
+        try:
+            tool = tool_path(root)
+        except UsageError:
+            tool = "git-cicd"
+        workflow_text = ("workflows do not match config: run "
+                         f"{generate_command(tool)}")
+    repo = repo_name(root)
+    rows = job_rows(config, decision, results, root=root, repo=repo)
+    passed, verdict = verdict_line(rows, decision, workflow_ok)
+    header = header_text(repo, short_head(root, (decision or {}).get("head")))
+    out.write(format_report(rows, verdict, workflow_text, setup_note,
+                            header))
+    out.flush()
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(format_markdown(rows, verdict, workflow_text,
+                                    setup_note, header))
+    return passed, verdict
+
+
+def load_decisions(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        return None
+    return data
+
+
+# ── Check (local) ───────────────────────────────────────────────────────────
+
+def _git_out(root, *args):
+    result = git(*args, cwd=root)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def default_source(root):
+    return _git_out(root, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+
+
+def default_target(root, source):
+    """The upstream's branch name if one is set (and it is not the branch's
+    own remote copy), else the remote default branch, else main."""
+    if source and source != "HEAD":
+        upstream = _git_out(root, "rev-parse", "--abbrev-ref",
+                            "--symbolic-full-name", "@{upstream}")
+        remote = _git_out(root, "config", "--get",
+                          f"branch.{source}.remote")
+        if upstream:
+            name = upstream
+            if remote and remote != "." and name.startswith(remote + "/"):
+                name = name[len(remote) + 1:]
+            if name != source:
+                return name
+    origin_head = _git_out(root, "symbolic-ref", "--quiet", "--short",
+                           "refs/remotes/origin/HEAD")
+    if origin_head.startswith("origin/"):
+        return origin_head[len("origin/"):]
+    return "main"
+
+
+def default_base(root, target):
+    if resolve_commit(root, f"origin/{target}"):
+        return f"origin/{target}"
+    return target
+
+
+def check(config, root, target=None, source=None, base=None, head=None,
+          job=None, force=False, setup=False):
+    """Decide, run the needed jobs one after another, report. Return the
+    exit code (0 passed, 1 failed)."""
+    if force and not job:
+        raise UsageError("--force needs --job NAME")
+    if job is not None and job not in config["jobs"]:
+        raise UsageError(f"unknown job {job!r} (declared: "
+                         f"{', '.join(config['jobs']) or 'none'})")
+    source = source or default_source(root)
+    target = target or default_target(root, source)
+    base = base or default_base(root, target)
+    head = head or "HEAD"
+    base_sha = resolve_commit(root, base) or base
+    head_sha = resolve_commit(root, head) or head
+
+    files, diff_error = changed_files(root, base_sha, head_sha)
+    decision = decide(config, root, "open", target, source, base_sha,
+                      head_sha, files=files, diff_error=diff_error)
+    if job is not None:
+        for d in decision["jobs"]:
+            if d["name"] != job:
+                d.update(needed=False, reason=f"not selected (--job {job})")
+            elif force and not d["needed"] and d["reason"] in (
+                    "no changed file matches paths",
+                    "only needs_nothing files changed"):
+                d.update(needed=True, reason="forced with --force (paths "
+                                             "ignored)")
+    print(format_decision(decision), flush=True)
+
+    facts = {"trigger": "open", "target": target, "source": source,
+             "base": base_sha, "head": head_sha}
+    results = {}
+    for name in needed_jobs(decision):
+        results[name] = run_job(config, root, name, facts, setup=setup,
+                                files=files or [])
+    print("", flush=True)
+    passed, _ = report(config, root, decision, results,
+                       setup_note=not setup)
+    return 0 if passed else 1
+
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+def cmd_validate(args, root):
+    config = load_config(root, args.config)
+    n = len(config["jobs"])
+    print(f"config ok: {n} jobs")
+    return 0
+
+
+def cmd_decide(args, root):
+    config = load_config(root, args.config)
+    decision = decide(config, root, args.trigger, args.target, args.source,
+                      args.base, args.head)
+    if args.changed_files_out:
+        write_changed_files(args.changed_files_out, decision["changed_files"])
+    write_github_output(decision)
+    if args.json:
+        print(json.dumps(decision, indent=2))
+    else:
+        print(format_decision(decision))
+    return 0
+
+
+def facts_from_args(args):
+    return {"trigger": args.trigger, "target": args.target,
+            "source": args.source, "base": args.base, "head": args.head}
+
+
+def cmd_run_job(args, root):
+    config = load_config(root, args.config)
+    result = run_job(config, root, args.job, facts_from_args(args),
+                     setup=args.setup)
+    line = f"==> git-cicd: job {args.job}: {result['state']}"
+    if result["state"] == "failed":
+        line += f" (step {result['failed_step']}, exit {result['exit_code']})"
+    print(f"{line} in {result['seconds']:.1f}s", flush=True)
+    if args.result:
+        with open(args.result, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+            f.write("\n")
+    return 0 if result["state"] == "passed" else 1
+
+
+def cmd_generate(args, root):
+    config = load_config(root, args.config)
+    for rel, text in render_workflows(config, tool_path(root)).items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        print(f"wrote {rel}")
+    legacy = os.path.join(root, LEGACY_WORKFLOW_PATH)
+    if os.path.lexists(legacy):
+        os.remove(legacy)
+        print(f"removed {LEGACY_WORKFLOW_PATH} (replaced by the per-trigger "
+              "workflows; commit the removal)")
+    return 0
+
+
+def cmd_verify(args, root):
+    config = load_config(root, args.config)
+    ok, message = verify_workflow(config, root)
+    print(message)
+    return 0 if ok else 1
+
+
+STATUS_DESCRIPTION_MAX = 140  # GitHub's limit on a commit status description
+
+
+def status_description(verdict):
+    """The verdict line as a commit status description: one line, at most
+    STATUS_DESCRIPTION_MAX characters."""
+    text = " ".join(str(verdict).split())
+    if len(text) > STATUS_DESCRIPTION_MAX:
+        text = text[:STATUS_DESCRIPTION_MAX - 3].rstrip() + "..."
+    return text
+
+
+def write_verdict(path, passed, verdict):
+    """Write the commit status state (success or failure) and description,
+    one per line, for the workflow step that sets the
+    `Verdict / git-cicd:verdict` status."""
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(("success" if passed else "failure") + "\n"
+                + status_description(verdict) + "\n")
+
+
+def cmd_report(args, root):
+    try:
+        config = load_config(root, args.config)
+        check_trigger(config, args.trigger)
+    except UsageError as e:
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as f:
+                f.write(f"## {VERDICT_STATUS}: FAILED\n\n{e}\n")
+        write_verdict(args.verdict_out, False, f"FAILED - {e}")
+        raise
+    except ConfigError as e:
+        write_verdict(args.verdict_out, False,
+                      "FAILED - the config is invalid: " + "; ".join(e.errors))
+        raise
+    decision = load_decisions(args.decisions)
+    passed, verdict = report(config, root, decision,
+                             load_results(args.results))
+    write_verdict(args.verdict_out, passed, verdict)
+    return 0 if passed else 1
+
+
+def cmd_check(args, root):
+    config = load_config(root, args.config)
+    return check(config, root, target=args.target, source=args.source,
+                 base=args.base, head=args.head, job=args.job,
+                 force=args.force, setup=args.setup)
+
+
+def add_change_args(p):
+    """The facts about a change, as given by the platform or the caller."""
+    p.add_argument("--trigger", required=True, choices=ALL_TRIGGERS)
+    p.add_argument("--target", required=True, help="target branch")
+    p.add_argument("--source", required=True, help="source branch")
+    p.add_argument("--base", required=True, help="base commit")
+    p.add_argument("--head", required=True, help="head commit")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="git-cicd",
+        description="Decide which jobs a change needs, run them, report.")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+
+    def add(name, func, help_text):
+        p = sub.add_parser(name, help=help_text, description=help_text)
+        p.add_argument("--config", default=None,
+                       help=f"config file (default: {CONFIG_PATH} at the "
+                            "repository root)")
+        p.set_defaults(func=func)
+        return p
+
+    add("validate", cmd_validate, "load and validate the config")
+
+    p = add("decide", cmd_decide, "decide which jobs a change needs")
+    add_change_args(p)
+    p.add_argument("--json", action="store_true",
+                   help="print the decisions as JSON")
+    p.add_argument("--changed-files-out", metavar="PATH",
+                   help="write the changed files, one per line, to PATH")
+
+    p = add("run-job", cmd_run_job,
+            "run one job: setup when asked, then its steps, without a shell")
+    p.add_argument("job", metavar="JOB")
+    add_change_args(p)
+    p.add_argument("--setup", action="store_true",
+                   help="run the job's setup script first")
+    p.add_argument("--result", metavar="PATH",
+                   help="write the job's result JSON to PATH")
+
+    add("generate", cmd_generate,
+        f"write {', '.join(generated_paths())} from the config (and remove "
+        f"{LEGACY_WORKFLOW_PATH})")
+    add("verify", cmd_verify,
+        f"check that {', '.join(generated_paths())} match what the config "
+        f"generates and {LEGACY_WORKFLOW_PATH} is gone")
+
+    p = add("report", cmd_report, "one line per job with times, and one "
+            "verdict")
+    p.add_argument("--decisions", required=True, metavar="FILE",
+                   help="the JSON written by decide --json")
+    p.add_argument("--results", required=True, metavar="DIR",
+                   help="directory holding run-job --result files (any "
+                        "nesting)")
+    p.add_argument("--trigger", default="open", choices=ALL_TRIGGERS)
+    p.add_argument("--verdict-out", metavar="PATH",
+                   help="write the commit status state (success or failure) "
+                        "and description, one per line, to PATH")
+
+    p = add("check", cmd_check, "decide, run the needed jobs one after "
+            "another and report, locally (no GitHub needed)")
+    p.add_argument("--target", help="target branch (default: the upstream's "
+                   "branch, else origin/HEAD, else main)")
+    p.add_argument("--source", help="source branch (default: the current "
+                   "branch)")
+    p.add_argument("--base", help="base revision (default: origin/<target> "
+                   "if it exists, else <target>)")
+    p.add_argument("--head", help="head revision (default: HEAD)")
+    p.add_argument("--job", metavar="NAME", help="run only this job (still "
+                   "bound by its branches and the decision)")
+    p.add_argument("--force", action="store_true",
+                   help="with --job: run it regardless of its paths")
+    p.add_argument("--setup", action="store_true",
+                   help="run setup scripts (they install things for real)")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        root = repo_root()
+        return args.func(args, root)
+    except ConfigError as e:
+        for line in e.errors:
+            print(line, file=sys.stderr)
+        return 2
+    except UsageError as e:
+        print(f"git-cicd: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
