@@ -35,6 +35,10 @@ CONFIG_PATH = ".vendored/config.json"
 CONFIGS_DIR = ".vendored/configs"
 MANIFESTS_DIR = ".vendored/manifests"
 
+# Branch used when one run updates more than one vendor. `.vendored/check`
+# accepts changes to protected files on it; keep the two in sync.
+MULTI_VENDOR_INSTALL_BRANCH = "chore/install-vendors"
+
 # Registry fields managed by the framework (stored under _vendor key)
 REGISTRY_FIELDS = {"repo", "install_branch", "protected", "allowed",
                    "private", "automerge", "dogfood", "dependency_mode",
@@ -1015,7 +1019,7 @@ def get_pr_metadata(results):
             f"{r['vendor']} v{r['new_version']}" for r in changed
         )
         return {
-            "branch": "chore/install-vendors",
+            "branch": MULTI_VENDOR_INSTALL_BRANCH,
             "title": f"chore: install {vendor_versions}",
             "body": f"Automated vendor updates.\n\n**Updated:** {vendor_versions}",
             "automerge": False,
@@ -1071,9 +1075,7 @@ def create_pull_request(results):
 
     # Skip git hooks: the install script is the authorized mechanism
     # for modifying vendor files. The check guard rejects manual edits,
-    # not automated installs (and multi-vendor branches like
-    # "chore/install-vendors" don't match any single vendor's
-    # install_branch prefix, so the check would reject the commit).
+    # not automated installs.
     subprocess.run(
         ["git", "commit", "--no-verify", "-m", title],
         check=True, capture_output=True,

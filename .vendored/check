@@ -3,7 +3,8 @@
 
 Reads .vendored/config.json and validates that changed files don't modify
 protected vendor files. Skips checking when the PR branch matches a vendor's
-install_branch prefix.
+install_branch prefix, or is the installer's multi-vendor branch
+(chore/install-vendors).
 
 Usage:
     python3 .vendored/check [--base <ref>]
@@ -30,6 +31,10 @@ CONFIGS_DIR = ".vendored/configs"
 
 
 MANIFESTS_DIR_PATH = ".vendored/manifests"
+
+# Branch that `.vendored/install --pr` uses when one run updates more than
+# one vendor. Keep in sync with the installer.
+MULTI_VENDOR_INSTALL_BRANCH = "chore/install-vendors"
 
 
 def _read_registry(vendor_name):
@@ -199,6 +204,11 @@ def check_vendor(vendor_name, vendor_config, changed_files, branch):
     # Skip if branch matches this vendor's install_branch prefix
     install_branch = vendor_config.get("install_branch", "")
     if install_branch and branch.startswith(install_branch):
+        return []
+    # Skip on the installer's own multi-vendor branch. When one run updates
+    # several vendors, `.vendored/install --pr` puts them all on this branch,
+    # which matches no single vendor's install_branch.
+    if branch.startswith(MULTI_VENDOR_INSTALL_BRANCH):
         return []
 
     protected = get_protected_files(vendor_name, vendor_config)
