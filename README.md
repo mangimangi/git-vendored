@@ -18,8 +18,8 @@ Bootstrap git-vendored in a new repo, from its root, with git (works with git-ve
 
 ```bash
 tmp="$(mktemp -d)"
-git clone --depth 1 --branch v0.0.32 https://github.com/mangimangi/git-vendored.git "$tmp"
-VENDOR_CHECKOUT="$tmp" bash "$tmp/install.sh" 0.0.32
+git clone --depth 1 --branch v0.0.33 https://github.com/mangimangi/git-vendored.git "$tmp"
+VENDOR_CHECKOUT="$tmp" bash "$tmp/install.sh" 0.0.33
 rm -rf "$tmp"
 ```
 
@@ -28,7 +28,7 @@ With `VENDOR_CHECKOUT` set, `install.sh` copies every file from that checkout: n
 GitHub-specific shortcut (downloads each file from `raw.githubusercontent.com`, or through `gh api` when `GH_TOKEN` is set):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.32/install.sh | bash -s 0.0.32
+curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.33/install.sh | bash -s 0.0.33
 ```
 
 This creates:
@@ -375,28 +375,28 @@ This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_I
 
 ## Developing git-vendored
 
-git-vendored's own pull request checks, releases, vendor updates and vendor validations run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
+git-vendored's own pull request checks, releases, vendor updates and vendor validations run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`. A job gets only the secrets it declares there (`secrets`): `version-check` declares `CICD_WRITE_TOKEN` and `update-vendored` declares `CICD_WRITE_TOKEN` and the deprecated `VENDOR_PAT`; no other job declares any, and none declares `permissions`. The jobs that only check (`test`, `vendor-check`, `version-check`) say `"manual": false`, so they are not offered in the Manual workflow:
 
 - `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names (`>=3.11`, so Python 3.11; on GitHub runners it looks in the tool cache at `$RUNNER_TOOL_CACHE`), plus `pytest` and `pyyaml`, plus `coverage` (with a startup hook so subprocess runs are measured), into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` under coverage with it and prints the line coverage of the six shipped Python scripts (`templates/install`, `templates/check`, `templates/remove`, `templates/audit`, `templates/feedback`, `validate`): `Stmts` executable lines, `Miss` lines no test ran, `Cover` the percentage, `Missing` their line numbers. Scripts a test starts as a subprocess are counted too. For one file: `python -m coverage report --include=templates/check` after a run. The job fails when the total or any one of those files is below 99% (`fail_under` in `pyproject.toml`, and a per-file check in `ci/test.sh`): a change that lowers coverage below 99% fails the verdict, so it adds its tests in the same pull request. A line is excluded (`# pragma: no cover`) only when no test can reach it, with the reason on the line. After pytest, `ci/test.sh` runs the bats tests in `tests/bats/` for `install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts (`ci/setup.sh` provides a pinned bats-core when none is on `PATH`); a failing bats test fails the job. Run them alone with `bats tests/bats/`.
 - `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
-- `version-check` (Version Check): runs on every pull request into `main`. Its step is `.vendored/pkg/git-semver/git-semver check-bump`, which fails the pull request when it changes a file listed in `files` in `.vendored/configs/git-semver.json` (`install.sh`, `validate`, `templates/**`, `docs/**`, `AGENTS.md`, `README.md`) without raising `VERSION` above `main`'s.
+- `version-check` (Version Check): runs on every pull request into `main`. Its step is `.vendored/pkg/git-semver/git-semver check-bump`, which fails the pull request when it changes a file listed in `files` in `.vendored/configs/git-semver.json` (`install.sh`, `validate`, `templates/**`, `docs/**`, `AGENTS.md`, `README.md`) without raising `VERSION` above `main`'s. The job declares the `CICD_WRITE_TOKEN` secret, so when the bump is missing `check-bump` can push a patch bump to the pull request branch (with that token, so the pushed commit gets its checks); set the secret in the repository's Actions secrets.
 - `release` (Release): runs on every merge to `main`, and by hand. Its step is `.vendored/pkg/git-semver/release` with no subcommand; with `"bump_on": "pull_request"` in `.vendored/configs/git-semver.json` it tags the landed commit with the version it carries (`v<VERSION>`) and creates the GitHub release, or does nothing when that version is already tagged. It pushes nothing to `main`, makes no commit and moves no `latest` tag. It takes no inputs; a manual run releases the current commit of the branch it runs on.
-- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `CICD_WRITE_TOKEN` secret (else the deprecated `VENDOR_PAT`) when one is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
+- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `CICD_WRITE_TOKEN` secret (else the deprecated `VENDOR_PAT`) when one is set, and otherwise the workflow's own token (whose pull request gets no checks). The job declares both secrets; set `CICD_WRITE_TOKEN`. No token is printed. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
 - `validate` (Validate Vendor): by hand only. `ci/validate.sh` runs this repository's `validate <repo> --version <version>` to check whether a repository implements the vendor contract (nothing is installed). Inputs: `repo` (a git URL, or `owner/repo` for github.com; required) and `version` (default `latest`). `validate` reads the vendor with git, the way an install does: its version tags from `git ls-remote --tags` and one fetch at the version's tag, so it needs no `gh`.
 
 ### How a release happens
 
 The version is raised in the pull request, not after the merge. A change to a file git-semver watches runs, on its branch, `.vendored/pkg/git-semver/git-semver bump patch --no-commit` (or `minor` / `major` when it breaks an adopter), commits the new `VERSION` with the change, and the `version-check` job confirms it against `main`. Merging the pull request into `main` runs `release`, which tags that commit `v<VERSION>` and publishes the GitHub release. Nothing is pushed to `main`: there is no bump commit and no bump pull request.
 
-To start a release (it only tags what is already on the branch), an update or a validation by hand: Actions tab → **Manual** workflow → **Run workflow**, pick the branch (`main` for `release` and `update-vendored`), set `job` to the job name (`release`, `update-vendored` or `validate`) and `inputs` to the job's inputs as a JSON object of strings, for example:
+To start a release (it only tags what is already on the branch), an update or a validation by hand: Actions tab → **Manual** workflow → **Run workflow**, pick the branch (`main` for `release` and `update-vendored`), pick the job in the `job` dropdown (`release`, `update-vendored` or `validate`) and fill in the named fields of the inputs it declares, for example:
 
-| `job` | `inputs` |
+| `job` | fields |
 |---|---|
-| `release` | `{}` (it takes none) |
-| `update-vendored` | `{"vendor": "git-cicd", "version": "latest"}` (empty: every vendor, latest) |
-| `validate` | `{"repo": "owner/repo"}` |
+| `release` | none (it takes no inputs) |
+| `update-vendored` | `vendor` = `git-cicd`, `version` = `latest`, `private` = `false` (defaults: every vendor, latest, not private) |
+| `validate` | `repo` = `owner/repo` (`version` defaults to `latest`) |
 
-An input left out gets its default; an undeclared input, a value outside the choices or a missing `repo` refuses the run, with the reason in the report.
+The form shows every job's fields; the chosen job reads only those it declares. A field left at its default gets that default; a missing `repo` refuses the run, with the reason in the report. A run that needs no job shows the single row `Nothing needed / git-vendored:(nothing)`.
 
 Tracker records (`LICENSE`, `.pearls/issues.jsonl`, `.pearls/docs/**`, `.madreperla/sessions.jsonl`, ...) are in `needs_nothing`, so a change to them alone needs no job. `*.md` and `docs/**` are not: `README.md`, `AGENTS.md` and `docs/**` are files git-semver watches, so a pull request into `main` that changes only them still runs `version-check` (and `vendor-check`). No Python version is written in any workflow: `pyproject.toml` is the one place it is declared.
 
