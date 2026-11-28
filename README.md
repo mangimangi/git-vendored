@@ -281,3 +281,21 @@ python3 .vendored/install owner/my-tool
 ```
 
 This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_INSTALL_DIR`. See `docs/vendor-install-dir-guide.md` for details.
+
+## Developing git-vendored
+
+git-vendored's own pull request checks run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
+
+- `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names, plus `pytest` and `pyyaml`, into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` with it.
+- `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
+
+Documents and tracker records (`*.md`, `docs/**`, `.pearls/issues.jsonl`, `.pearls/docs/**`, `.madreperla/sessions.jsonl`, ...) are in `needs_nothing`, so a change to them alone needs no job. No Python version is written in any workflow: `pyproject.toml` is the one place it is declared.
+
+Run the checks locally the way CI runs them:
+
+```bash
+.vendored/pkg/git-cicd/git-cicd check --setup   # first run: setup, then the jobs
+.vendored/pkg/git-cicd/git-cicd check           # later runs reuse the virtualenv
+```
+
+`.github/workflows/git-cicd-open.yml` is generated: after changing the config or upgrading git-cicd, run `.vendored/pkg/git-cicd/git-cicd generate` and commit what it writes (`git-cicd verify` checks it matches).

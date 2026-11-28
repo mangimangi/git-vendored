@@ -80,7 +80,9 @@ def test_user_facing_file_is_covered(filepath):
         ".pearls/issues.jsonl",
         ".madreperla/sessions.jsonl",
         # Repo's own CI (consumers don't ship these)
-        ".github/workflows/test.yml",
+        ".github/workflows/git-cicd-open.yml",
+        "pyproject.toml",
+        "ci/setup.sh",
         # Tests aren't shipped to consumers
         "tests/test_install.py",
         # Vendor configs themselves
