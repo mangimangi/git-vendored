@@ -100,7 +100,7 @@ first_line() { head -n 1 "$STUB_LOG"; }
 
 @test "ci_setup removes token variables the outer environment holds" {
     export VENDOR_PAT=outer-fake-pat GH_TOKEN=outer-fake-gh GITHUB_TOKEN=outer-fake-gt
-    ci_setup
+    BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR/again" ci_setup
     [ -z "${VENDOR_PAT+set}" ]
     [ -z "${GH_TOKEN+set}" ]
     [ -z "${GITHUB_TOKEN+set}" ]
