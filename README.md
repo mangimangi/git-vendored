@@ -40,12 +40,15 @@ The two workflows are installed only on this bootstrap install, into a repositor
 ## Adding a Vendor
 
 ```bash
-python3 .vendored/install owner/repo-name
+python3 .vendored/install owner/repo-name                          # github.com shorthand
+python3 .vendored/install https://git.example.com/team/repo-name.git  # any URL git can fetch
 ```
 
+A vendor is named by a URL git can fetch (`https://`, `ssh://`, `git@host:path`, `file://`) or by the `owner/repo` shorthand, which means that repository on github.com. Its default vendor name is the URL's last path component without `.git`.
+
 This will:
-1. Verify the repo has `install.sh` and a resolvable version
-2. Run the vendor's `install.sh` with `VENDOR_REPO`, `VENDOR_REF`, `VENDOR_MANIFEST`, and `VENDOR_INSTALL_DIR` set
+1. Resolve the version from the repo's version tags (`git ls-remote --tags`), then fetch the vendor once with git at that tag (a shallow clone into a temporary directory outside the repository, removed afterwards) and verify it has `install.sh` at its root
+2. Run the vendor's `install.sh` from that checkout with `VENDOR_REPO`, `VENDOR_REF`, `VENDOR_MANIFEST`, `VENDOR_INSTALL_DIR` and `VENDOR_CHECKOUT` set; `deps.json` and `templates/config.schema` are read from the same checkout
 3. Read the manifest output and store it at `.vendored/manifests/<vendor>.files`
 4. Store the version at `.vendored/manifests/<vendor>.version` and the commit its tag points at at `.vendored/manifests/<vendor>.commit`
 
@@ -83,7 +86,7 @@ The vendor, the version and the private flag can also be given through the envir
 
 | Env var | Stands for | Used when |
 |---------|------------|-----------|
-| `VENDORED_VENDOR` | the target (`<vendor>`, `owner/repo` or `all`) | no positional target is given |
+| `VENDORED_VENDOR` | the target (`<vendor>`, a git URL, `owner/repo` or `all`) | no positional target is given |
 | `VENDORED_VERSION` | `--version` (empty means `latest`) | `--version` is not given |
 | `VENDORED_PRIVATE` | `--private` for `true`/`1`/`yes`; nothing for `false`/`0`/`no`/empty | `--private` is not given |
 
@@ -101,7 +104,7 @@ The install uses two secrets, split by what a token may do. A git-cicd job is gi
 | `CICD_READ_TOKEN` | reads a private vendor repository (`private: true`, `--private`); cannot write | `CICD_READ_TOKEN`, then `CICD_WRITE_TOKEN`, then `VENDOR_PAT` | each private vendor repository: **Contents** read-only (and **Metadata** read-only, which GitHub adds) | `repo` |
 | `GITHUB_TOKEN` (the workflow's own) | reads public vendors; pushes the branch without workflow files; opens the PR only with `--allow-workflow-token` or outside CI | | | |
 
-`VENDOR_PAT`, the old name for both, is still read where the new names are unset, as shown; it is deprecated, so set `CICD_WRITE_TOKEN` and `CICD_READ_TOKEN` instead. No token value is printed.
+`VENDOR_PAT`, the old name for both, is still read where the new names are unset, as shown; it is deprecated, so set `CICD_WRITE_TOKEN` and `CICD_READ_TOKEN` instead. No token value is printed. A vendor is read with git (`git ls-remote`, `git clone`): the read token is handed to that one git command as an HTTP header scoped to the vendor's URL, through `GIT_CONFIG_*` environment variables, never in a URL or on the command line and never written to a git config file. With no token, git reads the vendor anonymously.
 
 ### `--pr` in CI needs `CICD_WRITE_TOKEN`
 
@@ -146,7 +149,7 @@ Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `repo` | yes | GitHub repository (`owner/name`) |
+| `repo` | yes | A git URL of the vendor, or the `owner/name` shorthand for github.com; stored as given |
 | `install_branch` | yes | Branch prefix for vendor update PRs |
 | `allowed` | no | Glob patterns of vendor-managed files that users *can* edit |
 | `private` | no | If `true`, the vendor is read with `CICD_READ_TOKEN` (else `CICD_WRITE_TOKEN`) |
@@ -174,6 +177,7 @@ A vendor repo must provide:
 | `VENDOR_REF` | Git ref to fetch files at |
 | `VENDOR_MANIFEST` | Path to write the file manifest to |
 | `VENDOR_INSTALL_DIR` | Target directory for vendor files (e.g., `.vendored/pkg/<vendor>`) |
+| `VENDOR_CHECKOUT` | Absolute path of the vendor fetched with git at `VENDOR_REF` (removed after the install) |
 | `GH_TOKEN` | Auth token (when available) |
 
 `VENDOR_INSTALL_DIR` is set for non-dogfood vendors. Vendors SHOULD install their primary files under this directory but MAY install to other paths (workflows) when the target system requires specific locations. If not set, the vendor falls back to its original file layout.
@@ -222,7 +226,7 @@ Each key is the dependency's vendor name, and the value is an object with:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `repo` | yes | GitHub repository (`owner/name`) |
+| `repo` | yes | A git URL of the dependency, or the `owner/name` shorthand for github.com |
 | `private` | no | If `true`, the dependency is read with `CICD_READ_TOKEN` (else `CICD_WRITE_TOKEN`). When omitted, inherits the parent vendor's `--private` flag |
 
 Usage:
