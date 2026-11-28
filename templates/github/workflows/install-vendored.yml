@@ -34,7 +34,7 @@ on:
         required: false
         default: 'latest'
       private:
-        description: 'Vendor repo is private (read with CICD_READ_TOKEN)'
+        description: 'Vendor repo is private (only needed when adding a new vendor)'
         type: boolean
         required: false
         default: false

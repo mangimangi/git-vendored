@@ -92,3 +92,28 @@ def test_validate_job_is_manual_only():
     assert inputs["repo"]["required"] is True
     assert "default" not in inputs["repo"]
     assert inputs["version"]["default"] == "latest"
+
+
+def test_declared_secrets():
+    """git-cicd 0.2.0 hands a job only the secrets it declares (gv-a509):
+    update-vendored needs the write token (VENDOR_PAT is its deprecated
+    fallback) and version-check needs it to push a missing bump; no other
+    job gets a secret, and no job declares permissions."""
+    jobs = _jobs()
+    assert jobs["update-vendored"]["secrets"] == ["CICD_WRITE_TOKEN", "VENDOR_PAT"]
+    assert jobs["version-check"]["secrets"] == ["CICD_WRITE_TOKEN"]
+    for name in ("test", "vendor-check", "release", "validate"):
+        assert "secrets" not in jobs[name], name
+    for name, job in jobs.items():
+        assert "permissions" not in job, name
+
+
+def test_check_only_jobs_are_not_manual():
+    """The open jobs only check a pull request, so the Manual form does not
+    offer them; release, update-vendored and validate stay manual."""
+    jobs = _jobs()
+    for name, job in jobs.items():
+        if "open" in job["on"]:
+            assert job["manual"] is False, name
+    for name in ("release", "update-vendored", "validate"):
+        assert jobs[name].get("manual", True) is True, name

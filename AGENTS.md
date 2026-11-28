@@ -45,14 +45,19 @@ pushes nothing to `main`),
 runs `.vendored/install <vendor> --version <version> --pr --deps=install`,
 `GH_TOKEN` from `CICD_WRITE_TOKEN`, else the deprecated `VENDOR_PAT`,
 when set) and `validate` (manual only;
-`ci/validate.sh` runs `validate <repo> --version <version>`). Start one by
-hand: Actions tab -> **Manual** workflow -> Run workflow, `job` = the job name,
-`inputs` = its inputs as a JSON object of strings:
+`ci/validate.sh` runs `validate <repo> --version <version>`). A job gets only
+the secrets it declares (`secrets` in the config): `update-vendored` declares
+`CICD_WRITE_TOKEN` and `VENDOR_PAT`, `version-check` declares
+`CICD_WRITE_TOKEN` (so `check-bump` can push a missing bump); the check-only
+jobs (`test`, `vendor-check`, `version-check`) say `"manual": false` and no
+job declares `permissions`. Start one by hand: Actions tab -> **Manual**
+workflow -> Run workflow, pick the job in the `job` dropdown and fill in its
+named input fields:
 
 ```
-release          {}                              # no inputs: tags the branch's current commit
-update-vendored  {"vendor": "git-cicd", "version": "latest"}   # defaults: all, latest; private: "true"|"false"
-validate         {"repo": "owner/repo"}          # version defaults to latest
+release          (no inputs: tags the branch's current commit)
+update-vendored  vendor=git-cicd version=latest   # defaults: all, latest; private: false|true (only for a new vendor)
+validate         repo=owner/repo                  # version defaults to latest
 ```
 
 ### Releasing
