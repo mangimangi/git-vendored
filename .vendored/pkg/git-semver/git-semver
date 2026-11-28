@@ -7,6 +7,7 @@ Subcommands:
     bump [patch|minor|major] [opts]  Bump version, commit, tag, push
     bump-all --since <commit> [opts] Check all components, bump all triggered
     tag [--push] [--subdir <name>]   Create version tags from VERSION files
+    released [<ref>]                 Print the version tags at a commit (read-only)
 
 Config: .vendored/configs/git-semver.json (see README for schema)
 """
@@ -654,6 +655,27 @@ def cmd_tag(args):
         print("Tags pushed")
 
 
+# Tag names format_tag produces: v<X.Y.Z> (root) or <subdir>/v<X.Y.Z>.
+VERSION_TAG_RE = re.compile(r"^(?:.+/)?v\d+\.\d+\.\d+$")
+
+
+def cmd_released(args):
+    """Print the version tags pointing at a commit (default HEAD), one per line.
+
+    Read-only and local: needs no config, token or network. Prints nothing
+    (exit 0) when no version was released at the commit. `latest` and any
+    other non-version tag are never printed.
+    """
+    ref = getattr(args, "ref", None) or "HEAD"
+    if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
+           check=False).returncode != 0:
+        raise SemverError(f"not a commit: {ref}")
+    result = git("tag", "--points-at", ref)
+    tags = sorted(t for t in result.stdout.split("\n") if VERSION_TAG_RE.match(t))
+    for tag in tags:
+        print(tag)
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -714,6 +736,14 @@ def build_parser():
     tag_parser.add_argument("--push", action="store_true", help="Push tags after creation")
     tag_parser.add_argument("--subdir", default=None, help="Subdirectory name (tags all if omitted)")
 
+    # released
+    released_parser = subparsers.add_parser(
+        "released", help="Print the version tags released at a commit",
+    )
+    released_parser.add_argument(
+        "ref", nargs="?", default="HEAD", help="Commit to ask about (default: HEAD)",
+    )
+
     return parser
 
 
@@ -730,6 +760,7 @@ def main():
         "bump": cmd_bump,
         "bump-all": cmd_bump_all,
         "tag": cmd_tag,
+        "released": cmd_released,
     }
 
     try:
