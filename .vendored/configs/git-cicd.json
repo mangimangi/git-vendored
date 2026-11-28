@@ -1,4 +1,39 @@
 {
-  "jobs": {},
-  "needs_nothing": []
+  "jobs": {
+    "test": {
+      "name": "Unit Tests",
+      "on": ["open"],
+      "branches": ["**"],
+      "paths": [
+        ".vendored/**",
+        "templates/**",
+        "tests/**",
+        "install.sh",
+        "validate",
+        "VERSION",
+        "madreperla.yaml",
+        "pearls.yaml",
+        "pyproject.toml",
+        "ci/**"
+      ],
+      "setup": "ci/setup.sh",
+      "steps": ["ci/test.sh"]
+    },
+    "vendor-check": {
+      "name": "Vendor Check",
+      "on": ["open"],
+      "branches": ["**"],
+      "paths": ["**"],
+      "steps": ["ci/vendor-check.sh"]
+    }
+  },
+  "needs_nothing": [
+    "*.md",
+    "LICENSE",
+    "docs/**",
+    ".pearls/issues.jsonl",
+    ".pearls/docs/**",
+    ".pearls/archive/**",
+    ".madreperla/sessions.jsonl"
+  ]
 }
