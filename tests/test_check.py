@@ -30,6 +30,13 @@ check = _import_check()
 
 # ── Fixtures ───────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _no_cicd_source_branch(monkeypatch):
+    """git-cicd sets CICD_SOURCE_BRANCH for the test job itself; the check
+    reads it first, so a test sees it only when it sets it."""
+    monkeypatch.delenv("CICD_SOURCE_BRANCH", raising=False)
+
+
 @pytest.fixture
 def tmp_repo(tmp_path, monkeypatch):
     """Create a temporary directory with .vendored/ and chdir into it."""
@@ -692,3 +699,146 @@ class TestMain:
     def test_unknown_base_exits_1(self, git_repo, monkeypatch, capsys):
         assert _run_main(monkeypatch, "--base", "no-such-ref") == 1
         assert "Failed to get changed files:" in capsys.readouterr().out
+
+
+# ── Tests: CICD_SOURCE_BRANCH ─────────────────────────────────────────────
+
+class TestCicdSourceBranch:
+    def test_cicd_source_branch_is_read(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+        monkeypatch.setenv("CICD_SOURCE_BRANCH", "feature/x")
+        with patch("subprocess.run") as mock_run:
+            assert check.get_branch_name() == "feature/x"
+        mock_run.assert_not_called()
+
+    def test_cicd_source_branch_wins_over_github_head_ref(self, monkeypatch):
+        monkeypatch.setenv("CICD_SOURCE_BRANCH", "chore/install-tool-v2")
+        monkeypatch.setenv("GITHUB_HEAD_REF", "feature/other")
+        assert check.get_branch_name() == "chore/install-tool-v2"
+
+    def test_empty_cicd_source_branch_falls_back_to_github_head_ref(self, monkeypatch):
+        monkeypatch.setenv("CICD_SOURCE_BRANCH", "")
+        monkeypatch.setenv("GITHUB_HEAD_REF", "feature/pr")
+        assert check.get_branch_name() == "feature/pr"
+
+    def test_empty_cicd_source_branch_and_head_ref_fall_back_to_git(self, monkeypatch):
+        monkeypatch.setenv("CICD_SOURCE_BRANCH", "")
+        monkeypatch.setenv("GITHUB_HEAD_REF", "")
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="local\n")
+            assert check.get_branch_name() == "local"
+
+    def test_install_branch_let_through_with_only_cicd_source_branch(
+            self, git_repo, monkeypatch, capsys):
+        """Under git-cicd no wrapper is needed: the install branch is let through."""
+        (git_repo / ".vendored/pkg/tool/run").write_text("v2\n")
+        _git(git_repo, "commit", "-q", "-am", "install")
+        monkeypatch.setenv("CICD_SOURCE_BRANCH", "chore/install-tool-v1.2.3")
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        assert "No vendor file violations detected." in capsys.readouterr().out
+
+    def test_ordinary_cicd_source_branch_is_still_checked(
+            self, git_repo, monkeypatch, capsys):
+        """The checkout is on an install branch, but CICD_SOURCE_BRANCH says otherwise."""
+        _git(git_repo, "checkout", "-q", "-b", "chore/install-tool-v2")
+        (git_repo / ".vendored/pkg/tool/run").write_text("v2\n")
+        _git(git_repo, "commit", "-q", "-am", "edit")
+        monkeypatch.setenv("CICD_SOURCE_BRANCH", "feature/sneaky")
+        assert _run_main(monkeypatch, "--base", "main") == 1
+        assert "- .vendored/pkg/tool/run" in capsys.readouterr().out
+
+
+# ── Tests: --base notes uncommitted / staged changes it did not read ──────
+
+NOTE_PREFIX = "Note: "
+NOTE_TAIL = ("not checked (only commits in main..HEAD are read); "
+             "run with --staged to check staged files")
+
+
+def _note_lines(out):
+    return [line for line in out.splitlines() if line.startswith(NOTE_PREFIX)]
+
+
+class TestBaseNotesUnreadChanges:
+    def test_unstaged_edit_only(self, git_repo, monkeypatch, capsys):
+        (git_repo / ".vendored/pkg/tool/run").write_text("v2\n")
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        out = capsys.readouterr().out
+        assert "No changed files" in out
+        assert _note_lines(out) == [
+            "Note: 1 uncommitted or staged file(s) " + NOTE_TAIL]
+
+    def test_staged_only(self, git_repo, monkeypatch, capsys):
+        (git_repo / ".vendored/pkg/tool/run").write_text("v2\n")
+        (git_repo / "README.md").write_text("changed\n")
+        _git(git_repo, "add", "-A")
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        out = capsys.readouterr().out
+        assert "No changed files" in out
+        assert _note_lines(out) == [
+            "Note: 2 uncommitted or staged file(s) " + NOTE_TAIL]
+
+    def test_staged_and_unstaged_same_file_counted_once(self, git_repo, monkeypatch, capsys):
+        (git_repo / "README.md").write_text("staged\n")
+        _git(git_repo, "add", "README.md")
+        (git_repo / "README.md").write_text("then edited again\n")
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        assert _note_lines(capsys.readouterr().out) == [
+            "Note: 1 uncommitted or staged file(s) " + NOTE_TAIL]
+
+    def test_committed_violation_plus_uncommitted_file(self, git_repo, monkeypatch, capsys):
+        (git_repo / ".vendored/pkg/tool/run").write_text("v2\n")
+        _git(git_repo, "commit", "-q", "-am", "edit vendor file")
+        # Uncommitted: another change to the committed file (in the range,
+        # so not counted) and an edit outside it.
+        (git_repo / ".vendored/pkg/tool/run").write_text("v3\n")
+        (git_repo / "README.md").write_text("changed\n")
+        assert _run_main(monkeypatch, "--base", "main") == 1
+        out = capsys.readouterr().out
+        assert _note_lines(out) == [
+            "Note: 1 uncommitted or staged file(s) " + NOTE_TAIL]
+        assert "::error::Protected vendor files were modified!" in out
+        assert "  tool:\n    - .vendored/pkg/tool/run\n" in out
+
+    def test_committed_clean_change_plus_uncommitted_file_still_passes(
+            self, git_repo, monkeypatch, capsys):
+        """The note is not a violation: the exit code is unchanged."""
+        (git_repo / "README.md").write_text("changed\n")
+        _git(git_repo, "commit", "-q", "-am", "edit readme")
+        (git_repo / ".vendored/pkg/tool/run").write_text("v2\n")
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        out = capsys.readouterr().out
+        assert len(_note_lines(out)) == 1
+        assert "No vendor file violations detected." in out
+
+    def test_clean_tree_has_no_note(self, git_repo, monkeypatch, capsys):
+        (git_repo / "README.md").write_text("changed\n")
+        _git(git_repo, "commit", "-q", "-am", "edit readme")
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        assert _note_lines(capsys.readouterr().out) == []
+
+    def test_clean_tree_no_changes_has_no_note(self, git_repo, monkeypatch, capsys):
+        assert _run_main(monkeypatch, "--base", "main") == 0
+        out = capsys.readouterr().out
+        assert "No changed files" in out
+        assert _note_lines(out) == []
+
+    def test_staged_mode_prints_no_note(self, git_repo, monkeypatch, capsys):
+        (git_repo / "README.md").write_text("staged\n")
+        _git(git_repo, "add", "README.md")
+        (git_repo / ".vendored/pkg/tool/run").write_text("unstaged\n")
+        assert _run_main(monkeypatch, "--staged") == 0
+        assert _note_lines(capsys.readouterr().out) == []
+
+    def test_note_names_the_default_base(self, git_repo, monkeypatch, capsys):
+        monkeypatch.setenv("GITHUB_BASE_REF", "main")
+        (git_repo / "README.md").write_text("changed\n")
+        with patch.object(check, "get_changed_files", return_value=[]):
+            assert _run_main(monkeypatch) == 0
+        assert ("only commits in origin/main..HEAD are read"
+                in capsys.readouterr().out)
+
+    def test_git_failure_gives_no_note(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=128, stdout="")
+            assert check.get_unread_local_files([]) == []

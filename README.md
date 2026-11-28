@@ -53,6 +53,8 @@ Use `--name` to override the vendor key:
 python3 .vendored/install owner/repo-name --name my-custom-name
 ```
 
+If `owner/repo-name` is already registered (a vendor's registry `repo` is that repository), the same command updates it instead of failing, and says which vendor it updates. If the name it would use is registered for a different repository, it fails naming both. Surrounding whitespace is trimmed from the arguments; an empty target, one with whitespace inside, or a malformed `owner/repo` is rejected with a message naming what is wrong, before any network call.
+
 ## How Updates Work
 
 The `install-vendored.yml` workflow runs weekly (Mondays 9am UTC) or on manual dispatch:
@@ -72,6 +74,29 @@ python3 .vendored/install all  # update all vendors
 # With automatic PR creation (used by CI):
 python3 .vendored/install all --pr
 ```
+
+The vendor, the version and the private flag can also be given through the environment, so a job can pass its declared inputs without building a command line. Command-line arguments win over the environment:
+
+| Env var | Stands for | Used when |
+|---------|------------|-----------|
+| `VENDORED_VENDOR` | the target (`<vendor>`, `owner/repo` or `all`) | no positional target is given |
+| `VENDORED_VERSION` | `--version` (empty means `latest`) | `--version` is not given |
+| `VENDORED_PRIVATE` | `--private` for `true`/`1`/`yes`; nothing for `false`/`0`/`no`/empty | `--private` is not given |
+
+```bash
+VENDORED_VENDOR=git-cicd VENDORED_VERSION=latest python3 .vendored/install --pr
+```
+
+### Workflow files and `VENDOR_PAT`
+
+An install can change files under `.github/workflows/` (a vendor's workflows). The workflow's own `GITHUB_TOKEN` may not push those, so in `--pr` mode:
+
+- **With `VENDOR_PAT` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with `VENDOR_PAT` (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). The PR itself is still opened with `GITHUB_TOKEN`. If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
+- **Without `VENDOR_PAT`**, workflow files are left out as before.
+
+Whenever workflow files are left out, the PR description lists them and says what to run and commit on the branch: for git-cicd, `.vendored/pkg/git-cicd/git-cicd generate`; for other vendors, `python3 .vendored/install <vendor> --force` with a token that may write workflows.
+
+To carry workflow files, `VENDOR_PAT` needs, on the consuming repository: **Contents** read/write, **Pull requests** read/write and **Workflows** write (fine-grained token), or the `repo` and `workflow` scopes (classic token). No token value is printed in any log.
 
 ## Removing a Vendor
 
@@ -144,6 +169,21 @@ A vendor repo must provide:
 - Write version files (the framework handles this via `.vendored/manifests/<vendor>.version`)
 - Modify `.vendored/config.json` (the framework handles vendor registration)
 
+On every install, add or update, `.vendored/manifests/<vendor>.files` is replaced by the manifest that install wrote, so it always lists the files of the installed version.
+
+### Registry
+
+A vendor's registry lives in `.vendored/manifests/<vendor>.registry`. `install.sh` ships it as a `_vendor` block in `.vendored/configs/<vendor>.json` (or as its entry under `vendors` in the legacy `.vendored/config.json`, or by writing the `.registry` file itself). The framework moves it into the `.registry` file and strips `_vendor` from the config.
+
+On every install, add or update, the registry is that of the installed version:
+
+| Owned by | Fields | On an update |
+|----------|--------|--------------|
+| the vendor | `repo`, `install_branch`, `protected`, `allowed`, `dogfood`, `support` | replaced by what the installed version ships; a field it no longer ships is removed (`repo` keeps its old value if missing) |
+| the repository | `private`, `automerge`, `dependency_mode` | kept as they are |
+
+The repository's own `.vendored/configs/<vendor>.json` is never overwritten: its keys keep their values (a key `install.sh` adds is kept). If the installed version ships no registry at all, the existing one is kept unchanged. So when a vendor changes which files it allows (git-cicd v0.0.4 allows `.github/workflows/git-cicd-*.yml` where v0.0.2 allowed `.github/workflows/git-cicd.yml`), `.vendored/check` uses the new rules as soon as the install is merged.
+
 ### Dependencies (`deps.json`)
 
 A vendor repo may include a `deps.json` at its root to declare dependencies on other vendors. When a consumer installs the vendor with `--deps=install`, missing dependencies are automatically installed.
@@ -188,6 +228,18 @@ Dependency modes (`--deps`):
 - Fallback: for v1 vendors without manifests, config `protected` patterns are used
 
 This prevents accidental edits to vendor-managed files while allowing the automated update workflow to function.
+
+### Running the check as a git-cicd job
+
+In a repository that uses [git-cicd](https://github.com/mangimangi/git-cicd), the check can run as a job instead of through `check-vendor.yml`. Declare it in `.vendored/configs/git-cicd.json` and run `.vendored/pkg/git-cicd/git-cicd generate`:
+
+```json
+"vendor-check": {"on": ["open"], "branches": ["**"], "paths": ["**"], "steps": [".vendored/check"]}
+```
+
+No wrapper script is needed. The source branch (which decides whether an `install_branch` is let through) is read in this order: `CICD_SOURCE_BRANCH` (git-cicd sets it for a step, in Actions and locally), then `GITHUB_HEAD_REF` (a GitHub pull request), then the current git branch; an empty variable counts as unset. Without `--base`, the base is `origin/$GITHUB_BASE_REF`, else `origin/main`.
+
+`--base <ref>` reads only the commits in `<ref>..HEAD`. When the working tree or the index holds changes outside that range, the check prints one line saying so (`Note: N uncommitted or staged file(s) not checked ...; run with --staged to check staged files`); the note does not change the exit code. `--staged` checks the index instead (no note is printed in that mode).
 
 ## Directory Layout
 
@@ -284,10 +336,23 @@ This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_I
 
 ## Developing git-vendored
 
-git-vendored's own pull request checks run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
+git-vendored's own pull request checks, releases, vendor updates and vendor validations run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
 
 - `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names, plus `pytest` and `pyyaml`, plus `coverage` (with a startup hook so subprocess runs are measured), into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` under coverage with it and prints the line coverage of the six shipped Python scripts (`templates/install`, `templates/check`, `templates/remove`, `templates/audit`, `templates/feedback`, `validate`): `Stmts` executable lines, `Miss` lines no test ran, `Cover` the percentage, `Missing` their line numbers. Scripts a test starts as a subprocess are counted too. For one file: `python -m coverage report --include=templates/check` after a run. The job fails when the total or any one of those files is below 99% (`fail_under` in `pyproject.toml`, and a per-file check in `ci/test.sh`): a change that lowers coverage below 99% fails the verdict, so it adds its tests in the same pull request. A line is excluded (`# pragma: no cover`) only when no test can reach it, with the reason on the line. After pytest, `ci/test.sh` runs the bats tests in `tests/bats/` for `install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts (`ci/setup.sh` provides a pinned bats-core when none is on `PATH`); a failing bats test fails the job. Run them alone with `bats tests/bats/`.
 - `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
+- `release` (Release): runs on every merge to `main`, and by hand. Its step is `.vendored/pkg/git-semver/release` with no subcommand: git-semver decides whether to bump the version, publish (tag and GitHub release after a bump lands) or do nothing. Inputs: `bump_type` (`patch`, `minor` or `major`; default `patch`), `subdirectory` and `changelog_description` (both default empty).
+- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `VENDOR_PAT` secret when it is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
+- `validate` (Validate Vendor): by hand only. `ci/validate.sh` runs this repository's `validate <repo> --version <version>` to check whether a repository implements the vendor contract (nothing is installed). Inputs: `repo` (`owner/repo`, required) and `version` (default `latest`).
+
+To start a release, an update or a validation by hand: Actions tab → **Manual** workflow → **Run workflow**, pick the branch (`main` for `release` and `update-vendored`), set `job` to the job name (`release`, `update-vendored` or `validate`) and `inputs` to the job's inputs as a JSON object of strings, for example:
+
+| `job` | `inputs` |
+|---|---|
+| `release` | `{"bump_type": "minor"}` |
+| `update-vendored` | `{"vendor": "git-cicd", "version": "latest"}` (empty: every vendor, latest) |
+| `validate` | `{"repo": "owner/repo"}` |
+
+An input left out gets its default; an undeclared input, a value outside the choices or a missing `repo` refuses the run, with the reason in the report.
 
 Documents and tracker records (`*.md`, `docs/**`, `.pearls/issues.jsonl`, `.pearls/docs/**`, `.madreperla/sessions.jsonl`, ...) are in `needs_nothing`, so a change to them alone needs no job. No Python version is written in any workflow: `pyproject.toml` is the one place it is declared.
 
@@ -298,4 +363,4 @@ Run the checks locally the way CI runs them:
 .vendored/pkg/git-cicd/git-cicd check           # later runs reuse the virtualenv
 ```
 
-`.github/workflows/git-cicd-open.yml` is generated: after changing the config or upgrading git-cicd, run `.vendored/pkg/git-cicd/git-cicd generate` and commit what it writes (`git-cicd verify` checks it matches).
+The workflows `.github/workflows/git-cicd-open.yml`, `git-cicd-merge.yml`, `git-cicd-cron.yml` and `git-cicd-manual.yml` are generated: after changing the config or upgrading git-cicd, run `.vendored/pkg/git-cicd/git-cicd generate` and commit what it writes (`git-cicd verify` checks it matches).
