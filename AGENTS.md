@@ -38,7 +38,9 @@ python3 validate <owner/repo> --version latest # check a repo implements the ven
 
 Release, vendor update and vendor validation are git-cicd jobs too
 (`.vendored/configs/git-cicd.json`): `release` (runs on merge to `main`;
-`.vendored/pkg/git-semver/release` decides bump, publish or nothing),
+`.vendored/pkg/git-semver/release` tags the landed commit `v<VERSION>` and
+creates the GitHub release, or does nothing if that version is tagged; it
+pushes nothing to `main`),
 `update-vendored` (cron Mondays 09:00 UTC on `main`; `ci/update-vendored.sh`
 runs `.vendored/install <vendor> --version <version> --pr --deps=install`,
 `GH_TOKEN` from `VENDOR_PAT` when set) and `validate` (manual only;
@@ -47,10 +49,22 @@ hand: Actions tab -> **Manual** workflow -> Run workflow, `job` = the job name,
 `inputs` = its inputs as a JSON object of strings:
 
 ```
-release          {"bump_type": "minor"}          # patch|minor|major; subdirectory, changelog_description
+release          {}                              # no inputs: tags the branch's current commit
 update-vendored  {"vendor": "git-cicd", "version": "latest"}   # defaults: all, latest; private: "true"|"false"
 validate         {"repo": "owner/repo"}          # version defaults to latest
 ```
+
+### Releasing
+
+The version is raised in the pull request (`"bump_on": "pull_request"` in
+`.vendored/configs/git-semver.json`). A change to a file listed in its `files`
+(`install.sh`, `validate`, `templates/**`, `docs/**`, `AGENTS.md`,
+`README.md`) runs `.vendored/pkg/git-semver/git-semver bump patch --no-commit`
+(`minor`/`major` if it breaks an adopter) and commits `VERSION` with the
+change; the `version-check` job (pull requests into `main`) runs
+`.vendored/pkg/git-semver/git-semver check-bump` and fails if the version was
+not raised above `main`'s. Merging into `main` tags and publishes it. There is
+no bump commit or bump pull request.
 
 ## Tests
 
@@ -123,8 +137,9 @@ cron, manual); `git-cicd verify` checks they match.
 ## Contributing
 
 - Commits: `<type>: <description>` (e.g., `feat:`, `fix:`, `chore:`)
+- A change to a file git-semver watches raises `VERSION` in the same PR (`.vendored/pkg/git-semver/git-semver bump patch --no-commit`)
 - Keep every shipped Python script at >= 99% line coverage: a change that lowers it fails the `test` job, so add its tests in the same PR (`# pragma: no cover` only for lines no test can reach, reason on the line)
-- PRs run `tests/` and `.vendored/check` as git-cicd jobs (`Open / ... / git-vendored:<job>` rows, `Verdict / git-cicd:verdict` status); `release`, `update-vendored` and `validate` are git-cicd jobs on merge, cron and manual runs
+- PRs run `tests/` and `.vendored/check` as git-cicd jobs (`Open / ... / git-vendored:<job>` rows, `Verdict / git-cicd:verdict` status), plus `version-check` on pull requests into `main`; `release`, `update-vendored` and `validate` are git-cicd jobs on merge, cron and manual runs
 - Vendor configs live in `.vendored/configs/<vendor>.json`, not the legacy `config.json`
 - All vendor-installed files go under `.vendored/pkg/<vendor>/`
 - Manifests at `.vendored/manifests/<vendor>.files` drive protection rules
