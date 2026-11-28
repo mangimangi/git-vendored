@@ -163,6 +163,7 @@ def get_files_to_remove(vendor_name):
     extra = [
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.files"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.version"),
+        os.path.join(MANIFESTS_DIR, f"{vendor_name}.commit"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.deps"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.schema"),
         os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry"),

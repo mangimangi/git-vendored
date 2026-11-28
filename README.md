@@ -47,7 +47,9 @@ This will:
 1. Verify the repo has `install.sh` and a resolvable version
 2. Run the vendor's `install.sh` with `VENDOR_REPO`, `VENDOR_REF`, `VENDOR_MANIFEST`, and `VENDOR_INSTALL_DIR` set
 3. Read the manifest output and store it at `.vendored/manifests/<vendor>.files`
-4. Store the version at `.vendored/manifests/<vendor>.version`
+4. Store the version at `.vendored/manifests/<vendor>.version` and the commit its tag points at at `.vendored/manifests/<vendor>.commit`
+
+A later install of the same version checks the tag: when it now points at another commit than the recorded one, the install prints `::warning::<vendor>: tag <tag> now points at <new sha>, recorded <old sha>` and still skips, unless `--force` is given, which reinstalls and records the new commit. An install made before commits were recorded has no `.commit` file; it gets one on its next install.
 
 Use `--name` to override the vendor key:
 
@@ -160,7 +162,7 @@ Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 A vendor repo must provide:
 
 1. **`install.sh` at repo root** — receives context via environment variables, downloads its files, and writes a manifest
-2. **Version discovery** — either GitHub Releases (tags like `v1.0.0`) or a `VERSION` file at repo root
+2. **Version tags** — the vendor's versions are its version tags (`vX.Y.Z` or `X.Y.Z`, numeric parts), as `git ls-remote --tags` lists them; `latest` is the highest of them by version order (so `0.0.10` is above `0.0.9`). Tags that are not versions (such as `latest`) and a component's tags (`<subdir>/vX.Y.Z`, a separate series) are ignored. An explicit `--version X` installs tag `vX`, else `X`; a version with no tag is an error
 
 ### Environment Variables
 
@@ -187,7 +189,7 @@ A vendor repo must provide:
 ```
 
 `install.sh` **must not**:
-- Write version files (the framework handles this via `.vendored/manifests/<vendor>.version`)
+- Write version files (the framework handles this via `.vendored/manifests/<vendor>.version` and `.vendored/manifests/<vendor>.commit`)
 - Modify `.vendored/config.json` (the framework handles vendor registration)
 
 On every install, add or update, `.vendored/manifests/<vendor>.files` is replaced by the manifest that install wrote, so it always lists the files of the installed version.
@@ -286,6 +288,7 @@ No wrapper script is needed. The source branch (which decides whether an `instal
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
+    my-tool.commit               # single line: commit of the installed version's tag
     my-tool.schema               # config schema (if vendor provides one)
     my-tool.deps                 # dependency list (if vendor declares deps)
     pearls.files

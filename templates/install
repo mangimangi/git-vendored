@@ -44,6 +44,7 @@ Environment:
 
 import argparse
 import base64
+import collections
 import hashlib
 import json
 import os
@@ -249,20 +250,91 @@ def _gh_env(token):
     return env
 
 
-# ── Pre-validation (add path) ────────────────────────────────────────────
+# ── Git access ────────────────────────────────────────────────────────────
 
-def check_repo_exists(repo, token):
-    """Check that the GitHub repo exists and is accessible."""
-    env = _gh_env(token)
+GITHUB_URL = "https://github.com/{}.git"
+
+
+def _is_url(repo):
+    """True if `repo` is a git URL rather than the owner/repo shorthand."""
+    return "://" in repo or ":" in repo
+
+
+def vendor_git_url(repo):
+    """Return a URL git can fetch for a configured vendor `repo`.
+
+    The owner/repo shorthand (exactly one '/', no ':', no scheme) means that
+    repository on github.com. Anything else (https://, ssh://, git@host:path,
+    file://) is passed to git unchanged.
+    """
+    if not _is_url(repo) and repo.count("/") == 1:
+        return GITHUB_URL.format(repo)
+    return repo
+
+
+def _git_env(token):
+    """Environment that hands `token` to git for one command only.
+
+    The token goes in as an http.extraHeader through GIT_CONFIG_COUNT /
+    GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>: never in argv or a URL, never
+    written to a git config file. With no token, git reads anonymously.
+    GIT_TERMINAL_PROMPT=0 makes a missing credential fail instead of hang.
+    """
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    if token:
+        # Appended after any GIT_CONFIG_* entries already in the environment.
+        try:
+            n = int(env.get("GIT_CONFIG_COUNT", "0"))
+        except ValueError:
+            n = 0
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env["GIT_CONFIG_COUNT"] = str(n + 1)
+        env[f"GIT_CONFIG_KEY_{n}"] = "http.extraHeader"
+        env[f"GIT_CONFIG_VALUE_{n}"] = f"Authorization: Basic {basic}"
+    return env
+
+
+def ls_remote_tags(repo, token):
+    """List a vendor's tags with `git ls-remote --tags`.
+
+    Returns a dict tag -> commit, or None when the repo cannot be read. For
+    an annotated tag the peeled `refs/tags/X^{}` line gives the commit; a
+    lightweight tag's own sha is its commit.
+    """
     result = subprocess.run(
-        ["gh", "api", f"repos/{repo}", "--jq", ".full_name"],
-        capture_output=True, text=True, env=env
+        ["git", "ls-remote", "--tags", vendor_git_url(repo)],
+        capture_output=True, text=True, env=_git_env(token),
     )
     if result.returncode != 0:
-        print(f"::error::Cannot access repo: {repo}")
-        print("Ensure the repo exists and your GH_TOKEN has access.")
-        sys.exit(1)
+        return None
+    tags = {}
+    peeled = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[1].startswith("refs/tags/"):
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()[len("refs/tags/"):]
+        if ref.endswith("^{}"):
+            peeled[ref[:-3]] = sha
+        else:
+            tags[ref] = sha
+    tags.update(peeled)
+    return tags
 
+
+def list_tags(repo, token):
+    """Tag -> commit for a vendor, or exit when the repo cannot be read."""
+    tags = ls_remote_tags(repo, token)
+    if tags is None:
+        print(f"::error::Cannot access repo: {repo}")
+        print(f"Ensure the repo exists; a private vendor needs "
+              f"{READ_TOKEN_ENV} (or {WRITE_TOKEN_ENV}).")
+        sys.exit(1)
+    return tags
+
+
+# ── Pre-validation (add path) ────────────────────────────────────────────
 
 def check_install_sh(repo, token):
     """Verify the repo has an install.sh at its root."""
@@ -279,55 +351,81 @@ def check_install_sh(repo, token):
 
 # ── Version resolution ────────────────────────────────────────────────────
 
-def resolve_version(vendor_name, repo, requested_version, token):
-    """Resolve the target version for a vendor.
+Resolved = collections.namedtuple("Resolved", "version tag commit")
 
-    Strategy:
-    1. If a specific version is given (not 'latest'), use it
-    2. Try GitHub releases API for latest release tag
-    3. Fall back to reading VERSION file from default branch
+
+def _parse_version(text):
+    """Return a version's numeric parts as a tuple, or None if not a version."""
+    parts = text.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def version_tags(tags, prefix=""):
+    """Version tags of one series: {version: (tag, commit)}.
+
+    A version tag is `<prefix>vX.Y.Z` or `<prefix>X.Y.Z` with numeric parts.
+    With no prefix (the vendor's root series), tags containing '/' are a
+    component's series (`<subdir>/vX.Y.Z`) and are left out. Tags that are
+    not versions (such as `latest`) are ignored. When both `vX` and `X`
+    exist, `vX` wins.
+    """
+    found = {}
+    for tag, commit in tags.items():
+        if not tag.startswith(prefix):
+            continue
+        rest = tag[len(prefix):]
+        if "/" in rest:
+            continue
+        bare = rest[1:] if rest.startswith("v") else rest
+        if _parse_version(bare) is None:
+            continue
+        if bare in found and not rest.startswith("v"):
+            continue
+        found[bare] = (tag, commit)
+    return found
+
+
+def pick_version(tags, requested_version, prefix=""):
+    """Resolve a requested version against tag -> commit.
+
+    Returns (Resolved, None) or (None, reason). `latest` (or empty) is the
+    highest version tag by numeric order; an explicit version X is tag
+    `<prefix>vX` if it exists, else `<prefix>X`.
     """
     if requested_version and requested_version != "latest":
-        return requested_version
-
-    version = _resolve_from_releases(repo, token)
-    if version:
-        return version
-
-    version = _resolve_from_version_file(repo, token)
-    if version:
-        return version
-
-    print(f"::error::Could not resolve version for {vendor_name} from {repo}")
-    sys.exit(1)
-
-
-def _resolve_from_releases(repo, token):
-    """Try to get latest version from GitHub releases."""
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip().lstrip("v")
-    return None
+        for tag in (f"{prefix}v{requested_version}",
+                    f"{prefix}{requested_version}"):
+            if tag in tags:
+                return Resolved(requested_version, tag, tags[tag]), None
+        return None, f"no tag for {requested_version}"
+    versions = version_tags(tags, prefix)
+    if not versions:
+        return None, "no version tags found"
+    best = max(versions, key=_parse_version)
+    tag, commit = versions[best]
+    return Resolved(best, tag, commit), None
 
 
-def _resolve_from_version_file(repo, token):
-    """Fallback: read VERSION file from repo default branch."""
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/VERSION", "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        try:
-            content = base64.b64decode(result.stdout.strip()).decode().strip()
-            return content
-        except Exception:
-            pass
-    return None
+def resolve_version(vendor_name, repo, requested_version, token, prefix=""):
+    """Resolve the version, tag and commit to install for a vendor.
+
+    The single place a requested version becomes a tag and a commit: the
+    versions are the vendor's version tags as `git ls-remote --tags` lists
+    them, and `latest` is the highest of them.
+    """
+    tags = list_tags(repo, token)
+    resolved, reason = pick_version(tags, requested_version, prefix)
+    if resolved is None:
+        if reason.startswith("no tag"):
+            print(f"::error::Version {requested_version} of {vendor_name} "
+                  f"has no tag in {repo}")
+        else:
+            print(f"::error::{repo} has no version tags "
+                  f"(expected tags like v1.0.0)")
+        sys.exit(1)
+    return resolved
 
 
 # ── Manifest helpers ──────────────────────────────────────────────────────
@@ -364,6 +462,22 @@ def write_manifest_version(vendor_name, version):
     version_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.version")
     with open(version_path, "w") as f:
         f.write(f"{version}\n")
+
+
+def read_manifest_commit(vendor_name):
+    """Read the commit recorded for a vendor's installed version, or None."""
+    commit_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.commit")
+    if os.path.isfile(commit_path):
+        return open(commit_path).read().strip() or None
+    return None
+
+
+def write_manifest_commit(vendor_name, commit):
+    """Record the commit of a vendor's installed version tag."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    commit_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.commit")
+    with open(commit_path, "w") as f:
+        f.write(f"{commit}\n")
 
 
 def validate_manifest(files):
@@ -948,12 +1062,12 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     installing_set.append(repo)
 
     # Pre-validate
-    check_repo_exists(repo, token)
+    resolved = resolve_version(repo, repo, version, token)
+    resolved_version = resolved.version
     check_install_sh(repo, token)
-    resolved_version = resolve_version(repo, repo, version, token)
 
     # Check dependencies
-    ref = f"v{resolved_version}"
+    ref = resolved.tag
     deps = download_deps(repo, ref, token)
     if deps:
         mode = deps_mode if deps_mode is not None else "error"
@@ -1041,6 +1155,7 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
         validate_manifest(manifest_files)
         write_manifest(new_key, manifest_files)
         write_manifest_version(new_key, resolved_version)
+        write_manifest_commit(new_key, resolved.commit)
 
     # Cache resolved deps
     if deps:
@@ -1086,8 +1201,15 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     installing_set.append(repo)
 
     token = get_auth_token(vendor_config)
-    target_version = resolve_version(vendor_name, repo, requested_version, token)
+    resolved = resolve_version(vendor_name, repo, requested_version, token)
+    target_version = resolved.version
     current_version = get_current_version(vendor_name, vendor_config)
+
+    if current_version == target_version:
+        recorded = read_manifest_commit(vendor_name)
+        if recorded and recorded != resolved.commit:
+            print(f"::warning::{vendor_name}: tag {resolved.tag} now points "
+                  f"at {resolved.commit}, recorded {recorded}")
 
     if current_version == target_version and not force:
         print(f"{vendor_name}: already at v{target_version}, skipping")
@@ -1099,7 +1221,7 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
         }
 
     # Check dependencies for the target version
-    ref = f"v{target_version}"
+    ref = resolved.tag
     deps = download_deps(repo, ref, token)
     if deps:
         mode = _get_dep_mode(deps_mode, vendor_config)
@@ -1120,6 +1242,7 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
         validate_manifest(manifest_files)
         write_manifest(vendor_name, manifest_files)
         write_manifest_version(vendor_name, target_version)
+        write_manifest_commit(vendor_name, resolved.commit)
 
     print(f"  protected: {', '.join(registry.get('protected', []))}")
     if registry.get("allowed"):
