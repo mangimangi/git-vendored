@@ -343,16 +343,129 @@ run_install() {
     [[ "$output" == *"Done!"* ]]
 }
 
-@test "gh path: a failed workflow fetch is retried on the next install, not skipped" {
+@test "gh path: a workflow whose bootstrap fetch failed is not added by the next install (an upgrade)" {
     export GH_TOKEN=tok
     export GH_FAIL="*check-vendor.yml*"
     run_install 1.0.0
     [ "$status" -eq 0 ]
     unset GH_FAIL
+    run_install 1.0.1
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Not installing .github/workflows/check-vendor.yml: this is an upgrade"* ]]
+    [ ! -e .github/workflows/check-vendor.yml ]
+    ! grep -q check-vendor.yml .vendored/manifests/git-vendored.files
+}
+
+# ── bootstrap, upgrade, git-cicd ────────────────────────────────────────
+
+@test "bootstrap (no earlier install): both workflows installed and listed" {
     run_install 1.0.0
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Installed .github/workflows/check-vendor.yml"* ]]
-    [ "$(cat .github/workflows/check-vendor.yml)" = "gh:templates/github/workflows/check-vendor.yml@v1.0.0" ]
+    [ -f .github/workflows/install-vendored.yml ]
+    [ -f .github/workflows/check-vendor.yml ]
+    [ "$(cat .vendored/manifests/git-vendored.files)" = "$SORTED_MANIFEST" ]
+    [[ "$output" != *"Not installing"* ]]
+}
+
+@test "upgrade without the workflows: neither is fetched, written or listed" {
+    run_install 1.0.0
+    [ "$status" -eq 0 ]
+    rm .github/workflows/install-vendored.yml .github/workflows/check-vendor.yml
+    : > "$STUB_LOG"
+    export VENDOR_MANIFEST="$BATS_TEST_TMPDIR/out.files"
+    run_install 1.1.0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Not installing .github/workflows/install-vendored.yml: this is an upgrade (.vendored/manifests/git-vendored.version exists) and the repository has no such workflow"* ]]
+    [[ "$output" == *"Not installing .github/workflows/check-vendor.yml: this is an upgrade"* ]]
+    [[ "$output" != *"Installed .github/workflows/"* ]]
+    refute_logged_match "templates/github/workflows"
+    [ ! -e .github/workflows/install-vendored.yml ]
+    [ ! -e .github/workflows/check-vendor.yml ]
+    ! grep -q workflows .vendored/manifests/git-vendored.files
+    ! grep -q workflows "$VENDOR_MANIFEST"
+    [ "$(cat .vendored/manifests/git-vendored.version)" = "1.1.0" ]
+    [[ "$output" == *"Done! git-vendored v1.1.0 installed."* ]]
+}
+
+@test "upgrade keeps a workflow that is present and does not add the missing one" {
+    run_install 1.0.0
+    [ "$status" -eq 0 ]
+    rm .github/workflows/check-vendor.yml
+    echo mine > .github/workflows/install-vendored.yml
+    run_install 1.1.0
+    [ "$status" -eq 0 ]
+    [ "$(cat .github/workflows/install-vendored.yml)" = mine ]
+    [ ! -e .github/workflows/check-vendor.yml ]
+    grep -qx .github/workflows/install-vendored.yml .vendored/manifests/git-vendored.files
+    ! grep -q check-vendor.yml .vendored/manifests/git-vendored.files
+}
+
+@test "each earlier-install marker makes the run an upgrade" {
+    for marker in .vendored/manifests/git-vendored.version \
+            .vendored/manifests/git-vendored.files .vendored/.version .vendored/install; do
+        rm -rf .vendored .github
+        : > "$STUB_LOG"
+        mkdir -p "$(dirname "$marker")"
+        echo old > "$marker"
+        run_install 1.0.0
+        [ "$status" -eq 0 ]
+        [[ "$output" == *"this is an upgrade ($marker exists)"* ]]
+        refute_logged_match "templates/github/workflows"
+        [ ! -e .github/workflows/check-vendor.yml ]
+        [ ! -e .github/workflows/install-vendored.yml ]
+    done
+}
+
+write_git_cicd_config() {
+    mkdir -p .vendored/configs ci
+    cat > ci/vendor-check.sh <<'SH'
+#!/bin/bash
+exec python3 .vendored/check --base "$CICD_BASE"
+SH
+    cat > .vendored/configs/git-cicd.json <<'JSON'
+{"jobs": {
+  "test": {"on": ["open"], "steps": ["ci/test.sh"]},
+  "vendor-check": {"on": ["open"], "steps": ["ci/vendor-check.sh"]},
+  "update-vendored": {"on": ["cron"], "steps": [["python3", ".vendored/install", "all", "--pr"]]}
+}}
+JSON
+}
+
+@test "bootstrap on git-cicd: jobs that run .vendored/check and .vendored/install replace both workflows" {
+    write_git_cicd_config
+    run_install 1.0.0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Not installing .github/workflows/install-vendored.yml: git-cicd job 'update-vendored' in .vendored/configs/git-cicd.json already runs .vendored/install"* ]]
+    [[ "$output" == *"Not installing .github/workflows/check-vendor.yml: git-cicd job 'vendor-check' in .vendored/configs/git-cicd.json already runs .vendored/check"* ]]
+    refute_logged_match "templates/github/workflows"
+    [ ! -e .github/workflows/install-vendored.yml ]
+    [ ! -e .github/workflows/check-vendor.yml ]
+    ! grep -q workflows .vendored/manifests/git-vendored.files
+}
+
+@test "bootstrap on git-cicd: a step string naming the command counts; a job that runs neither does not" {
+    mkdir -p .vendored/configs
+    cat > .vendored/configs/git-cicd.json <<'JSON'
+{"jobs": {
+  "vendor-check": {"steps": ["python3 ./.vendored/check --base origin/main"]},
+  "other": {"steps": ["ci/missing.sh", ".vendored/installer"]}
+}}
+JSON
+    run_install 1.0.0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Not installing .github/workflows/check-vendor.yml: git-cicd job 'vendor-check'"* ]]
+    [[ "$output" == *"Installed .github/workflows/install-vendored.yml"* ]]
+    [ ! -e .github/workflows/check-vendor.yml ]
+    grep -qx .github/workflows/install-vendored.yml .vendored/manifests/git-vendored.files
+}
+
+@test "bootstrap with an unreadable git-cicd config installs both workflows" {
+    mkdir -p .vendored/configs
+    echo 'not json' > .vendored/configs/git-cicd.json
+    run_install 1.0.0
+    [ "$status" -eq 0 ]
+    [ -f .github/workflows/install-vendored.yml ]
+    [ -f .github/workflows/check-vendor.yml ]
 }
 
 # ── required download failures ──────────────────────────────────────────
