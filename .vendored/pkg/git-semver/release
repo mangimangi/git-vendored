@@ -19,6 +19,15 @@ decision lives here and not in a workflow file or a per-repo script:
                                                workflow_dispatch, with inputs
     any other trigger (open, cron, ...)    ->  refused, non-zero exit
 
+When git-semver's config (.vendored/configs/git-semver.json) sets
+"bump_on": "pull_request", the version is bumped in the pull request
+(checked by `git-semver check-bump`) and a merge or manual run instead tags
+the landed commit: for each component whose version has no tag yet, an
+annotated tag at the landed commit, pushed by name, and one GitHub release
+per new tag. It never bumps, commits, pushes to the branch, consults the
+commit-subject rules or creates/moves `latest`, and refuses (non-zero) a
+version that the merge set but that is already tagged at another commit.
+
 The same script serves a git-cicd job and the version-bump.yml workflow:
 git-cicd's CICD_* variables win over the GitHub Actions ones whenever they
 are set, because inside a git-cicd job on Actions both exist and git-cicd's
@@ -58,6 +67,15 @@ from pathlib import Path
 
 SEMVER_SCRIPT = str(Path(__file__).parent / "git-semver")
 CONFIG_PATH = ".semver/config.json"
+SEMVER_CONFIG_PATH = ".vendored/configs/git-semver.json"
+BUMP_ON_VALUES = ("merge", "pull_request")
+DEFAULT_VERSION_FILE = "VERSION"
+# Top-level git-semver config keys that are not subdirectory components
+# (git-semver's RESERVED_KEYS).
+SEMVER_RESERVED_KEYS = frozenset({
+    "version_file", "files", "updates", "changelog", "install", "bump_on",
+})
+ZERO_SHA = "0" * 40
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -351,7 +369,10 @@ def handle_merge():
 def cmd_auto():
     """No subcommand: work out whether this run bumps, publishes or does nothing."""
     trigger, source = resolve_trigger()
-    if trigger == "merge":
+    if trigger in ("merge", "manual") and \
+            read_bump_on(read_semver_config()) == "pull_request":
+        handle_tag_landed(trigger)
+    elif trigger == "merge":
         handle_merge()
     elif trigger == "manual":
         _, automerge = read_config()
@@ -365,6 +386,149 @@ def cmd_auto():
         print(f"Error: release does not run for trigger {trigger!r} (from "
               f"{source}); it runs on a merge or a manual run", file=sys.stderr)
         sys.exit(1)
+
+
+# ── bump_on: pull_request — tag the landed commit ──────────────────────
+
+def read_semver_config():
+    """git-semver's config as a dict ({} when the file is absent)."""
+    path = Path(SEMVER_CONFIG_PATH)
+    if not path.exists():
+        return {}
+    try:
+        config = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"Error: {SEMVER_CONFIG_PATH} is not valid JSON: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    return config if isinstance(config, dict) else {}
+
+
+def read_bump_on(config):
+    """The "bump_on" setting: "merge" (default) or "pull_request"."""
+    value = config.get("bump_on", "merge")
+    if value not in BUMP_ON_VALUES:
+        allowed = ", ".join(f'"{v}"' for v in BUMP_ON_VALUES)
+        print(f"Error: {SEMVER_CONFIG_PATH}: bump_on is {value!r}; "
+              f"allowed values are {allowed}", file=sys.stderr)
+        sys.exit(1)
+    return value
+
+
+def semver_components(config):
+    """[(subdir or None, version_file)] for the root and each subdirectory."""
+    components = [(None, config.get("version_file", DEFAULT_VERSION_FILE))]
+    for key, value in config.items():
+        if key.startswith("_") or key in SEMVER_RESERVED_KEYS:
+            continue
+        if isinstance(value, dict):
+            components.append(
+                (key, value.get("version_file", DEFAULT_VERSION_FILE)))
+    return components
+
+
+def format_tag(version, subdir=None):
+    """vX.Y.Z for the root, <subdir>/vX.Y.Z for a subdirectory."""
+    return f"{subdir}/v{version}" if subdir else f"v{version}"
+
+
+def is_version(text):
+    parts = text.split(".")
+    return len(parts) == 3 and all(p.isdigit() for p in parts)
+
+
+def version_file_changed(base, landed, version_file):
+    """Did base..landed change version_file? True when it cannot be told."""
+    if not base or base == ZERO_SHA:
+        return True
+    result = run("git", "diff", "--quiet", base, landed, "--", version_file,
+                 check=False)
+    return result.returncode != 0
+
+
+def plan_tags(config, landed, base):
+    """Work out the tags to create at `landed`. Returns (new, errors)."""
+    new, errors = [], []
+    for subdir, version_file in semver_components(config):
+        label = subdir or "root"
+        shown = run("git", "show", f"{landed}:{version_file}", check=False)
+        if shown.returncode != 0:
+            print(f"{label}: no {version_file} at {landed[:12]}, skipping")
+            continue
+        version = shown.stdout.strip()
+        if not is_version(version):
+            errors.append(f"{label}: {version_file} holds {version!r}, "
+                          "not a valid X.Y.Z version")
+            continue
+        tag = format_tag(version, subdir)
+        held = run("git", "rev-parse", "--verify", "--quiet",
+                   f"refs/tags/{tag}^{{commit}}", check=False)
+        if held.returncode != 0:
+            print(f"{label}: {tag} is not tagged yet, tagging {landed[:12]}")
+            new.append(tag)
+            continue
+        holder = held.stdout.strip()
+        if holder == landed or run(
+                "git", "merge-base", "--is-ancestor", holder, landed,
+                check=False).returncode == 0:
+            print(f"{label}: {tag} is already released (at {holder[:12]})")
+            continue
+        if not version_file_changed(base, landed, version_file):
+            print(f"{label}: {tag} is tagged at {holder[:12]} and this merge "
+                  f"did not change {version_file}; nothing to release")
+            continue
+        fix = "git-semver bump patch --no-push" + (
+            f" --subdir {subdir}" if subdir else "")
+        errors.append(
+            f"{label}: this merge set {version_file} to {version}, but {tag} "
+            f"is already tagged at {holder}, which is not this commit or an "
+            f"ancestor of it (two pull requests bumped to the same version?). "
+            f"Raise the version to one that is not tagged in a new pull "
+            f"request (`{fix}`) and merge it.")
+    return new, errors
+
+
+def handle_tag_landed(trigger):
+    """bump_on: pull_request. Tag and release the landed commit's versions."""
+    if trigger == "manual":
+        given = [name.lower() for name in
+                 ("BUMP_TYPE", "SUBDIRECTORY", "CHANGELOG_DESCRIPTION")
+                 if read_input(name)]
+        if given:
+            print(f"Error: input(s) {', '.join(given)} do not apply: this "
+                  "repository bumps the version in the pull request "
+                  f"(bump_on: pull_request in {SEMVER_CONFIG_PATH}). Run "
+                  "`git-semver bump <patch|minor|major> --no-push` on a "
+                  "branch and merge its pull request; a manual run only "
+                  "releases the current commit.", file=sys.stderr)
+            sys.exit(1)
+
+    head = first_env("CICD_HEAD", "GITHUB_SHA") or "HEAD"
+    landed = run("git", "rev-parse", f"{head}^{{commit}}").stdout.strip()
+    base = first_env("CICD_BASE", "GITHUB_EVENT_BEFORE")
+    print(f"bump_on is pull_request: releasing {landed[:12]} ({trigger})")
+
+    new, errors = plan_tags(read_semver_config(), landed, base)
+    if errors:
+        for error in errors:
+            print(f"Error: {error}", file=sys.stderr)
+        print("Nothing was tagged or pushed.", file=sys.stderr)
+        sys.exit(1)
+    if not new:
+        print("Nothing to release: every version is already tagged")
+        return
+
+    configure_git()
+    for tag in new:
+        run("git", "tag", "-a", tag, "-m", tag, landed)
+    for tag in new:
+        run("git", "push", "origin", tag)
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    for tag in new:
+        print(f"Creating release for {tag}")
+        run("gh", "release", "create", tag,
+            "--repo", repo, "--title", tag, "--generate-notes")
+    print(f"Released {', '.join(new)} at {landed[:12]}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────

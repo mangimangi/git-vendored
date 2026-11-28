@@ -24,6 +24,11 @@
       "type": "object",
       "required": false,
       "description": "Installed workflow behavior (on_merge, automerge)"
+    },
+    "bump_on": {
+      "type": "string",
+      "required": false,
+      "description": "When the version is bumped: \"merge\" (default; release bumps after the merge) or \"pull_request\" (the pull request bumps, checked by git-semver check-bump; release tags the landed commit and pushes nothing to the branch)"
     }
   }
 }
