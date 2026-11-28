@@ -2,7 +2,8 @@
 # ci/setup.sh - setup for git-vendored's own `test` job.
 #
 # Reads the Python floor from requires-python in pyproject.toml, uses that
-# Python if present (python3.X, the runner tool cache) or installs it with uv
+# Python if present (python3.X, the runner tool cache: $RUNNER_TOOL_CACHE,
+# /opt/hostedtoolcache when unset) or installs it with uv
 # (itself installed into a small venv when missing), and installs what the
 # test suite needs (pytest, pyyaml, coverage) into a virtualenv ci/test.sh
 # finds on disk, with a .pth startup hook so Python processes the tests start
@@ -19,10 +20,13 @@ fi
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/git-vendored-ci"
 VENV="$CACHE/venv-$FLOOR"
 TOOLS="$CACHE/tools"   # holds uv when it has to be installed
+# The GitHub runner tool cache. GitHub sets RUNNER_TOOL_CACHE on its runners;
+# the bats tests point it at a directory they control.
+TOOLCACHE="${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}"
 
 find_floor() {
     local candidate
-    for candidate in "python$FLOOR" /opt/hostedtoolcache/Python/"$FLOOR".*/x64/bin/python3; do
+    for candidate in "python$FLOOR" "$TOOLCACHE"/Python/"$FLOOR".*/x64/bin/python3; do
         if command -v "$candidate" >/dev/null 2>&1; then
             command -v "$candidate"
             return 0
@@ -52,13 +56,10 @@ fi
 
 "$PYTHON" -m venv --clear "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-# coverage 7.6 is the last line that supports Python 3.8 (the floor); [toml]
-# pulls tomli there so the [tool.coverage] settings in pyproject.toml are read.
-"$VENV/bin/python" -m pip install --quiet pytest pyyaml "coverage[toml]>=7.2,<7.7"
+"$VENV/bin/python" -m pip install --quiet pytest pyyaml "coverage>=7.2"
 # Subprocess measurement: every interpreter started from this venv runs this
 # hook, which starts coverage only when COVERAGE_PROCESS_START is set (as
-# ci/test.sh does). coverage 7.10's patch = ["subprocess"] would replace it,
-# but does not support Python 3.8.
+# ci/test.sh does).
 SITE="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 echo "import coverage; coverage.process_startup()" > "$SITE/git-vendored-coverage.pth"
 "$VENV/bin/python" --version

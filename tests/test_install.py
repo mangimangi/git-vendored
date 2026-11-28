@@ -19,7 +19,7 @@ ROOT = Path(__file__).parent.parent
 def _import_install():
     filepath = str(ROOT / "templates" / "install")
     loader = importlib.machinery.SourceFileLoader("vendored_install", filepath)
-    spec = importlib.util.spec_from_loader("vendored_install", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_install", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     module.__file__ = filepath
     sys.modules["vendored_install"] = module

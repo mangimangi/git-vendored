@@ -21,7 +21,7 @@ CONFIG_PATH = ROOT / ".vendored" / "configs" / "git-semver.json"
 def _load_matches_pattern():
     """Import git-semver's pattern matcher (the script has no .py extension)."""
     loader = importlib.machinery.SourceFileLoader("git_semver_bin", str(GIT_SEMVER_BIN))
-    spec = importlib.util.spec_from_loader("git_semver_bin", loader, origin=str(GIT_SEMVER_BIN))
+    spec = importlib.util.spec_from_file_location("git_semver_bin", str(GIT_SEMVER_BIN), loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["git_semver_bin"] = module
     spec.loader.exec_module(module)

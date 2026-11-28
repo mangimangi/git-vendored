@@ -24,8 +24,7 @@ INSTALL = ROOT / "templates" / "install"
 def _import_install():
     filepath = str(INSTALL)
     loader = importlib.machinery.SourceFileLoader("vendored_install_git", filepath)
-    spec = importlib.util.spec_from_loader("vendored_install_git", loader,
-                                           origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_install_git", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     module.__file__ = filepath
     spec.loader.exec_module(module)

@@ -21,7 +21,7 @@ ROOT = Path(__file__).parent.parent
 def _import_validate():
     filepath = str(ROOT / "validate")
     loader = importlib.machinery.SourceFileLoader("vendored_validate", filepath)
-    spec = importlib.util.spec_from_loader("vendored_validate", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_validate", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["vendored_validate"] = module
     spec.loader.exec_module(module)

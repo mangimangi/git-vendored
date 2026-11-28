@@ -416,7 +416,9 @@ run_install() {
     done
 }
 
+# install.sh reads the git-cicd config with python3.
 write_git_cicd_config() {
+    use_real_python3
     mkdir -p .vendored/configs ci
     cat > ci/vendor-check.sh <<'SH'
 #!/bin/bash
@@ -444,6 +446,7 @@ JSON
 }
 
 @test "bootstrap on git-cicd: a step string naming the command counts; a job that runs neither does not" {
+    use_real_python3
     mkdir -p .vendored/configs
     cat > .vendored/configs/git-cicd.json <<'JSON'
 {"jobs": {
@@ -459,7 +462,21 @@ JSON
     grep -qx .github/workflows/install-vendored.yml .vendored/manifests/git-vendored.files
 }
 
+@test "bootstrap on git-cicd without python3 on PATH: the config is not read, both workflows installed" {
+    write_git_cicd_config
+    rm "$STUB_BIN/python3"
+    use_system_tools
+    run env PATH="$RUN_PATH" bash -c 'command -v python3'
+    [ "$status" -ne 0 ]
+    run_install 1.0.0
+    [ "$status" -eq 0 ]
+    [ -f .github/workflows/install-vendored.yml ]
+    [ -f .github/workflows/check-vendor.yml ]
+    [[ "$output" != *"Not installing"* ]]
+}
+
 @test "bootstrap with an unreadable git-cicd config installs both workflows" {
+    use_real_python3
     mkdir -p .vendored/configs
     echo 'not json' > .vendored/configs/git-cicd.json
     run_install 1.0.0

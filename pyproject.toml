@@ -1,7 +1,7 @@
 [project]
 name = "git-vendored"
 description = "Automated vendor install control for repo-embedded tools"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dependencies = []
 dynamic = ["version"]
 
