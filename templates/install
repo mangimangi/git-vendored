@@ -44,6 +44,16 @@ REGISTRY_FIELDS = {"repo", "install_branch", "protected", "allowed",
                    "private", "automerge", "dogfood", "dependency_mode",
                    "support"}
 
+# Registry fields the vendor owns: replaced by what the installed version
+# ships on every install (add or update). They describe the vendor's files
+# and identity.
+VENDOR_OWNED_FIELDS = {"repo", "install_branch", "protected", "allowed",
+                       "dogfood", "support"}
+
+# Registry fields the consuming repository owns: its own choices about auth,
+# merging and dependencies. An update keeps them as they are.
+REPO_OWNED_FIELDS = REGISTRY_FIELDS - VENDOR_OWNED_FIELDS
+
 
 # ── Config helpers ────────────────────────────────────────────────────────
 
@@ -729,6 +739,160 @@ def validate_entry(vendor_name, entry):
         sys.exit(1)
 
 
+# ── Registry refresh (update path) ────────────────────────────────────────
+
+def _read_bytes(path):
+    """Return a file's bytes, or None if it does not exist."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def snapshot_vendor_state(vendor_name):
+    """Snapshot what an install may rewrite: the vendor's config and registry.
+
+    Taken before install.sh runs so refresh_registry() can tell what the
+    installed version shipped from what the repository already had.
+    """
+    config_path = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+    return {
+        "config": _read_bytes(config_path),
+        "registry": _read_bytes(registry_path),
+        "legacy": _read_bytes(CONFIG_PATH),
+    }
+
+
+def _shipped_registry(vendor_name, snapshot):
+    """Return the registry the installed version shipped, or None.
+
+    Looked for in the same places the add path reads: the `_vendor` block of
+    .vendored/configs/<vendor>.json, the vendor's entry under `vendors` in the
+    legacy .vendored/config.json, or a .vendored/manifests/<vendor>.registry
+    install.sh wrote. A block left over from before the install (the file is
+    byte-for-byte what it was) is not counted as shipped, unless no registry
+    file existed, in which case it is the registry in use anyway.
+    """
+    config_path = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    after = _read_bytes(config_path)
+    if after is not None:
+        raw = json.loads(after)
+        changed = after != snapshot["config"]
+        if "_vendor" in raw and (changed or snapshot["registry"] is None):
+            return dict(raw["_vendor"])
+
+    after = _read_bytes(CONFIG_PATH)
+    if after is not None and after != snapshot["legacy"]:
+        entry = json.loads(after).get("vendors", {}).get(vendor_name)
+        if entry is not None:
+            return {k: v for k, v in entry.items() if k in REGISTRY_FIELDS}
+
+    registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+    after = _read_bytes(registry_path)
+    if after is not None and after != snapshot["registry"]:
+        return json.loads(after)
+    return None
+
+
+def _restore_project_config(vendor_name, snapshot):
+    """Keep the repository's own .vendored/configs/<vendor>.json.
+
+    The repository's keys keep the values they had before the install; a key
+    install.sh added that the repository did not have is kept. `_vendor` and
+    registry fields are stripped, as save_vendor_config() does. When nothing
+    but `_vendor` changed, the file is restored byte for byte.
+    """
+    config_path = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    after = _read_bytes(config_path)
+    before = snapshot["config"]
+    if after is None:
+        if before is not None:
+            with open(config_path, "wb") as f:
+                f.write(before)
+        return
+    old = json.loads(before) if before is not None else {}
+    new = json.loads(after)
+    merged = {k: v for k, v in new.items()
+              if k != "_vendor" and k not in REGISTRY_FIELDS}
+    for k, v in old.items():
+        if k != "_vendor" and k not in REGISTRY_FIELDS:
+            merged[k] = v
+    old_project = {k: v for k, v in old.items()
+                   if k != "_vendor" and k not in REGISTRY_FIELDS}
+    if before is not None and merged == old and old == old_project:
+        data = before
+    else:
+        data = (json.dumps(merged, indent=2) + "\n").encode()
+    if data != after:
+        with open(config_path, "wb") as f:
+            f.write(data)
+
+
+def _clean_legacy_entry(vendor_name, snapshot):
+    """Drop an entry install.sh wrote into the legacy config.json.
+
+    Only when the vendor already has its per-vendor config (it is registered
+    there) and the entry is new, as the add path does after migrating it.
+    """
+    after = _read_bytes(CONFIG_PATH)
+    if after is None or after == snapshot["legacy"]:
+        return
+    if not os.path.isfile(os.path.join(CONFIGS_DIR, f"{vendor_name}.json")):
+        return
+    before = json.loads(snapshot["legacy"]) if snapshot["legacy"] else {}
+    if vendor_name in before.get("vendors", {}):
+        return
+    raw_config = json.loads(after)
+    raw_vendors = raw_config.get("vendors", {})
+    if vendor_name not in raw_vendors:
+        return
+    del raw_vendors[vendor_name]
+    if not raw_vendors:
+        del raw_config["vendors"]
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(raw_config, f, indent=2)
+        f.write("\n")
+
+
+def refresh_registry(vendor_name, old_registry, snapshot):
+    """Make the registry that of the installed version.
+
+    Vendor-owned fields (VENDOR_OWNED_FIELDS) are replaced by what the
+    installed version shipped; one it no longer ships is removed, so a vendor
+    can drop entries from `allowed`. Repository-owned fields
+    (REPO_OWNED_FIELDS) keep the values the registry had. The repository's
+    .vendored/configs/<vendor>.json is not overwritten. When the installed
+    version ships no registry, the existing one is kept as it is.
+
+    Returns the registry now in force.
+    """
+    old_registry = {k: v for k, v in (old_registry or {}).items()
+                    if k in REGISTRY_FIELDS}
+    shipped = _shipped_registry(vendor_name, snapshot)
+    _restore_project_config(vendor_name, snapshot)
+    _clean_legacy_entry(vendor_name, snapshot)
+    if shipped is None:
+        # Keep the registry in force; write it out when it lived only in
+        # the config file, whose registry fields were just stripped.
+        registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+        if snapshot["registry"] is not None:
+            with open(registry_path, "wb") as f:
+                f.write(snapshot["registry"])
+        elif old_registry:
+            write_registry(vendor_name, old_registry)
+        return old_registry
+
+    registry = {k: v for k, v in shipped.items() if k in VENDOR_OWNED_FIELDS}
+    if "repo" not in registry and "repo" in old_registry:
+        registry["repo"] = old_registry["repo"]
+    for k in REPO_OWNED_FIELDS:
+        if k in old_registry:
+            registry[k] = old_registry[k]
+    write_registry(vendor_name, registry)
+    return registry
+
+
 # ── Core install logic ────────────────────────────────────────────────────
 
 def install_new_vendor(repo, version, token, name=None, deps_mode=None,
@@ -903,20 +1067,29 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
         resolve_deps(deps, token, mode, installing_set)
 
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
+    snapshot = snapshot_vendor_state(vendor_name)
     manifest_files = download_and_run_install(repo, target_version, token,
                                               vendor_name=vendor_name,
                                               vendor_config=vendor_config)
+
+    # The registry and manifest become those of the installed version.
+    # Done before a re-exec so the new coordinator sees them.
+    registry = refresh_registry(vendor_name, vendor_config, snapshot)
+
+    # Process manifest if install.sh wrote one: it replaces the old one.
+    if manifest_files:
+        validate_manifest(manifest_files)
+        write_manifest(vendor_name, manifest_files)
+        write_manifest_version(vendor_name, target_version)
+
+    print(f"  protected: {', '.join(registry.get('protected', []))}")
+    if registry.get("allowed"):
+        print(f"  allowed: {', '.join(registry['allowed'])}")
 
     # Self-bootstrap: if install.sh updated the coordinator on disk,
     # re-exec so post-install steps use the new code.
     if not post_install_only:
         _maybe_reexec()
-
-    # Process manifest if install.sh wrote one
-    if manifest_files:
-        validate_manifest(manifest_files)
-        write_manifest(vendor_name, manifest_files)
-        write_manifest_version(vendor_name, target_version)
 
     # Cache resolved deps
     if deps:

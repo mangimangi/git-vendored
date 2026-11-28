@@ -144,6 +144,21 @@ A vendor repo must provide:
 - Write version files (the framework handles this via `.vendored/manifests/<vendor>.version`)
 - Modify `.vendored/config.json` (the framework handles vendor registration)
 
+On every install, add or update, `.vendored/manifests/<vendor>.files` is replaced by the manifest that install wrote, so it always lists the files of the installed version.
+
+### Registry
+
+A vendor's registry lives in `.vendored/manifests/<vendor>.registry`. `install.sh` ships it as a `_vendor` block in `.vendored/configs/<vendor>.json` (or as its entry under `vendors` in the legacy `.vendored/config.json`, or by writing the `.registry` file itself). The framework moves it into the `.registry` file and strips `_vendor` from the config.
+
+On every install, add or update, the registry is that of the installed version:
+
+| Owned by | Fields | On an update |
+|----------|--------|--------------|
+| the vendor | `repo`, `install_branch`, `protected`, `allowed`, `dogfood`, `support` | replaced by what the installed version ships; a field it no longer ships is removed (`repo` keeps its old value if missing) |
+| the repository | `private`, `automerge`, `dependency_mode` | kept as they are |
+
+The repository's own `.vendored/configs/<vendor>.json` is never overwritten: its keys keep their values (a key `install.sh` adds is kept). If the installed version ships no registry at all, the existing one is kept unchanged. So when a vendor changes which files it allows (git-cicd v0.0.4 allows `.github/workflows/git-cicd-*.yml` where v0.0.2 allowed `.github/workflows/git-cicd.yml`), `.vendored/check` uses the new rules as soon as the install is merged.
+
 ### Dependencies (`deps.json`)
 
 A vendor repo may include a `deps.json` at its root to declare dependencies on other vendors. When a consumer installs the vendor with `--deps=install`, missing dependencies are automatically installed.

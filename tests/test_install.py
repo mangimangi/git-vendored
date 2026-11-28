@@ -3105,3 +3105,369 @@ class TestMainCLIPaths:
         assert json.loads((configs / "tool.json").read_text())["prefix"] == "t"
         assert not (tmp_repo / ".tool").exists()
         mock_update.assert_called_once()
+
+
+# ── Tests: registry refresh on update (gv-05c2.2) ─────────────────────────
+
+OLD_CICD_REGISTRY = {
+    "repo": "mangimangi/git-cicd",
+    "install_branch": "chore/install-git-cicd",
+    "protected": [".vendored/pkg/git-cicd/**"],
+    "allowed": [".vendored/configs/git-cicd.json",
+                ".github/workflows/git-cicd.yml"],
+}
+
+NEW_CICD_VENDOR = {
+    "repo": "mangimangi/git-cicd",
+    "install_branch": "chore/install-git-cicd",
+    "protected": [".vendored/pkg/git-cicd/**"],
+    "allowed": [".vendored/configs/git-cicd.json",
+                ".github/workflows/git-cicd-*.yml"],
+}
+
+CICD_PROJECT_CONFIG = '{\n  "jobs": {"test": {"steps": ["ci/test.sh"]}},\n  "needs_nothing": ["*.md"]\n}\n'
+
+NEW_CICD_FILES = [".vendored/pkg/git-cicd/git-cicd",
+                  ".github/workflows/git-cicd-open.yml"]
+
+
+def _setup_cicd_repo(tmp_repo, registry=None, config_text=CICD_PROJECT_CONFIG):
+    configs = tmp_repo / ".vendored" / "configs"
+    configs.mkdir(parents=True, exist_ok=True)
+    (configs / "git-cicd.json").write_text(config_text)
+    manifests = tmp_repo / ".vendored" / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    if registry is not None:
+        (manifests / "git-cicd.registry").write_text(
+            json.dumps(registry, indent=2) + "\n")
+    (manifests / "git-cicd.files").write_text(
+        ".vendored/pkg/git-cicd/git-cicd\n.github/workflows/git-cicd.yml\n")
+    (manifests / "git-cicd.version").write_text("0.0.2\n")
+
+
+def _fake_install_sh(tmp_repo, vendor_block=NEW_CICD_VENDOR, files=NEW_CICD_FILES,
+                     where="config"):
+    """Side effect standing in for git-cicd's install.sh."""
+    def _run(*args, **kwargs):
+        for f in files:
+            p = tmp_repo / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("# generated\n")
+        old = tmp_repo / ".github" / "workflows" / "git-cicd.yml"
+        if old.exists():
+            old.unlink()
+        if vendor_block is not None:
+            if where == "config":
+                path = tmp_repo / ".vendored" / "configs" / "git-cicd.json"
+                raw = json.loads(path.read_text())
+                raw["_vendor"] = vendor_block
+                path.write_text(json.dumps(raw, indent=2) + "\n")
+            elif where == "legacy":
+                path = tmp_repo / ".vendored" / "config.json"
+                path.write_text(json.dumps(
+                    {"vendors": {"git-cicd": vendor_block}}, indent=2) + "\n")
+            else:
+                path = tmp_repo / ".vendored" / "manifests" / "git-cicd.registry"
+                path.write_text(json.dumps(vendor_block, indent=2) + "\n")
+        return list(files)
+    return _run
+
+
+def _upgrade(tmp_repo, registry, **fake_kwargs):
+    with patch("vendored_install.download_deps", return_value=None), \
+         patch("vendored_install.download_schema", return_value=None), \
+         patch("vendored_install.resolve_version", return_value="0.0.4"), \
+         patch("vendored_install.get_auth_token", return_value="token"), \
+         patch("vendored_install.download_and_run_install",
+               side_effect=_fake_install_sh(tmp_repo, **fake_kwargs)):
+        return inst.install_existing_vendor("git-cicd", registry, "latest")
+
+
+def _registry(tmp_repo):
+    return json.loads((tmp_repo / ".vendored" / "manifests" /
+                       "git-cicd.registry").read_text())
+
+
+class TestRegistryRefresh:
+    def test_upgrade_replaces_allowed_and_protected(self, tmp_repo, capsys):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        result = _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY))
+        assert result["changed"] is True
+        reg = _registry(tmp_repo)
+        assert reg["allowed"] == NEW_CICD_VENDOR["allowed"]
+        assert reg["protected"] == NEW_CICD_VENDOR["protected"]
+        out = capsys.readouterr().out
+        assert "allowed: .vendored/configs/git-cicd.json, .github/workflows/git-cicd-*.yml" in out
+        assert "protected: .vendored/pkg/git-cicd/**" in out
+
+    def test_project_config_untouched_byte_for_byte(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY))
+        text = (tmp_repo / ".vendored" / "configs" / "git-cicd.json").read_text()
+        assert text == CICD_PROJECT_CONFIG
+
+    def test_repo_owned_fields_survive(self, tmp_repo):
+        old = dict(OLD_CICD_REGISTRY, private=True, automerge=True,
+                   dependency_mode="warn")
+        _setup_cicd_repo(tmp_repo, old)
+        shipped = dict(NEW_CICD_VENDOR, private=False, automerge=False)
+        _upgrade(tmp_repo, dict(old), vendor_block=shipped)
+        reg = _registry(tmp_repo)
+        assert reg["private"] is True
+        assert reg["automerge"] is True
+        assert reg["dependency_mode"] == "warn"
+        assert reg["allowed"] == NEW_CICD_VENDOR["allowed"]
+
+    def test_repo_owned_field_not_taken_from_shipped(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY),
+                 vendor_block=dict(NEW_CICD_VENDOR, private=True))
+        assert "private" not in _registry(tmp_repo)
+
+    def test_vendor_owned_field_removed_when_not_shipped(self, tmp_repo):
+        old = dict(OLD_CICD_REGISTRY, support={"issues": "x"})
+        _setup_cicd_repo(tmp_repo, old)
+        shipped = {k: v for k, v in NEW_CICD_VENDOR.items() if k != "allowed"}
+        _upgrade(tmp_repo, dict(old), vendor_block=shipped)
+        reg = _registry(tmp_repo)
+        assert "allowed" not in reg
+        assert "support" not in reg
+
+    def test_repo_falls_back_to_existing(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        shipped = {k: v for k, v in NEW_CICD_VENDOR.items() if k != "repo"}
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), vendor_block=shipped)
+        assert _registry(tmp_repo)["repo"] == "mangimangi/git-cicd"
+
+    def test_no_shipped_registry_keeps_existing(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        before = (tmp_repo / ".vendored" / "manifests" /
+                  "git-cicd.registry").read_bytes()
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), vendor_block=None)
+        after = (tmp_repo / ".vendored" / "manifests" /
+                 "git-cicd.registry").read_bytes()
+        assert after == before
+
+    def test_no_shipped_registry_writes_flat_registry_out(self, tmp_repo):
+        """A registry that lived only as flat config keys is kept."""
+        flat = dict(OLD_CICD_REGISTRY, jobs={})
+        _setup_cicd_repo(tmp_repo, None, config_text=json.dumps(flat))
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), vendor_block=None)
+        assert _registry(tmp_repo) == OLD_CICD_REGISTRY
+        raw = json.loads((tmp_repo / ".vendored" / "configs" /
+                          "git-cicd.json").read_text())
+        assert raw == {"jobs": {}}
+
+    def test_leftover_vendor_block_is_not_shipped(self, tmp_repo):
+        """An unchanged _vendor block left from an old add is not shipped."""
+        stale = dict(NEW_CICD_VENDOR, allowed=["stale"])
+        config = json.dumps({"_vendor": stale, "jobs": {}}, indent=2) + "\n"
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY, config_text=config)
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), vendor_block=None)
+        assert _registry(tmp_repo) == OLD_CICD_REGISTRY
+        raw = json.loads((tmp_repo / ".vendored" / "configs" /
+                          "git-cicd.json").read_text())
+        assert raw == {"jobs": {}}
+
+    def test_vendor_block_without_registry_file_is_used(self, tmp_repo):
+        config = json.dumps({"_vendor": NEW_CICD_VENDOR, "jobs": {}}) + "\n"
+        _setup_cicd_repo(tmp_repo, None, config_text=config)
+        _upgrade(tmp_repo, dict(NEW_CICD_VENDOR), vendor_block=None)
+        assert _registry(tmp_repo) == NEW_CICD_VENDOR
+
+    def test_shipped_in_legacy_config_json(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), where="legacy")
+        assert _registry(tmp_repo)["allowed"] == NEW_CICD_VENDOR["allowed"]
+        legacy = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "vendors" not in legacy
+
+    def test_legacy_entry_kept_when_other_vendors_remain(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        legacy = tmp_repo / ".vendored" / "config.json"
+        legacy.write_text(json.dumps({"vendors": {"other": {"repo": "o/o"}}}))
+
+        def _run(*a, **k):
+            legacy.write_text(json.dumps({"vendors": {
+                "other": {"repo": "o/o"}, "git-cicd": NEW_CICD_VENDOR}}))
+            return None
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.download_and_run_install", side_effect=_run):
+            inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
+                                         "latest")
+        assert json.loads(legacy.read_text()) == {
+            "vendors": {"other": {"repo": "o/o"}}}
+        assert _registry(tmp_repo)["allowed"] == NEW_CICD_VENDOR["allowed"]
+
+    def test_legacy_entry_already_there_is_left(self, tmp_repo):
+        """An entry the repo already had in config.json is not removed."""
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        legacy = tmp_repo / ".vendored" / "config.json"
+        legacy.write_text(json.dumps({"vendors": {"git-cicd": OLD_CICD_REGISTRY}}))
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), where="legacy")
+        assert "git-cicd" in json.loads(legacy.read_text())["vendors"]
+
+    def test_legacy_change_without_vendor_entry_ignored(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        legacy = tmp_repo / ".vendored" / "config.json"
+
+        def _run(*a, **k):
+            legacy.write_text(json.dumps({"vendors": {"other": {}}}))
+            return None
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.download_and_run_install", side_effect=_run):
+            inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
+                                         "latest")
+        assert _registry(tmp_repo) == OLD_CICD_REGISTRY
+        assert json.loads(legacy.read_text()) == {"vendors": {"other": {}}}
+
+    def test_legacy_entry_without_per_vendor_config_left(self, tmp_repo):
+        """Without configs/<vendor>.json the legacy entry is the registration."""
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        legacy = tmp_repo / ".vendored" / "config.json"
+
+        def _run(*a, **k):
+            legacy.write_text(json.dumps({"vendors": {"git-cicd": NEW_CICD_VENDOR}}))
+            return None
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.download_and_run_install", side_effect=_run):
+            inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
+                                         "latest")
+        assert "git-cicd" in json.loads(legacy.read_text())["vendors"]
+        assert _registry(tmp_repo)["allowed"] == NEW_CICD_VENDOR["allowed"]
+
+    def test_shipped_as_registry_file(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY), where="registry")
+        assert _registry(tmp_repo)["allowed"] == NEW_CICD_VENDOR["allowed"]
+
+    def test_new_key_added_by_install_sh_kept(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        path = tmp_repo / ".vendored" / "configs" / "git-cicd.json"
+
+        def _run(*a, **k):
+            raw = json.loads(path.read_text())
+            raw["jobs"] = {"overwritten": True}
+            raw["new_default"] = 1
+            raw["_vendor"] = NEW_CICD_VENDOR
+            path.write_text(json.dumps(raw))
+            return None
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.download_and_run_install", side_effect=_run):
+            inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
+                                         "latest")
+        raw = json.loads(path.read_text())
+        assert raw["jobs"] == {"test": {"steps": ["ci/test.sh"]}}
+        assert raw["new_default"] == 1
+        assert "_vendor" not in raw
+
+    def test_config_created_by_install_sh_stripped(self, tmp_repo):
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir(parents=True)
+        (manifests / "git-cicd.registry").write_text(json.dumps(OLD_CICD_REGISTRY))
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY),
+                 vendor_block=None, files=[".vendored/pkg/git-cicd/git-cicd"])
+        # install.sh wrote no config: nothing created
+        assert not (tmp_repo / ".vendored" / "configs" / "git-cicd.json").exists()
+
+        path = tmp_repo / ".vendored" / "configs" / "git-cicd.json"
+
+        def _run(*a, **k):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"_vendor": NEW_CICD_VENDOR, "jobs": {}}))
+            return None
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value="0.0.5"), \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.download_and_run_install", side_effect=_run):
+            inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
+                                         "latest")
+        assert json.loads(path.read_text()) == {"jobs": {}}
+        assert _registry(tmp_repo)["allowed"] == NEW_CICD_VENDOR["allowed"]
+
+    def test_config_deleted_by_install_sh_restored(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        path = tmp_repo / ".vendored" / "configs" / "git-cicd.json"
+
+        def _run(*a, **k):
+            path.unlink()
+            return None
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.download_and_run_install", side_effect=_run):
+            inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
+                                         "latest")
+        assert path.read_text() == CICD_PROJECT_CONFIG
+
+    def test_manifest_replaced_by_new_install(self, tmp_repo):
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY))
+        assert inst.read_manifest("git-cicd") == sorted(NEW_CICD_FILES)
+        assert inst.read_manifest_version("git-cicd") == "0.0.4"
+
+    def test_check_accepts_regenerated_workflow_after_upgrade(self, tmp_repo):
+        """After the upgrade, a regenerated workflow committed from an
+        ordinary branch passes templates/check (and failed before)."""
+        import subprocess
+
+        def git(*args):
+            subprocess.run(["git", *args], check=True, capture_output=True,
+                           cwd=tmp_repo)
+
+        def run_check():
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("GITHUB_HEAD_REF", "GITHUB_BASE_REF",
+                                "CICD_SOURCE_BRANCH")}
+            return subprocess.run(
+                [sys.executable, str(ROOT / "templates" / "check"),
+                 "--base", "main"],
+                capture_output=True, text=True, cwd=tmp_repo, env=env)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "t")
+        _setup_cicd_repo(tmp_repo, OLD_CICD_REGISTRY)
+        # The old manifest already lists the new workflow (as medici's did).
+        (tmp_repo / ".vendored" / "manifests" / "git-cicd.files").write_text(
+            "\n".join(NEW_CICD_FILES) + "\n")
+        git("add", "-A")
+        git("commit", "-qm", "base")
+
+        # Before the refresh: the regenerated workflow is rejected.
+        git("checkout", "-qb", "feature/regen")
+        wf = tmp_repo / ".github" / "workflows" / "git-cicd-open.yml"
+        wf.parent.mkdir(parents=True, exist_ok=True)
+        wf.write_text("# regenerated\n")
+        git("add", "-A")
+        git("commit", "-qm", "regen")
+        assert run_check().returncode == 1
+        git("checkout", "-q", "main")
+        git("branch", "-qD", "feature/regen")
+
+        # Upgrade on main (as the merged install PR would).
+        _upgrade(tmp_repo, dict(OLD_CICD_REGISTRY))
+        git("add", "-A")
+        git("commit", "-qm", "install git-cicd v0.0.4")
+
+        git("checkout", "-qb", "feature/regen")
+        wf.write_text("# regenerated again\n")
+        git("add", "-A")
+        git("commit", "-qm", "regen")
+        result = run_check()
+        assert result.returncode == 0, result.stdout + result.stderr
