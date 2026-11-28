@@ -204,6 +204,18 @@ Dependency modes (`--deps`):
 
 This prevents accidental edits to vendor-managed files while allowing the automated update workflow to function.
 
+### Running the check as a git-cicd job
+
+In a repository that uses [git-cicd](https://github.com/mangimangi/git-cicd), the check can run as a job instead of through `check-vendor.yml`. Declare it in `.vendored/configs/git-cicd.json` and run `.vendored/pkg/git-cicd/git-cicd generate`:
+
+```json
+"vendor-check": {"on": ["open"], "branches": ["**"], "paths": ["**"], "steps": [".vendored/check"]}
+```
+
+No wrapper script is needed. The source branch (which decides whether an `install_branch` is let through) is read in this order: `CICD_SOURCE_BRANCH` (git-cicd sets it for a step, in Actions and locally), then `GITHUB_HEAD_REF` (a GitHub pull request), then the current git branch; an empty variable counts as unset. Without `--base`, the base is `origin/$GITHUB_BASE_REF`, else `origin/main`.
+
+`--base <ref>` reads only the commits in `<ref>..HEAD`. When the working tree or the index holds changes outside that range, the check prints one line saying so (`Note: N uncommitted or staged file(s) not checked ...; run with --staged to check staged files`); the note does not change the exit code. `--staged` checks the index instead (no note is printed in that mode).
+
 ## Directory Layout
 
 ```

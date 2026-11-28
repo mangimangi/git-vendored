@@ -11,8 +11,19 @@ Usage:
     python3 .vendored/check --staged
 
 Modes:
-    (default)       Diff against base ref (for CI / PR checks)
+    (default)       Diff against base ref (for CI / PR checks). Only commits
+                    in <base>..HEAD are read; when the working tree or the
+                    index holds changes outside that range, one note line
+                    says so (it does not change the exit code).
     --staged        Check staged files only
+
+Environment:
+    CICD_SOURCE_BRANCH  Source branch of the change (set by git-cicd); read
+                        first when set and non-empty
+    GITHUB_HEAD_REF     Source branch of a GitHub pull request; read next
+                        (the current git branch is the last fallback)
+    GITHUB_BASE_REF     Default base when --base is not given
+                        (origin/<GITHUB_BASE_REF>, else origin/main)
 
 Exit codes:
     0 - No violations (or all changes are allowed)
@@ -126,17 +137,42 @@ def get_staged_files():
 
 
 def get_branch_name():
-    """Get the current branch name, or GITHUB_HEAD_REF for PRs."""
-    # In GitHub Actions PR context, GITHUB_HEAD_REF is the source branch
-    branch = os.environ.get("GITHUB_HEAD_REF", "")
-    if branch:
-        return branch
+    """Get the change's source branch.
+
+    In order: CICD_SOURCE_BRANCH (git-cicd gives it to a job's steps, in
+    Actions and locally), then GITHUB_HEAD_REF (the source branch of a GitHub
+    pull request), then the current git branch. An empty variable counts as
+    unset.
+    """
+    for name in ("CICD_SOURCE_BRANCH", "GITHUB_HEAD_REF"):
+        branch = os.environ.get(name, "")
+        if branch:
+            return branch
     # Fallback to git
     result = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True
     )
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def get_unread_local_files(range_files):
+    """Files changed in the working tree or the index but not in range_files.
+
+    Reads `git diff --name-only` (unstaged) and `git diff --cached
+    --name-only` (staged). A git failure counts as no changes: this only
+    feeds an informational note.
+    """
+    in_range = set(range_files)
+    unread = set()
+    for cmd in (["git", "diff", "--name-only"],
+                ["git", "diff", "--cached", "--name-only"]):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            continue
+        unread.update(f for f in result.stdout.strip().split("\n")
+                      if f and f not in in_range)
+    return sorted(unread)
 
 
 def matches_any_pattern(filepath, patterns):
@@ -258,6 +294,11 @@ def main():
             else:
                 base_ref = "origin/main"
         changed_files = get_changed_files(base_ref)
+        unread = get_unread_local_files(changed_files)
+        if unread:
+            print(f"Note: {len(unread)} uncommitted or staged file(s) not "
+                  f"checked (only commits in {base_ref}..HEAD are read); "
+                  f"run with --staged to check staged files")
 
     if not changed_files:
         print("No changed files")
