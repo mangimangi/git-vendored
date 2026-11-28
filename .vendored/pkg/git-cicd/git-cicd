@@ -41,7 +41,7 @@ WORKFLOWS = {
     "cron": ("Cron", ".github/workflows/git-cicd-cron.yml"),
     "manual": ("Manual", ".github/workflows/git-cicd-manual.yml"),
 }
-GENERATED_TRIGGERS = ("open",)
+GENERATED_TRIGGERS = ("open", "merge", "cron", "manual")
 # The single workflow file of git-cicd before the per-trigger files; generate
 # removes it and verify fails while it is there.
 LEGACY_WORKFLOW_PATH = ".github/workflows/git-cicd.yml"
@@ -57,9 +57,16 @@ DEFAULT_MAX_PARALLEL = 3
 
 TOP_LEVEL_FIELDS = ("_vendor", "jobs", "needs_nothing", "max_parallel")
 JOB_FIELDS = ("name", "on", "branches", "paths", "setup", "steps", "cron", "manual",
-              "blocking")
+              "blocking", "inputs")
+INPUT_FIELDS = ("description", "required", "default", "choices")
 
 JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+INPUT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Every declared input reaches a script as CICD_INPUT_<NAME upper-cased>.
+INPUT_ENV_PREFIX = "CICD_INPUT_"
+# The values of a manual run: a JSON object of strings, set by the Manual
+# workflow from its fixed `inputs` field. Read by the tool, never passed on.
+MANUAL_INPUTS_ENV = "CICD_MANUAL_INPUTS"
 GLOB_CHARS = ("*", "?", "[")
 
 
@@ -195,6 +202,127 @@ def _validate_step(root, step, where):
             "and fixed arguments"]
 
 
+def _validate_inputs(prefix, inputs):
+    """Return (errors, normalized inputs) for a job's `inputs` field: input
+    name -> {description, required, default, choices}. Every value is a
+    string, since values reach scripts as environment variables."""
+    if not isinstance(inputs, dict):
+        return [f"{prefix}: inputs must be an object (input name -> "
+                "declaration)"], {}
+    errors = []
+    normalized = {}
+    for name, decl in inputs.items():
+        where = f"{prefix}: input {name}"
+        before = len(errors)
+        if not INPUT_NAME_RE.match(name):
+            errors.append(f"{where}: invalid input name (lowercase letters, "
+                          "digits and _, starting with a letter)")
+        if not isinstance(decl, dict):
+            errors.append(f"{where}: a declaration must be an object "
+                          f"({', '.join(INPUT_FIELDS)})")
+            continue
+        for key in decl:
+            if key not in INPUT_FIELDS:
+                errors.append(f"{where}: unknown field {key}")
+        description = decl.get("description", "")
+        if not isinstance(description, str) or not all(
+                ch.isprintable() for ch in description):
+            errors.append(f"{where}: description must be a single-line "
+                          "string of printable characters")
+        required = decl.get("required", False)
+        if not isinstance(required, bool):
+            errors.append(f"{where}: required must be a boolean")
+        default = decl.get("default")
+        if "default" in decl and not isinstance(default, str):
+            errors.append(f"{where}: default must be a string (every input "
+                          "value is a string)")
+        if required is True and "default" in decl:
+            errors.append(f"{where}: a required input cannot have a default "
+                          "(leave required out, or drop the default)")
+        choices = decl.get("choices")
+        if "choices" in decl:
+            if not isinstance(choices, list) or not choices:
+                errors.append(f"{where}: choices must be a non-empty array "
+                              "of strings")
+            elif not _is_str_list(choices):
+                errors.append(f"{where}: every choice must be a string")
+            else:
+                for dupe in sorted({c for c in choices
+                                    if choices.count(c) > 1}):
+                    errors.append(f"{where}: choice {dupe!r} is listed more "
+                                  "than once")
+                if isinstance(default, str) and default not in choices:
+                    errors.append(f"{where}: default {default!r} is not one "
+                                  f"of the choices ({', '.join(choices)})")
+        if len(errors) == before:
+            normalized[name] = {
+                "description": description,
+                "required": required,
+                "default": default,
+                "choices": list(choices) if choices is not None else None,
+            }
+    return errors, normalized
+
+
+def input_env_name(name):
+    return INPUT_ENV_PREFIX + name.upper()
+
+
+def parse_manual_inputs(text):
+    """The values of a manual run from the Manual workflow's `inputs` field
+    (a JSON object of strings; empty means none). Return (values, None) or
+    (None, why)."""
+    if text is None or not text.strip():
+        return {}, None
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        return None, f"the inputs are not valid JSON ({e})"
+    if not isinstance(data, dict) or not all(
+            isinstance(v, str) for v in data.values()):
+        return None, ("the inputs must be a JSON object of string values, "
+                      'for example {"bump_type": "minor"}')
+    return data, None
+
+
+def input_values(job, given=None):
+    """Every declared input's value: the given one, else the default, else
+    the empty string. Return (values, None) or (None, why) when a given value
+    is undeclared or outside the choices, or a required input is missing.
+    With `given` None (every trigger but manual) nothing is required: each
+    input is its default or the empty string."""
+    manual = given is not None
+    given = given or {}
+    declared = job.get("inputs") or {}
+    name = job["name"]
+    for key in given:
+        if key not in declared:
+            return None, (f"job {name} declares no input {key!r} (declared: "
+                          f"{', '.join(declared) or 'none'})")
+    values = {}
+    for key, decl in declared.items():
+        if key in given:
+            value = given[key]
+            if decl["choices"] is not None and value not in decl["choices"]:
+                return None, (f"job {name}: input {key}: {value!r} is not "
+                              f"one of the choices "
+                              f"({', '.join(decl['choices'])})")
+        elif decl["required"] and manual:
+            return None, f"job {name}: input {key} is required"
+        else:
+            value = decl["default"] if decl["default"] is not None else ""
+        values[key] = value
+    return values, None
+
+
+def manual_input_values(job):
+    """The values of a manual run of the job, from MANUAL_INPUTS_ENV."""
+    given, why = parse_manual_inputs(os.environ.get(MANUAL_INPUTS_ENV))
+    if why:
+        return None, why
+    return input_values(job, given)
+
+
 def _validate_job(root, name, job):
     """Return (errors, normalized job)."""
     errors = []
@@ -312,6 +440,12 @@ def _validate_job(root, name, job):
                 norm_steps.append([step] if isinstance(step, str)
                                   else list(step))
 
+    # inputs
+    inputs = {}
+    if "inputs" in job:
+        input_errors, inputs = _validate_inputs(prefix, job["inputs"])
+        errors.extend(input_errors)
+
     # flags
     for flag in ("manual", "blocking"):
         if flag in job and not isinstance(job[flag], bool):
@@ -328,6 +462,7 @@ def _validate_job(root, name, job):
         "cron": cron if has_cron else None,
         "manual": job.get("manual", True) is not False,
         "blocking": job.get("blocking", True) is not False,
+        "inputs": inputs,
     }
     return errors, normalized
 
@@ -396,22 +531,15 @@ def load_config(root, path=None):
 
 # ── Decide ──────────────────────────────────────────────────────────────────
 
-NOT_BUILT = "the {trigger} trigger is not built yet (git-cicd gcd-e74c builds open only)"
 ALL_TRIGGERS = TRIGGERS + ("manual",)
 
 
 def check_trigger(config, trigger):
-    """Raise UsageError for a trigger that is not built yet, naming the jobs
-    that declare it. Never silently succeed."""
-    if trigger == "open":
-        return
-    if trigger == "manual":
-        declaring = [n for n, j in config["jobs"].items() if j["manual"]]
-    else:
-        declaring = [n for n, j in config["jobs"].items() if trigger in j["on"]]
-    names = ", ".join(declaring) if declaring else "none"
-    raise UsageError(NOT_BUILT.format(trigger=trigger)
-                     + f"; jobs declaring it: {names}")
+    """Raise UsageError for a trigger the interface does not know. Every
+    trigger it knows executes."""
+    if trigger not in ALL_TRIGGERS:
+        raise UsageError(f"unknown trigger {trigger!r} (allowed: "
+                         f"{', '.join(ALL_TRIGGERS)})")
 
 
 def resolve_commit(root, rev):
@@ -431,6 +559,9 @@ def changed_files(root, base, head):
 
     Return (files, None) or (None, why) when the diff cannot be computed.
     """
+    if base and re.fullmatch(r"0+", base):  # a push that created the branch
+        return None, (f"base {base!r} is the all-zero commit (the push "
+                      "created the branch)")
     base_sha = resolve_commit(root, base)
     if base_sha is None:
         return None, f"base {base!r} is not a commit in this repository"
@@ -478,11 +609,123 @@ def _name_files(files, limit=5):
     return shown
 
 
+def manual_refusal(config, name, target):
+    """Why a manual run of job `name` on branch `target` is refused, or None
+    when it may run: the job must exist, allow manual runs and have branches
+    that match the branch the run was started on."""
+    job = config["jobs"].get(name)
+    if job is None:
+        return (f"unknown job {name!r} (declared: "
+                f"{', '.join(config['jobs']) or 'none'})")
+    if not job["manual"]:
+        return f'job {name} cannot be run by hand ("manual": false)'
+    if not match_any(job["branches"], target or ""):
+        return (f"branch {target} does not match the branches of job {name} "
+                f"({', '.join(job['branches'])})")
+    return None
+
+
+def decide_manual(config, target, source, base, head, job):
+    """A manual run: the named job is needed when it may run (paths and
+    needs_nothing are ignored); every other job is not needed. A refusal is
+    recorded in the decision record, never raised, so the report shows it."""
+    refused = manual_refusal(config, job, target)
+    if not refused:
+        _, refused = manual_input_values(config["jobs"][job])
+    decisions = []
+    for name, j in config["jobs"].items():
+        if name != job:
+            needed, reason = False, "not the job asked for"
+        elif refused:
+            needed, reason = False, refused
+        else:
+            needed, reason = True, "manual run"
+        decisions.append({"name": name, "title": j["title"],
+                          "needed": needed, "reason": reason,
+                          "blocking": j["blocking"]})
+    return {
+        "trigger": "manual",
+        "target": target,
+        "source": source,
+        "base": base,
+        "head": head,
+        "job": job,
+        "refused": refused,
+        "changed_files": [],
+        "jobs": decisions,
+        "max_parallel": config["max_parallel"],
+    }
+
+
+def _cron_key(expr):
+    return " ".join(str(expr or "").split())
+
+
+def branch_head(root, branch):
+    """A cron branch's head commit: origin/<branch> after a full checkout,
+    resolved once so every job on the branch runs on the same commit."""
+    return resolve_commit(root, f"refs/remotes/origin/{branch}")
+
+
+def decide_cron(config, root, cron):
+    """A schedule fired: the runs are every (job, branch) pair whose job has
+    cron in on and whose expression is the one that fired, for each of its
+    literal branches. paths do not apply. A branch that does not exist is
+    recorded as missing, and the report fails it."""
+    fired = _cron_key(cron)
+    heads = {}
+    runs = []
+    missing = []
+    decisions = []
+    for name, job in config["jobs"].items():
+        if "cron" not in job["on"]:
+            needed, reason = False, "not a cron job"
+        elif _cron_key(job["cron"]) != fired:
+            needed, reason = False, f"scheduled at {job['cron']}"
+        else:
+            needed, reason = True, f"scheduled {job['cron']}"
+            for n, branch in enumerate(job["branches"], 1):
+                if branch not in heads:
+                    heads[branch] = branch_head(root, branch)
+                if heads[branch] is None:
+                    missing.append({"job": name, "branch": branch,
+                                    "reason": f"branch {branch} does not "
+                                              "exist"})
+                else:
+                    runs.append({"key": f"{name}-{n}", "job": name,
+                                 "branch": branch, "sha": heads[branch]})
+        decisions.append({"name": name, "title": job["title"],
+                          "needed": needed, "reason": reason,
+                          "blocking": job["blocking"]})
+    return {
+        "trigger": "cron",
+        "cron": cron,
+        "target": None,
+        "source": None,
+        "base": None,
+        "head": None,
+        "changed_files": [],
+        "heads": heads,
+        "runs": runs,
+        "missing": missing,
+        "jobs": decisions,
+        "max_parallel": config["max_parallel"],
+    }
+
+
+def _article(word):
+    return "an" if word[:1] in "aeiou" else "a"
+
+
 def decide(config, root, trigger, target, source, base, head, files=None,
-           diff_error=None):
+           diff_error=None, job=None, cron=None):
     """Decide every declared job for the trigger, one decision each, with a
     reason. Return the decision record (what `decide --json` prints)."""
     check_trigger(config, trigger)
+    if trigger == "manual":
+        return decide_manual(config, target, source, base, head, job)
+    if trigger == "cron":
+        return decide_cron(config, root, cron)
     if files is None and diff_error is None:
         files, diff_error = changed_files(root, base, head)
 
@@ -514,7 +757,7 @@ def decide(config, root, trigger, target, source, base, head, files=None,
     decisions = []
     for name, job in config["jobs"].items():
         if trigger not in job["on"]:
-            needed, reason = False, f"not an {trigger} job"
+            needed, reason = False, f"not {_article(trigger)} {trigger} job"
         elif not match_any(job["branches"], target or ""):
             needed, reason = False, f"target {target} does not match branches"
         elif force:
@@ -555,10 +798,21 @@ def needed_jobs(decision):
 
 
 def format_decision(decision):
-    lines = [f"git-cicd decide: trigger {decision['trigger']}, target "
-             f"{decision['target']}, source {decision['source']}",
-             f"  base {decision['base']}, head {decision['head']}",
-             f"  {len(decision['changed_files'])} changed files"]
+    if decision["trigger"] == "cron":
+        lines = [f"git-cicd decide: trigger cron, schedule {decision['cron']}"]
+        for branch, sha in decision["heads"].items():
+            lines.append(f"  branch {branch}: "
+                         + (sha if sha else "does not exist"))
+        for run in decision["runs"]:
+            lines.append(f"  run {run['job']} on {run['branch']} at "
+                         f"{run['sha']}")
+    else:
+        lines = [f"git-cicd decide: trigger {decision['trigger']}, target "
+                 f"{decision['target']}, source {decision['source']}",
+                 f"  base {decision['base']}, head {decision['head']}",
+                 f"  {len(decision['changed_files'])} changed files"]
+    if decision.get("refused"):
+        lines.append(f"  refused: {decision['refused']}")
     for j in decision["jobs"]:
         state = "needed" if j["needed"] else "not needed"
         lines.append(f"  {j['name']}: {state} ({j['reason']})")
@@ -575,8 +829,14 @@ def write_github_output(decision):
         names = {j["name"]: j.get("title") or default_title(j["name"])
                  for j in decision["jobs"]}
         f.write(f"names={json.dumps(names)}\n")
-        f.write(f"any={'true' if needed_jobs(decision) else 'false'}\n")
+        any_run = decision["runs"] if decision["trigger"] == "cron" \
+            else needed_jobs(decision)
+        f.write(f"any={'true' if any_run else 'false'}\n")
         f.write(f"max_parallel={decision['max_parallel']}\n")
+        if decision["trigger"] == "cron":
+            # the cron matrix: one entry per (job, branch), cron only, so
+            # the outputs of the other triggers stay as they are
+            f.write(f"runs={json.dumps(decision['runs'])}\n")
 
 
 def write_changed_files(path, files):
@@ -587,13 +847,19 @@ def write_changed_files(path, files):
 
 # ── Run ─────────────────────────────────────────────────────────────────────
 
-def script_env(job_name, facts, changed_files_path):
-    """The inherited environment plus the CICD_ facts about the change.
+def script_env(job_name, facts, changed_files_path, inputs=None):
+    """The inherited environment plus the CICD_ facts about the change and
+    one CICD_INPUT_<NAME> per declared input.
 
-    GITHUB_TOKEN and VENDOR_PAT reach scripts unchanged through the inherited
-    environment; git-cicd itself never reads or logs them.
+    Inherited CICD_INPUT_ variables and the manual run's raw values
+    (CICD_MANUAL_INPUTS) are removed, so the declared inputs are the only
+    channel. GITHUB_TOKEN and VENDOR_PAT reach scripts unchanged through the
+    inherited environment; git-cicd itself never reads or logs them.
     """
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(INPUT_ENV_PREFIX) and k != MANUAL_INPUTS_ENV}
+    for key, value in (inputs or {}).items():
+        env[input_env_name(key)] = value
     env.update({
         "CICD_TRIGGER": facts["trigger"],
         "CICD_JOB": job_name,
@@ -630,15 +896,28 @@ def run_job(config, root, name, facts, setup=False, files=None):
     if job is None:
         raise UsageError(f"unknown job {name!r} (declared: "
                          f"{', '.join(config['jobs']) or 'none'})")
+    if facts["trigger"] == "manual":
+        refused = manual_refusal(config, name, facts["target"])
+        if not refused:
+            inputs, refused = manual_input_values(job)
+        if refused:
+            raise UsageError(f"manual run refused: {refused}")
+        files = []  # a manual run has no change
+    elif facts["trigger"] == "cron":
+        inputs, _ = input_values(job)
+        files = []  # a schedule has no change
+    else:
+        inputs, _ = input_values(job)  # the declared defaults
     if files is None:
         files, _ = changed_files(root, facts["base"], facts["head"])
     fd, changed_path = tempfile.mkstemp(prefix="git-cicd-changed-",
                                         suffix=".txt")
     os.close(fd)
     write_changed_files(changed_path, files or [])
-    env = script_env(name, facts, os.path.abspath(changed_path))
+    env = script_env(name, facts, os.path.abspath(changed_path), inputs)
 
-    result = {"job": name, "state": "passed", "failed_step": None,
+    result = {"job": name, "target": facts["target"], "head": facts["head"],
+              "state": "passed", "failed_step": None,
               "exit_code": 0, "error": None, "setup": None,
               "setup_skipped": bool(job["setup"]) and not setup,
               "steps": [], "seconds": 0.0}
@@ -727,10 +1006,30 @@ def render_workflow(config, tool, template):
     return text.replace("__TOOL__", tool)
 
 
+def has_cron_jobs(config):
+    return bool(schedule_block(config))
+
+
+def rendered_triggers(config):
+    """The triggers whose workflow the config generates: every one, except
+    cron when no job has cron in on (GitHub needs an event under on:, and a
+    schedule must never fire with nothing to run)."""
+    return [t for t in GENERATED_TRIGGERS
+            if t != "cron" or has_cron_jobs(config)]
+
+
+def stale_paths(config):
+    """Generated files the config no longer generates: the cron workflow when
+    no job has cron in on."""
+    return [WORKFLOWS[t][1] for t in GENERATED_TRIGGERS
+            if t not in rendered_triggers(config)]
+
+
 def render_workflows(config, tool, templates=None):
-    """{path: text} for every generated workflow, in trigger order."""
+    """{path: text} for every workflow the config generates, in trigger
+    order."""
     out = {}
-    for trigger in GENERATED_TRIGGERS:
+    for trigger in rendered_triggers(config):
         template = (templates or {}).get(trigger)
         if template is None:
             template = template_text(trigger)
@@ -771,12 +1070,20 @@ def verify_workflow(config, root, tool=None):
                 expected.splitlines(keepends=True),
                 fromfile=f"{rel} (committed)",
                 tofile=f"{rel} (generated from the config)")))
-    commit = ", ".join(generated_paths())
+    commit = ", ".join(render_workflows(config, tool))
+    removals = []
+    for rel in stale_paths(config):
+        if os.path.lexists(os.path.join(root, rel)):
+            problems.append(f"{rel} is still there, but no job has cron in "
+                            "on (generate removes it)\n")
+            removals.append(rel)
     if os.path.lexists(os.path.join(root, LEGACY_WORKFLOW_PATH)):
         problems.append(f"{LEGACY_WORKFLOW_PATH} is still there (the single "
                         "workflow of earlier git-cicd versions; generate "
                         "removes it)\n")
-        commit += f" and the removal of {LEGACY_WORKFLOW_PATH}"
+        removals.append(LEGACY_WORKFLOW_PATH)
+    if removals:
+        commit += f" and the removal of {', '.join(removals)}"
     if not problems:
         return True, "workflows match config"
     return False, ("".join(problems) + "the workflows do not match the "
@@ -788,7 +1095,13 @@ def verify_workflow(config, root, tool=None):
 
 def load_results(directory):
     """Every run-job result JSON under directory (any nesting), by job."""
-    results = {}
+    return {r["job"]: r for r in load_result_list(directory)}
+
+
+def load_result_list(directory):
+    """Every run-job result JSON under directory (any nesting), in order (a
+    cron run has one per job and branch)."""
+    results = []
     if not directory or not os.path.isdir(directory):
         return results
     for dirpath, dirnames, filenames in os.walk(directory):
@@ -804,7 +1117,7 @@ def load_results(directory):
                 continue
             if isinstance(data, dict) and isinstance(data.get("job"), str) \
                     and "state" in data:
-                results[data["job"]] = data
+                results.append(data)
     return results
 
 
@@ -997,6 +1310,11 @@ def verdict_line(rows, decision, workflow_ok):
     if decision is None:
         return passed, (f"{word} - no decisions: the decide step failed or "
                         "did not run (see its log)")
+    if decision.get("refused"):
+        text = f"FAILED - {decision['refused']}"
+        if not workflow_ok:
+            text += "; the workflows do not match the config"
+        return False, text
     if not needed:
         reasons = []
         for r in rows:
@@ -1026,9 +1344,10 @@ def _state_text(row):
     return text
 
 
-def header_text(repo, head):
-    return (f"git-cicd report: {repo} at {head} (the change under test; a "
-            "version below is its owner's last release)")
+def header_text(repo, head, branch=None):
+    where = f" on {branch}" if branch else ""
+    return (f"git-cicd report: {repo}{where} at {head} (the change under "
+            "test; a version below is its owner's last release)")
 
 
 def format_report(rows, verdict, workflow_text, setup_note=False,
@@ -1083,6 +1402,92 @@ def format_markdown(rows, verdict, workflow_text, setup_note=False,
     return "\n".join(lines)
 
 
+def _workflow_text(root, workflow_ok):
+    if workflow_ok:
+        return "workflows match config"
+    try:
+        tool = tool_path(root)
+    except UsageError:
+        tool = "git-cicd"
+    return f"workflows do not match config: run {generate_command(tool)}"
+
+
+def _write_summary(text):
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(text)
+
+
+def branch_decision(decision, branch):
+    """The part of a cron decision for one branch, shaped like the decision
+    of the other triggers: a job is needed on the branch when it has a run
+    (or a missing run) there."""
+    on_branch = {r["job"] for r in decision.get("runs", [])
+                 if r["branch"] == branch}
+    on_branch |= {m["job"] for m in decision.get("missing", [])
+                  if m["branch"] == branch}
+    jobs = []
+    for d in decision["jobs"]:
+        d = dict(d)
+        if d["needed"] and d["name"] not in on_branch:
+            d.update(needed=False, reason=f"not scheduled on {branch}")
+        jobs.append(d)
+    sha = (decision.get("heads") or {}).get(branch)
+    return dict(decision, jobs=jobs, target=branch, source=branch, base=sha,
+                head=sha)
+
+
+def report_cron(config, root, decision, result_list, workflow_ok, out):
+    """A cron report: one section and one verdict per branch the run is for,
+    then the run's verdict. Return (passed, verdict line, verdicts), the
+    verdicts being (sha, passed, verdict line) per branch head."""
+    workflow_text = _workflow_text(root, workflow_ok)
+    repo = repo_name(root)
+    heads = decision.get("heads") or {}
+    verdicts = []
+    failed = []
+    for branch, sha in heads.items():
+        part = branch_decision(decision, branch)
+        results = {r["job"]: r for r in result_list
+                   if r.get("target") == branch}
+        rows = job_rows(config, part, results, root=root, repo=repo)
+        if sha is None:
+            why = f"branch {branch} does not exist"
+            for row in rows:
+                if row["state"] != "not needed":
+                    row.update(state="could not run", detail=why)
+            passed, verdict = False, f"FAILED - {why}"
+        else:
+            passed, verdict = verdict_line(rows, part, workflow_ok)
+            verdicts.append((sha, passed, verdict))
+        if not passed:
+            failed.append(branch)
+        header = header_text(repo, short_head(root, sha) if sha else
+                             "no commit", branch)
+        out.write(format_report(rows, verdict, workflow_text, header=header))
+        _write_summary(format_markdown(rows, verdict, workflow_text,
+                                       header=header))
+    if not heads:
+        rows = job_rows(config, decision, {}, root=root, repo=repo)
+        passed, verdict = verdict_line(rows, decision, workflow_ok)
+        header = f"git-cicd report: {repo}, schedule {decision.get('cron')}"
+        out.write(format_report(rows, verdict, workflow_text, header=header))
+        _write_summary(format_markdown(rows, verdict, workflow_text,
+                                       header=header))
+        out.flush()
+        return passed, verdict, verdicts
+    n = len(heads)
+    word = "FAILED" if failed or not workflow_ok else "PASSED"
+    verdict = (f"{word} - schedule {decision.get('cron')} on {n} "
+               f"branch{'' if n == 1 else 'es'}")
+    if failed:
+        verdict += f", failed on {', '.join(failed)}"
+    out.write(verdict + "\n")
+    out.flush()
+    return word == "PASSED", verdict, verdicts
+
+
 def report(config, root, decision, results, workflow=None, setup_note=False,
            out=None):
     """Print the report, append it to GITHUB_STEP_SUMMARY when set, and
@@ -1091,15 +1496,7 @@ def report(config, root, decision, results, workflow=None, setup_note=False,
     if workflow is None:
         workflow = verify_workflow(config, root)
     workflow_ok = workflow[0]
-    if workflow_ok:
-        workflow_text = "workflows match config"
-    else:
-        try:
-            tool = tool_path(root)
-        except UsageError:
-            tool = "git-cicd"
-        workflow_text = ("workflows do not match config: run "
-                         f"{generate_command(tool)}")
+    workflow_text = _workflow_text(root, workflow_ok)
     repo = repo_name(root)
     rows = job_rows(config, decision, results, root=root, repo=repo)
     passed, verdict = verdict_line(rows, decision, workflow_ok)
@@ -1107,11 +1504,8 @@ def report(config, root, decision, results, workflow=None, setup_note=False,
     out.write(format_report(rows, verdict, workflow_text, setup_note,
                             header))
     out.flush()
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write(format_markdown(rows, verdict, workflow_text,
-                                    setup_note, header))
+    _write_summary(format_markdown(rows, verdict, workflow_text, setup_note,
+                                   header))
     return passed, verdict
 
 
@@ -1217,8 +1611,26 @@ def cmd_validate(args, root):
 
 def cmd_decide(args, root):
     config = load_config(root, args.config)
+    if args.trigger == "manual" and args.job is None:
+        raise UsageError("--trigger manual needs --job NAME (the job to run)")
+    if args.trigger != "manual" and args.job is not None:
+        raise UsageError(f"--job is for --trigger manual only, not "
+                         f"--trigger {args.trigger}")
+    if args.trigger == "cron":
+        if not args.cron:
+            raise UsageError("--trigger cron needs --cron EXPR (the schedule "
+                             "that fired)")
+    else:
+        if args.cron is not None:
+            raise UsageError(f"--cron is for --trigger cron only, not "
+                             f"--trigger {args.trigger}")
+        missing = [f"--{k}" for k in ("target", "source", "base", "head")
+                   if getattr(args, k) is None]
+        if missing:
+            raise UsageError(f"--trigger {args.trigger} needs "
+                             f"{', '.join(missing)}")
     decision = decide(config, root, args.trigger, args.target, args.source,
-                      args.base, args.head)
+                      args.base, args.head, job=args.job, cron=args.cron)
     if args.changed_files_out:
         write_changed_files(args.changed_files_out, decision["changed_files"])
     write_github_output(decision)
@@ -1257,6 +1669,11 @@ def cmd_generate(args, root):
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         print(f"wrote {rel}")
+    for rel in stale_paths(config):
+        if os.path.lexists(os.path.join(root, rel)):
+            os.remove(os.path.join(root, rel))
+            print(f"removed {rel} (no job has cron in on; commit the "
+                  "removal)")
     legacy = os.path.join(root, LEGACY_WORKFLOW_PATH)
     if os.path.lexists(legacy):
         os.remove(legacy)
@@ -1298,25 +1715,53 @@ def write_verdict(path, passed, verdict):
                 + status_description(verdict) + "\n")
 
 
+def write_cron_verdicts(path, verdicts):
+    """Write one line per branch head for the cron workflow's status step:
+    `<sha> TAB <state> TAB <description>`. Branches at the same commit share
+    one status, failed when any of them failed."""
+    if not path:
+        return
+    by_sha = {}
+    for sha, passed, verdict in verdicts:
+        if sha in by_sha and not by_sha[sha][0]:
+            continue
+        if sha not in by_sha or not passed:
+            by_sha[sha] = (passed, verdict)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for sha, (passed, verdict) in by_sha.items():
+            f.write(f"{sha}\t{'success' if passed else 'failure'}\t"
+                    f"{status_description(verdict)}\n")
+
+
 def cmd_report(args, root):
     try:
         config = load_config(root, args.config)
-        check_trigger(config, args.trigger)
-    except UsageError as e:
-        summary = os.environ.get("GITHUB_STEP_SUMMARY")
-        if summary:
-            with open(summary, "a", encoding="utf-8") as f:
-                f.write(f"## {VERDICT_STATUS}: FAILED\n\n{e}\n")
-        write_verdict(args.verdict_out, False, f"FAILED - {e}")
-        raise
     except ConfigError as e:
-        write_verdict(args.verdict_out, False,
-                      "FAILED - the config is invalid: " + "; ".join(e.errors))
+        reason = "FAILED - the config is invalid: " + "; ".join(e.errors)
+        if args.trigger == "cron":
+            decision = load_decisions(args.decisions) or {}
+            write_cron_verdicts(args.verdict_out, [
+                (sha, False, reason) for sha in
+                (decision.get("heads") or {}).values() if sha])
+        else:
+            write_verdict(args.verdict_out, False, reason)
         raise
     decision = load_decisions(args.decisions)
+    if args.trigger == "cron" and decision is not None:
+        passed, _, verdicts = report_cron(
+            config, root, decision, load_result_list(args.results),
+            verify_workflow(config, root)[0], sys.stdout)
+        write_cron_verdicts(args.verdict_out, verdicts)
+        return 0 if passed else 1
     passed, verdict = report(config, root, decision,
                              load_results(args.results))
-    write_verdict(args.verdict_out, passed, verdict)
+    if args.trigger == "cron":
+        write_cron_verdicts(args.verdict_out, [])
+    else:
+        write_verdict(args.verdict_out, passed, verdict)
     return 0 if passed else 1
 
 
@@ -1327,13 +1772,14 @@ def cmd_check(args, root):
                  force=args.force, setup=args.setup)
 
 
-def add_change_args(p):
-    """The facts about a change, as given by the platform or the caller."""
+def add_change_args(p, required=True):
+    """The facts about a change, as given by the platform or the caller.
+    decide checks them per trigger (cron takes --cron instead)."""
     p.add_argument("--trigger", required=True, choices=ALL_TRIGGERS)
-    p.add_argument("--target", required=True, help="target branch")
-    p.add_argument("--source", required=True, help="source branch")
-    p.add_argument("--base", required=True, help="base commit")
-    p.add_argument("--head", required=True, help="head commit")
+    p.add_argument("--target", required=required, help="target branch")
+    p.add_argument("--source", required=required, help="source branch")
+    p.add_argument("--base", required=required, help="base commit")
+    p.add_argument("--head", required=required, help="head commit")
 
 
 def build_parser():
@@ -1354,7 +1800,13 @@ def build_parser():
     add("validate", cmd_validate, "load and validate the config")
 
     p = add("decide", cmd_decide, "decide which jobs a change needs")
-    add_change_args(p)
+    add_change_args(p, required=False)
+    p.add_argument("--cron", metavar="EXPR",
+                   help="with --trigger cron (and only then): the schedule "
+                        "that fired (github.event.schedule)")
+    p.add_argument("--job", metavar="NAME",
+                   help="with --trigger manual (and only then): the job the "
+                        "manual run is for")
     p.add_argument("--json", action="store_true",
                    help="print the decisions as JSON")
     p.add_argument("--changed-files-out", metavar="PATH",
