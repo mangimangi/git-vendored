@@ -57,17 +57,56 @@ DEFAULT_MAX_PARALLEL = 3
 
 TOP_LEVEL_FIELDS = ("_vendor", "jobs", "needs_nothing", "max_parallel")
 JOB_FIELDS = ("name", "on", "branches", "paths", "setup", "steps", "cron", "manual",
-              "blocking", "inputs")
+              "blocking", "inputs", "secrets", "permissions")
+# The secrets a job may declare. A script's environment holds one of them if
+# and only if its job declares it and it is set non-empty, on every trigger
+# and in a local check. CICD_WRITE_TOKEN pushes branches, opens pull requests
+# and writes workflow files; CICD_READ_TOKEN reads private repositories;
+# VENDOR_PAT is the deprecated name CICD_WRITE_TOKEN replaces.
+DECLARABLE_SECRETS = ("CICD_WRITE_TOKEN", "CICD_READ_TOKEN", "VENDOR_PAT")
+# The permissions of the workflow's own token (GITHUB_TOKEN) a job may
+# declare, in GitHub's syntax (scope -> level), and the levels. A job's
+# effective permissions on a trigger are the trigger's default merged with
+# its declaration, the higher level winning. No write is allowed on a job
+# with open in on: open runs a pull request's own code.
+PERMISSION_SCOPES = ("contents", "pull-requests", "issues", "packages")
+PERMISSION_LEVELS = ("read", "write")
+TRIGGER_PERMISSIONS = {
+    "open": {"contents": "read"},
+    "merge": {"contents": "write", "pull-requests": "write"},
+    "cron": {"contents": "write", "pull-requests": "write"},
+    "manual": {"contents": "write", "pull-requests": "write"},
+}
 INPUT_FIELDS = ("description", "required", "default", "choices")
 
 JOB_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# The `run` matrix entry of a run that needs no job. A matrix job skipped by a
+# job-level `if` shows its `name:` expression unexpanded, so the workflows
+# never skip `run`: they run this entry and skip its steps. Its name is no
+# valid job name (JOB_NAME_RE), so it cannot be a config job's.
+NOTHING_JOB = "(nothing)"
+NOTHING_TITLE = "Nothing needed"
 INPUT_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # Every declared input reaches a script as CICD_INPUT_<NAME upper-cased>.
 INPUT_ENV_PREFIX = "CICD_INPUT_"
-# The values of a manual run: a JSON object of strings, set by the Manual
-# workflow from its fixed `inputs` field. Read by the tool, never passed on.
-MANUAL_INPUTS_ENV = "CICD_MANUAL_INPUTS"
+# The values of a manual run: the Manual workflow's form as one JSON object
+# of strings (`toJSON(inputs)`, set in a fixed env line), every field of
+# every manual job plus `job`. Read by the tool, never passed on.
+MANUAL_FORM_ENV = "CICD_MANUAL_FORM"
 GLOB_CHARS = ("*", "?", "[")
+# The most inputs a workflow_dispatch workflow may have, the Manual form's
+# `job` field included (so at most MANUAL_FORM_LIMIT - 1 input fields).
+# Source: GitHub changelog 2025-12-04, "Actions workflow_dispatch workflows
+# now support 25 inputs"
+# (https://github.blog/changelog/2025-12-04-actions-workflow-dispatch-workflows-now-support-25-inputs/),
+# re-checked 2026-11-28; the limit was 10 before.
+MANUAL_FORM_LIMIT = 25
+# Input names a job that allows manual runs cannot declare: the Manual form's
+# own field.
+MANUAL_FORM_RESERVED = ("job",)
+# GitHub evaluates `${{ ... }}` in every workflow string and YAML has no
+# escape for it, so it is refused in what the form writes from the config.
+EXPRESSION_MARK = "${{"
 
 
 class ConfigError(Exception):
@@ -268,59 +307,73 @@ def input_env_name(name):
     return INPUT_ENV_PREFIX + name.upper()
 
 
-def parse_manual_inputs(text):
-    """The values of a manual run from the Manual workflow's `inputs` field
-    (a JSON object of strings; empty means none). Return (values, None) or
-    (None, why)."""
+def parse_manual_form(text):
+    """The values of a manual run from MANUAL_FORM_ENV: a JSON object of
+    strings (unset or empty means none). Return (values, None) or (None,
+    why)."""
     if text is None or not text.strip():
         return {}, None
     try:
         data = json.loads(text)
     except ValueError as e:
-        return None, f"the inputs are not valid JSON ({e})"
+        return None, f"the manual run's form values are not valid JSON ({e})"
     if not isinstance(data, dict) or not all(
             isinstance(v, str) for v in data.values()):
-        return None, ("the inputs must be a JSON object of string values, "
-                      'for example {"bump_type": "minor"}')
+        return None, ("the manual run's form values must be a JSON object "
+                      "of string values")
     return data, None
 
 
 def input_values(job, given=None):
     """Every declared input's value: the given one, else the default, else
-    the empty string. Return (values, None) or (None, why) when a given value
-    is undeclared or outside the choices, or a required input is missing.
-    With `given` None (every trigger but manual) nothing is required: each
-    input is its default or the empty string."""
+    the empty string. `given` holds only declared inputs. Return (values,
+    None) or (None, why) when a given value is outside the choices or a
+    required input is missing (absent or empty). With `given` None (every
+    trigger but manual) nothing is required: each input is its default or
+    the empty string."""
     manual = given is not None
     given = given or {}
     declared = job.get("inputs") or {}
     name = job["name"]
-    for key in given:
-        if key not in declared:
-            return None, (f"job {name} declares no input {key!r} (declared: "
-                          f"{', '.join(declared) or 'none'})")
     values = {}
     for key, decl in declared.items():
-        if key in given:
-            value = given[key]
-            if decl["choices"] is not None and value not in decl["choices"]:
-                return None, (f"job {name}: input {key}: {value!r} is not "
-                              f"one of the choices "
-                              f"({', '.join(decl['choices'])})")
-        elif decl["required"] and manual:
-            return None, f"job {name}: input {key} is required"
-        else:
+        value = given.get(key)
+        if value is None or (value == "" and decl["required"]):
+            if decl["required"] and manual:
+                return None, f"job {name}: input {key} is required"
             value = decl["default"] if decl["default"] is not None else ""
+        elif decl["choices"] is not None and value not in decl["choices"]:
+            return None, (f"job {name}: input {key}: {value!r} is not "
+                          f"one of the choices "
+                          f"({', '.join(decl['choices'])})")
         values[key] = value
     return values, None
 
 
-def manual_input_values(job):
-    """The values of a manual run of the job, from MANUAL_INPUTS_ENV."""
-    given, why = parse_manual_inputs(os.environ.get(MANUAL_INPUTS_ENV))
+def manual_input_values(config, job):
+    """The values of a manual run of the job, from the form in
+    MANUAL_FORM_ENV - the one path a manual run's values take. The form
+    shows every manual job's fields: the job gets only those it declares
+    (`job` itself names the job, which comes from --job). Every other field
+    is ignored, and noted when its value is not the field's form default.
+    Return (values, ignored notes, None) or (None, [], why)."""
+    form, why = parse_manual_form(os.environ.get(MANUAL_FORM_ENV))
     if why:
-        return None, why
-    return input_values(job, given)
+        return None, [], why
+    declared = job.get("inputs") or {}
+    defaults = {key: (_form_default(decl) or (decl["choices"] or [""])[0])
+                for key, decl, _ in manual_form_fields(config["jobs"])}
+    given, ignored = {}, []
+    for key, value in form.items():
+        if key in declared:
+            given[key] = value
+        elif key != "job" and value != defaults.get(key, ""):
+            ignored.append(f"ignored input {key} (job {job['name']} does "
+                           "not declare it)")
+    values, why = input_values(job, given)
+    if why:
+        return None, [], why
+    return values, ignored, None
 
 
 def _validate_job(root, name, job):
@@ -446,6 +499,30 @@ def _validate_job(root, name, job):
         input_errors, inputs = _validate_inputs(prefix, job["inputs"])
         errors.extend(input_errors)
 
+    # secrets
+    secrets = job.get("secrets", [])
+    if "secrets" in job:
+        if not _is_str_list(secrets):
+            errors.append(f"{prefix}: secrets must be an array of secret "
+                          f"names ({', '.join(DECLARABLE_SECRETS)})")
+            secrets = []
+        else:
+            for secret in secrets:
+                if secret not in DECLARABLE_SECRETS:
+                    errors.append(f"{prefix}: unknown secret {secret!r} in "
+                                  "secrets (allowed: "
+                                  f"{', '.join(DECLARABLE_SECRETS)})")
+            for dupe in sorted({s for s in secrets if secrets.count(s) > 1}):
+                errors.append(f"{prefix}: secret {dupe} listed more than "
+                              "once in secrets")
+
+    # permissions
+    permissions = {}
+    if "permissions" in job:
+        permission_errors, permissions = _validate_permissions(
+            prefix, job["permissions"], "open" in on)
+        errors.extend(permission_errors)
+
     # flags
     for flag in ("manual", "blocking"):
         if flag in job and not isinstance(job[flag], bool):
@@ -463,8 +540,83 @@ def _validate_job(root, name, job):
         "manual": job.get("manual", True) is not False,
         "blocking": job.get("blocking", True) is not False,
         "inputs": inputs,
+        "secrets": list(dict.fromkeys(secrets)),
+        "permissions": permissions,
     }
     return errors, normalized
+
+
+def _validate_permissions(prefix, value, on_open):
+    """Return (errors, normalized permissions) for a job's `permissions`:
+    scope -> level, in PERMISSION_SCOPES order."""
+    allowed = ", ".join(PERMISSION_SCOPES)
+    if not isinstance(value, dict):
+        return [f"{prefix}: permissions must be an object (scope -> read or "
+                f"write; scopes: {allowed})"], {}
+    errors = []
+    for scope, level in value.items():
+        where = f"{prefix}: permission {scope}"
+        if scope not in PERMISSION_SCOPES:
+            errors.append(f"{prefix}: unknown permission {scope!r} in "
+                          f"permissions (allowed: {allowed})")
+        elif not isinstance(level, str):
+            errors.append(f"{where}: the level must be a string (read or "
+                          "write)")
+        elif level not in PERMISSION_LEVELS:
+            errors.append(f"{where}: level {level!r} is not allowed (read "
+                          "or write)")
+        elif level == "write" and on_open:
+            errors.append(f"{where}: write is not allowed on a job with "
+                          "open in on (open runs a pull request's own code; "
+                          "a job that must write on open declares the "
+                          "CICD_WRITE_TOKEN secret)")
+    if errors:
+        return errors, {}
+    return [], {s: value[s] for s in PERMISSION_SCOPES if s in value}
+
+
+def effective_permissions(job, trigger):
+    """The trigger's default permissions merged with the job's declaration,
+    the higher level winning, in PERMISSION_SCOPES order."""
+    merged = dict(TRIGGER_PERMISSIONS[trigger])
+    for scope, level in (job.get("permissions") or {}).items():
+        if merged.get(scope) != "write":
+            merged[scope] = level
+    return {s: merged[s] for s in PERMISSION_SCOPES if s in merged}
+
+
+def runs_on(job, trigger):
+    """True when the job can run on the trigger (manual: allows manual
+    runs)."""
+    return job["manual"] if trigger == "manual" else trigger in job["on"]
+
+
+def permission_groups(config, trigger):
+    """{run job id: {"permissions": effective set, "jobs": [names]}} for
+    every effective permission set on the trigger that differs from its
+    default, in first-seen config order. The id is `run-` plus each scope
+    and level beyond the default (`run-packages-write`), validated words
+    only. Every other job runs in the default `run` job."""
+    default = TRIGGER_PERMISSIONS[trigger]
+    groups = {}
+    for name, job in config["jobs"].items():
+        if not runs_on(job, trigger):
+            continue
+        perms = effective_permissions(job, trigger)
+        extra = [f"{s}-{lv}" for s, lv in perms.items()
+                 if default.get(s) != lv]
+        if not extra:
+            continue
+        gid = "run-" + "-".join(extra)
+        groups.setdefault(gid, {"permissions": perms, "jobs": []})
+        groups[gid]["jobs"].append(name)
+    return groups
+
+
+def group_placeholder(gid):
+    """The matrix entry of a permission group's run job when it has nothing
+    to run (like NOTHING_JOB for `run`); no valid job name."""
+    return f"(nothing:{gid})"
 
 
 def validate_config(data, root):
@@ -503,6 +655,8 @@ def validate_config(data, root):
         errors.append("config: max_parallel must be a positive integer")
         max_parallel = DEFAULT_MAX_PARALLEL
 
+    errors.extend(_validate_manual_form(jobs))
+
     if errors:
         raise ConfigError(errors)
     return {
@@ -510,6 +664,82 @@ def validate_config(data, root):
         "needs_nothing": list(needs_nothing),
         "max_parallel": max_parallel,
     }
+
+
+def _form_default(decl):
+    """The value a declaration gives the script when the form leaves it
+    alone: an absent default and "" are the same."""
+    return decl["default"] or ""
+
+
+def manual_form_fields(jobs):
+    """The input fields of the Manual workflow's form: [(input name,
+    declaration of the first job declaring it, [job names using it])], in
+    first-seen order over the jobs that allow manual runs."""
+    fields = {}
+    for name, job in jobs.items():
+        if not job["manual"]:
+            continue
+        for key, decl in (job.get("inputs") or {}).items():
+            if key in fields:
+                fields[key][1].append(name)
+            else:
+                fields[key] = (decl, [name])
+    return [(key, decl, users) for key, (decl, users) in fields.items()]
+
+
+def _validate_manual_form(jobs):
+    """The Manual workflow's form shows every manual job's inputs at once:
+    one field per input name, so declarations of one name must be able to
+    share a field, none may be named like the form's own fields, and the form
+    must fit the platform's limit."""
+    errors = []
+    manual = {n: j for n, j in jobs.items() if j["manual"]}
+    for name, job in manual.items():
+        for key, decl in (job.get("inputs") or {}).items():
+            texts = [("description", decl["description"]),
+                     ("default", decl["default"] or "")]
+            texts += [("choice", c) for c in decl["choices"] or []]
+            for what in dict.fromkeys(w for w, t in texts
+                                      if EXPRESSION_MARK in t):
+                errors.append(f"job {name}: input {key}: the {what} "
+                              f"contains {EXPRESSION_MARK}, which GitHub "
+                              "would evaluate in the Manual workflow's form; "
+                              f"remove {EXPRESSION_MARK}, or set "
+                              "\"manual\": false on the job")
+            if key in MANUAL_FORM_RESERVED:
+                errors.append(f"job {name}: input {key}: the name {key} is "
+                              "reserved for the Manual workflow's own field; "
+                              "rename the input, or set \"manual\": false on "
+                              "the job")
+    first = {}
+    for name, job in manual.items():
+        for key, decl in (job.get("inputs") or {}).items():
+            if key not in first:
+                first[key] = (name, decl)
+                continue
+            other, seen = first[key]
+            what = []
+            if seen["choices"] != decl["choices"]:
+                what.append("choices")
+            if _form_default(seen) != _form_default(decl):
+                what.append("defaults")
+            if what:
+                errors.append(f"input {key} is declared by jobs {other} and "
+                              f"{name} with different {' and '.join(what)}; "
+                              "the Manual workflow's form shows one field per "
+                              "input name: give them the same choices and "
+                              "default, or rename one")
+    count = len(first) + 1
+    if count > MANUAL_FORM_LIMIT:
+        errors.append(f"config: the Manual workflow's form would have "
+                      f"{count} fields (job and {len(first)} distinct input "
+                      f"names); GitHub allows at most {MANUAL_FORM_LIMIT} "
+                      f"inputs in a manually started workflow, so at most "
+                      f"{MANUAL_FORM_LIMIT - 1} distinct input names: use "
+                      "fewer distinct input names, or set \"manual\": false "
+                      "on a job")
+    return errors
 
 
 def load_config(root, path=None):
@@ -630,8 +860,9 @@ def decide_manual(config, target, source, base, head, job):
     needs_nothing are ignored); every other job is not needed. A refusal is
     recorded in the decision record, never raised, so the report shows it."""
     refused = manual_refusal(config, job, target)
+    ignored = []
     if not refused:
-        _, refused = manual_input_values(config["jobs"][job])
+        _, ignored, refused = manual_input_values(config, config["jobs"][job])
     decisions = []
     for name, j in config["jobs"].items():
         if name != job:
@@ -651,6 +882,7 @@ def decide_manual(config, target, source, base, head, job):
         "head": head,
         "job": job,
         "refused": refused,
+        "ignored": ignored,
         "changed_files": [],
         "jobs": decisions,
         "max_parallel": config["max_parallel"],
@@ -813,22 +1045,42 @@ def format_decision(decision):
                  f"  {len(decision['changed_files'])} changed files"]
     if decision.get("refused"):
         lines.append(f"  refused: {decision['refused']}")
+    for note in decision.get("ignored") or []:
+        lines.append(f"  {note}")
     for j in decision["jobs"]:
         state = "needed" if j["needed"] else "not needed"
         lines.append(f"  {j['name']}: {state} ({j['reason']})")
     return "\n".join(lines)
 
 
-def write_github_output(decision):
+def job_secrets(config):
+    """{job: [declared secret names]} for every job, in config order."""
+    return {n: list(j.get("secrets") or []) for n, j in config["jobs"].items()}
+
+
+def write_github_output(decision, config):
     """Append the outputs the generated workflow reads, when in Actions."""
     path = os.environ.get("GITHUB_OUTPUT")
     if not path:
         return
+    groups = permission_groups(config, decision["trigger"])
+    grouped = {n: gid for gid, g in groups.items() for n in g["jobs"]}
     with open(path, "a", encoding="utf-8") as f:
-        f.write(f"jobs={json.dumps(needed_jobs(decision))}\n")
+        # the matrix is never empty: a run that needs nothing runs the
+        # placeholder entry, whose steps the workflow skips (NOTHING_JOB);
+        # a job in a permission group runs in that group's run job instead
+        default_jobs = [n for n in needed_jobs(decision) if n not in grouped]
+        f.write(f"jobs={json.dumps(default_jobs or [NOTHING_JOB])}\n")
         names = {j["name"]: j.get("title") or default_title(j["name"])
                  for j in decision["jobs"]}
+        names[NOTHING_JOB] = NOTHING_TITLE
+        for gid in groups:
+            names[group_placeholder(gid)] = NOTHING_TITLE
         f.write(f"names={json.dumps(names)}\n")
+        # the secrets each job declares, for the run step's env: a documented
+        # name is given its secret only for a matrix entry whose job declares
+        # it (names only, never a value)
+        f.write(f"secrets={json.dumps(job_secrets(config))}\n")
         any_run = decision["runs"] if decision["trigger"] == "cron" \
             else needed_jobs(decision)
         f.write(f"any={'true' if any_run else 'false'}\n")
@@ -836,7 +1088,24 @@ def write_github_output(decision):
         if decision["trigger"] == "cron":
             # the cron matrix: one entry per (job, branch), cron only, so
             # the outputs of the other triggers stay as they are
-            f.write(f"runs={json.dumps(decision['runs'])}\n")
+            runs = [r for r in decision["runs"] if r["job"] not in grouped]
+            runs = runs or [{"job": NOTHING_JOB, "branch": "", "sha": "",
+                             "key": NOTHING_JOB}]
+            f.write(f"runs={json.dumps(runs)}\n")
+        if groups:
+            # each permission group's matrix, like jobs (runs on cron)
+            out = {}
+            for gid, g in groups.items():
+                ph = group_placeholder(gid)
+                if decision["trigger"] == "cron":
+                    entries = [r for r in decision["runs"]
+                               if grouped.get(r["job"]) == gid]
+                    out[gid] = entries or [{"job": ph, "branch": "",
+                                            "sha": "", "key": ph}]
+                else:
+                    out[gid] = [n for n in needed_jobs(decision)
+                                if grouped.get(n) == gid] or [ph]
+            f.write(f"groups={json.dumps(out)}\n")
 
 
 def write_changed_files(path, files):
@@ -847,17 +1116,32 @@ def write_changed_files(path, files):
 
 # ── Run ─────────────────────────────────────────────────────────────────────
 
-def script_env(job_name, facts, changed_files_path, inputs=None):
+def absent_secrets(declared):
+    """The declared secrets that are unset or empty in the caller's
+    environment (names only)."""
+    return [n for n in declared if not os.environ.get(n)]
+
+
+def script_env(job_name, facts, changed_files_path, inputs=None,
+               secrets=()):
     """The inherited environment plus the CICD_ facts about the change and
     one CICD_INPUT_<NAME> per declared input.
 
-    Inherited CICD_INPUT_ variables and the manual run's raw values
-    (CICD_MANUAL_INPUTS) are removed, so the declared inputs are the only
-    channel. GITHUB_TOKEN and VENDOR_PAT reach scripts unchanged through the
-    inherited environment; git-cicd itself never reads or logs them.
+    Inherited CICD_INPUT_ variables and the manual run's raw form values
+    (CICD_MANUAL_FORM) are removed, so the declared inputs are the only
+    channel. Every name of DECLARABLE_SECRETS the job does not declare in
+    `secrets` is removed, on every trigger (open, merge, cron, manual) and so
+    in a local check, and so is a declared one that is empty: a script sees
+    a documented secret if and only if its job declares it and it is set,
+    never as an empty string it could mistake for a value. GITHUB_TOKEN
+    reaches scripts unchanged through the inherited environment. git-cicd
+    itself never prints a secret's value.
     """
+    dropped = {MANUAL_FORM_ENV}
+    dropped |= {n for n in DECLARABLE_SECRETS
+                if n not in secrets or not os.environ.get(n)}
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(INPUT_ENV_PREFIX) and k != MANUAL_INPUTS_ENV}
+           if not k.startswith(INPUT_ENV_PREFIX) and k not in dropped}
     for key, value in (inputs or {}).items():
         env[input_env_name(key)] = value
     env.update({
@@ -870,6 +1154,11 @@ def script_env(job_name, facts, changed_files_path, inputs=None):
         "CICD_CHANGED_FILES": changed_files_path,
     })
     return env
+
+
+def secret_notes(absent):
+    """One note per declared secret that was not set (names only)."""
+    return [f"declared secret {n} is not set" for n in absent]
 
 
 def _run_script(argv, root, env, header):
@@ -899,9 +1188,11 @@ def run_job(config, root, name, facts, setup=False, files=None):
     if facts["trigger"] == "manual":
         refused = manual_refusal(config, name, facts["target"])
         if not refused:
-            inputs, refused = manual_input_values(job)
+            inputs, ignored, refused = manual_input_values(config, job)
         if refused:
             raise UsageError(f"manual run refused: {refused}")
+        for note in ignored:
+            print(f"==> git-cicd: {note}", flush=True)
         files = []  # a manual run has no change
     elif facts["trigger"] == "cron":
         inputs, _ = input_values(job)
@@ -914,12 +1205,18 @@ def run_job(config, root, name, facts, setup=False, files=None):
                                         suffix=".txt")
     os.close(fd)
     write_changed_files(changed_path, files or [])
-    env = script_env(name, facts, os.path.abspath(changed_path), inputs)
+    declared = job.get("secrets") or []
+    env = script_env(name, facts, os.path.abspath(changed_path), inputs,
+                     declared)
+    absent = absent_secrets(declared)
+    for note in secret_notes(absent):
+        print(f"==> git-cicd: job {name}: {note}", flush=True)
 
     result = {"job": name, "target": facts["target"], "head": facts["head"],
               "state": "passed", "failed_step": None,
               "exit_code": 0, "error": None, "setup": None,
               "setup_skipped": bool(job["setup"]) and not setup,
+              "absent_secrets": absent,
               "steps": [], "seconds": 0.0}
     start = time.monotonic()
     try:
@@ -997,12 +1294,112 @@ def schedule_block(config):
     return "\n".join(lines) + "\n"
 
 
-def render_workflow(config, tool, template):
+def manual_job_names(config):
+    return [n for n, j in config["jobs"].items() if j["manual"]]
+
+
+def _used_by(users):
+    return f"(job{'s' if len(users) > 1 else ''} {', '.join(users)})"
+
+
+def form_block(config):
+    """The Manual workflow's form, the `inputs:` entries of its
+    `workflow_dispatch`: `job`, a dropdown of the jobs that allow manual runs
+    in config order, then one field per distinct declared input of those
+    jobs, in first-seen order. Every field but `job` is optional in the form,
+    since the form shows every job's fields; the tool enforces `required` for
+    the chosen job. Names are validated identifiers, written bare; every
+    description, default and option is written with json.dumps (a JSON
+    string is a YAML double-quoted scalar), so it cannot leave its place."""
+    names = manual_job_names(config)
+    if not names:
+        return ""
+    lines = ["      job:",
+             f"        description: {json.dumps('The config job to run')}",
+             "        required: true",
+             "        type: choice",
+             "        options:"]
+    lines += [f"          - {json.dumps(n)}" for n in names]
+    for key, decl, users in manual_form_fields(config["jobs"]):
+        description = decl["description"]
+        if len(users) < len(names):
+            description = " ".join(p for p in (description, _used_by(users))
+                                   if p)
+        lines += [f"      {key}:",
+                  f"        description: {json.dumps(description)}",
+                  "        required: false"]
+        if _form_default(decl):
+            lines.append(f"        default: {json.dumps(_form_default(decl))}")
+        if decl["choices"] is not None:
+            lines += ["        type: choice", "        options:"]
+            lines += [f"          - {json.dumps(c)}" for c in decl["choices"]]
+        else:
+            lines.append("        type: string")
+    return "\n".join(lines) + "\n"
+
+
+GROUP_OUTPUTS = "__GROUP_OUTPUTS__\n"
+GROUP_JOBS = "__GROUP_JOBS__\n"
+GROUP_NEEDS = "__GROUP_NEEDS__"
+RUN_JOB_RE = re.compile(r"\n(  run:\n.*?)\n" + re.escape(GROUP_JOBS), re.S)
+PERMISSIONS_RE = re.compile(r"    permissions:\n(?:      .*\n)+")
+
+
+def template_trigger(template):
+    m = re.search(r"--trigger=([a-z]+)", template)
+    return m.group(1) if m else None
+
+
+def group_jobs_block(config, template, trigger):
+    """The run job of each permission group (permission_groups): the
+    template's own `run` job with its id, its permissions (the group's
+    effective set, written literally from validated words), its matrix (the
+    group's entry of decide's `groups` output) and its placeholder entry
+    changed. Nothing else differs, so the rows keep their names."""
+    groups = permission_groups(config, trigger) if trigger in \
+        TRIGGER_PERMISSIONS else {}
+    m = RUN_JOB_RE.search(template)
+    if not groups or m is None:
+        return ""
+    run = m.group(1) + "\n"
+    blocks = []
+    for gid, g in groups.items():
+        text = run.replace("  run:\n", f"  {gid}:\n", 1)
+        perms = "    permissions:\n" + "".join(
+            f"      {s}: {lv}\n" for s, lv in g["permissions"].items())
+        text = PERMISSIONS_RE.sub("", text, count=1)
+        text = text.replace("    runs-on: ubuntu-latest\n",
+                            "    runs-on: ubuntu-latest\n" + perms, 1)
+        source = "runs" if trigger == "cron" else "jobs"
+        text = text.replace(f"fromJSON(needs.decide.outputs.{source})",
+                            f"fromJSON(needs.decide.outputs.groups)['{gid}']")
+        text = text.replace(f"'{NOTHING_JOB}'",
+                            f"'{group_placeholder(gid)}'")
+        blocks.append(text)
+    return "\n" + "\n".join(blocks)
+
+
+def render_workflow(config, tool, template, trigger=None):
     """One workflow file from its template, deterministic byte for byte. A
-    template is fixed text; the only part that depends on the config is the
-    schedule block, which only the cron template holds (`__SCHEDULE__`). The
-    tool path depends on where the tool is installed."""
-    text = template.replace("__SCHEDULE__\n", schedule_block(config))
+    template is fixed text; the only parts that depend on the config are the
+    schedule block, which only the cron template holds (`__SCHEDULE__`), the
+    form, which only the manual template holds (`__FORM__`), and the run job
+    of each permission group with the decide output and the report's needs
+    that go with them (`__GROUP_OUTPUTS__`, `__GROUP_JOBS__`,
+    `__GROUP_NEEDS__`), empty when no job declares permissions beyond its
+    trigger's default. The tool path depends on where the tool is
+    installed."""
+    trigger = trigger or template_trigger(template)
+    groups = permission_groups(config, trigger) if trigger in \
+        TRIGGER_PERMISSIONS else {}
+    text = template.replace(GROUP_JOBS, group_jobs_block(config, template,
+                                                         trigger))
+    text = text.replace(GROUP_OUTPUTS, "      groups: ${{ steps.decide."
+                        "outputs.groups }}\n" if groups else "")
+    text = text.replace(GROUP_NEEDS, "".join(f", {g}" for g in groups))
+    text = text.replace("__SCHEDULE__\n", schedule_block(config))
+    if "__FORM__\n" in template:
+        text = text.replace("__FORM__\n", form_block(config))
     return text.replace("__TOOL__", tool)
 
 
@@ -1010,18 +1407,33 @@ def has_cron_jobs(config):
     return bool(schedule_block(config))
 
 
+def has_manual_jobs(config):
+    return bool(manual_job_names(config))
+
+
+# Why a trigger's workflow is not generated, for generate and verify.
+NOT_GENERATED = {
+    "cron": "no job has cron in on",
+    "manual": "no job allows manual runs",
+}
+
+
 def rendered_triggers(config):
     """The triggers whose workflow the config generates: every one, except
     cron when no job has cron in on (GitHub needs an event under on:, and a
-    schedule must never fire with nothing to run)."""
+    schedule must never fire with nothing to run), and manual when no job
+    allows manual runs (the form's `job` dropdown needs an option, and a
+    workflow with nothing to run must not exist)."""
+    present = {"cron": has_cron_jobs(config),
+               "manual": has_manual_jobs(config)}
+    return [t for t in GENERATED_TRIGGERS if present.get(t, True)]
+
+
+def stale_triggers(config):
+    """The triggers whose workflow the config no longer generates (generate
+    removes their files, verify fails while one is there): cron when no job
+    has cron in on, manual when no job allows manual runs."""
     return [t for t in GENERATED_TRIGGERS
-            if t != "cron" or has_cron_jobs(config)]
-
-
-def stale_paths(config):
-    """Generated files the config no longer generates: the cron workflow when
-    no job has cron in on."""
-    return [WORKFLOWS[t][1] for t in GENERATED_TRIGGERS
             if t not in rendered_triggers(config)]
 
 
@@ -1033,7 +1445,8 @@ def render_workflows(config, tool, templates=None):
         template = (templates or {}).get(trigger)
         if template is None:
             template = template_text(trigger)
-        out[WORKFLOWS[trigger][1]] = render_workflow(config, tool, template)
+        out[WORKFLOWS[trigger][1]] = render_workflow(config, tool, template,
+                                                     trigger)
     return out
 
 
@@ -1072,10 +1485,12 @@ def verify_workflow(config, root, tool=None):
                 tofile=f"{rel} (generated from the config)")))
     commit = ", ".join(render_workflows(config, tool))
     removals = []
-    for rel in stale_paths(config):
+    for trigger in stale_triggers(config):
+        rel = WORKFLOWS[trigger][1]
         if os.path.lexists(os.path.join(root, rel)):
-            problems.append(f"{rel} is still there, but no job has cron in "
-                            "on (generate removes it)\n")
+            problems.append(f"{rel} is still there, but "
+                            f"{NOT_GENERATED[trigger]} (generate removes "
+                            "it)\n")
             removals.append(rel)
     if os.path.lexists(os.path.join(root, LEGACY_WORKFLOW_PATH)):
         problems.append(f"{LEGACY_WORKFLOW_PATH} is still there (the single "
@@ -1192,6 +1607,8 @@ def step_owner(root, path, repo):
     if rel.startswith(VENDOR_PKG_PREFIX):
         vendor = rel[len(VENDOR_PKG_PREFIX):].split("/", 1)[0]
         if vendor:
+            if root is None:
+                return vendor, None
             return vendor, _read_version(
                 root, VENDOR_VERSION_PATH.format(vendor=vendor))
     if root is None:
@@ -1245,7 +1662,7 @@ def job_rows(config, decision, results, root=None, repo=None):
         row = {"name": name, "title": title,
                "display": row_name(title, repo, name),
                "blocking": job["blocking"], "seconds": None,
-               "children": [], "setup_skipped": False}
+               "children": [], "setup_skipped": False, "notes": []}
         if d is None:
             row.update(state="could not run", detail="no decision")
         elif not d["needed"]:
@@ -1257,6 +1674,10 @@ def job_rows(config, decision, results, root=None, repo=None):
             else:
                 row["seconds"] = r.get("seconds")
                 row["setup_skipped"] = bool(r.get("setup_skipped"))
+                absent = r.get("absent_secrets")
+                if isinstance(absent, list):
+                    row["notes"] = secret_notes(
+                        [n for n in absent if n in DECLARABLE_SECRETS])
                 setup = r.get("setup")
                 if setup:
                     path = setup.get("script") or job["setup"] or "setup"
@@ -1351,7 +1772,7 @@ def header_text(repo, head, branch=None):
 
 
 def format_report(rows, verdict, workflow_text, setup_note=False,
-                  header="git-cicd report"):
+                  header="git-cicd report", notes=()):
     width = max([len(r["display"]) for r in rows] + [4])
     lines = [header]
     for r in rows:
@@ -1362,6 +1783,8 @@ def format_report(rows, verdict, workflow_text, setup_note=False,
             lines.append(f"    {label}  {result}  {_secs(seconds)}")
         if setup_note and r["setup_skipped"]:
             lines.append("    setup skipped (pass --setup to run it)")
+        lines += [f"    {note}" for note in r.get("notes", ())]
+    lines += [f"  {note}" for note in notes]
     lines.append(workflow_text)
     lines.append(verdict)
     return "\n".join(lines) + "\n"
@@ -1382,7 +1805,7 @@ def _md_code(text):
 
 
 def format_markdown(rows, verdict, workflow_text, setup_note=False,
-                    header="git-cicd report"):
+                    header="git-cicd report", notes=()):
     word = verdict.split(" ", 1)[0]
     lines = [f"## {VERDICT_STATUS}: {word}", "", f"**{_md(verdict)}**", "",
              _md(header), "",
@@ -1398,6 +1821,11 @@ def format_markdown(rows, verdict, workflow_text, setup_note=False,
         if setup_note and r["setup_skipped"]:
             lines.append("| &nbsp;&nbsp;↳ setup | skipped | | pass --setup "
                          "to run it |")
+        for note in r.get("notes", ()):
+            lines.append(f"| &nbsp;&nbsp;↳ secrets | {_md(note)} | | |")
+    if notes:
+        lines.append("")
+        lines += [f"- {_md(note)}" for note in notes]
     lines += ["", f"Workflow: {_md(workflow_text)}", ""]
     return "\n".join(lines)
 
@@ -1501,11 +1929,13 @@ def report(config, root, decision, results, workflow=None, setup_note=False,
     rows = job_rows(config, decision, results, root=root, repo=repo)
     passed, verdict = verdict_line(rows, decision, workflow_ok)
     header = header_text(repo, short_head(root, (decision or {}).get("head")))
+    notes = (decision or {}).get("ignored")
+    notes = [str(n) for n in notes] if isinstance(notes, list) else []
     out.write(format_report(rows, verdict, workflow_text, setup_note,
-                            header))
+                            header, notes))
     out.flush()
     _write_summary(format_markdown(rows, verdict, workflow_text, setup_note,
-                                   header))
+                                   header, notes))
     return passed, verdict
 
 
@@ -1633,7 +2063,7 @@ def cmd_decide(args, root):
                       args.base, args.head, job=args.job, cron=args.cron)
     if args.changed_files_out:
         write_changed_files(args.changed_files_out, decision["changed_files"])
-    write_github_output(decision)
+    write_github_output(decision, config)
     if args.json:
         print(json.dumps(decision, indent=2))
     else:
@@ -1669,10 +2099,11 @@ def cmd_generate(args, root):
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         print(f"wrote {rel}")
-    for rel in stale_paths(config):
+    for trigger in stale_triggers(config):
+        rel = WORKFLOWS[trigger][1]
         if os.path.lexists(os.path.join(root, rel)):
             os.remove(os.path.join(root, rel))
-            print(f"removed {rel} (no job has cron in on; commit the "
+            print(f"removed {rel} ({NOT_GENERATED[trigger]}; commit the "
                   "removal)")
     legacy = os.path.join(root, LEGACY_WORKFLOW_PATH)
     if os.path.lexists(legacy):

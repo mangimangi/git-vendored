@@ -4,27 +4,82 @@
 # Provides fetch_file and fetch_dir functions that handle download, auth,
 # and manifest emission so vendor install scripts don't duplicate this logic.
 #
+# Two modes:
+#   checkout mode - VENDOR_CHECKOUT is set to a directory (the framework
+#                   fetched the vendor with git at VENDOR_REF): files are
+#                   copied from it. No gh, no curl, no token.
+#   fallback mode - VENDOR_CHECKOUT unset or empty (an installer run by hand,
+#                   or an older framework): gh api, then curl on
+#                   raw.githubusercontent.com, as before.
+# Either way a file gets its content only: its mode is the umask default,
+# and executable only through `fetch_file ... +x`.
+#
 # Usage in vendor install.sh:
 #   source "$VENDOR_LIB" 2>/dev/null || {
 #       fetch_file() { curl -fsSL ...; }  # inline fallback
 #   }
 #
 # Environment (set by the framework before sourcing):
-#   VENDOR_REPO      - owner/repo for API calls
+#   VENDOR_CHECKOUT  - Absolute path of the vendor checkout at VENDOR_REF
+#                      (optional; selects checkout mode)
+#   VENDOR_REPO      - The vendor's repo as configured (owner/repo in
+#                      fallback mode)
 #   VENDOR_REF       - Git ref to fetch files at
 #   VENDOR_MANIFEST  - Path to write the file manifest to
 #   VENDOR_INSTALL_DIR - Target directory for vendor files (optional)
-#   GH_TOKEN         - Auth token (optional, required for private repos)
-#   VENDOR_PAT       - Auth token for private repos (optional, overrides GH_TOKEN)
+#   CICD_READ_TOKEN  - Token that reads private repos (optional; first choice)
+#   CICD_WRITE_TOKEN - Token that may also write (optional; second choice)
+#   VENDOR_PAT       - Deprecated old name (optional; third choice)
+#   GH_TOKEN         - Auth token (optional; used when none of the above is set)
 set -euo pipefail
 
 # ── Internal helpers ─────────────────────────────────────────────────────
 
 _vendor_auth_header() {
-    local token="${VENDOR_PAT:-${GH_TOKEN:-}}"
+    local token="${CICD_READ_TOKEN:-${CICD_WRITE_TOKEN:-${VENDOR_PAT:-${GH_TOKEN:-}}}}"
     if [ -n "$token" ]; then
         echo "Authorization: token $token"
     fi
+}
+
+_vendor_checkout_mode() {
+    # True when the framework gave a vendor checkout to copy from.
+    [ -n "${VENDOR_CHECKOUT:-}" ] && [ -d "$VENDOR_CHECKOUT" ]
+}
+
+_vendor_copy() {
+    # Copy a single file from the vendor checkout: content only, so the
+    # mode is what a download gives, not the checkout's.
+    # Args: <repo_path> <dest_path>
+    local src="$VENDOR_CHECKOUT/$1"
+    local dest="$2"
+    if [ -L "$src" ] || [ ! -f "$src" ]; then
+        echo "Error: $1 not found in the vendor checkout" >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$dest")"
+    cat "$src" > "$dest"
+}
+
+_vendor_list_dir() {
+    # Print a directory's entries (dotfiles too), NUL-separated, with bash
+    # globbing only (no find or ls needed).
+    local restore entry
+    restore="$(shopt -p nullglob dotglob || true)"
+    shopt -s nullglob dotglob
+    for entry in "$1"/*; do
+        printf '%s\0' "$entry"
+    done
+    eval "$restore"
+}
+
+_vendor_is_empty_dir() {
+    local restore
+    restore="$(shopt -p nullglob dotglob || true)"
+    shopt -s nullglob dotglob
+    local entries=("$1"/*)
+    eval "$restore"
+    [ "${#entries[@]}" -eq 0 ]
 }
 
 _vendor_download() {
@@ -32,6 +87,13 @@ _vendor_download() {
     # Args: <repo_path> <dest_path>
     local repo_path="$1"
     local dest="$2"
+
+    if _vendor_checkout_mode; then
+        _vendor_copy "$repo_path" "$dest"
+        return
+    fi
+
+    # Fallback mode (no checkout given): GitHub API, then raw.githubusercontent.com
     local repo="${VENDOR_REPO:?VENDOR_REPO not set}"
     local ref="${VENDOR_REF:?VENDOR_REF not set}"
     local auth_header
@@ -89,7 +151,8 @@ fetch_file() {
     local local_path="$2"
     local make_exec="${3:-}"
 
-    _vendor_download "$repo_path" "$local_path"
+    # Explicit: set -e does not apply when the caller tests the result.
+    _vendor_download "$repo_path" "$local_path" || return
 
     if [ "$make_exec" = "+x" ]; then
         chmod +x "$local_path"
@@ -111,9 +174,38 @@ fetch_dir() {
     #   - Creates the local directory tree
     #   - Appends each downloaded file to $VENDOR_MANIFEST
     #
-    # Requires: gh CLI (uses GitHub API to list directory contents)
+    # Checkout mode walks $VENDOR_CHECKOUT/<repo_path>: regular files are
+    # fetched, directories recursed into; .git, symlinks and submodules are
+    # skipped (the API mode handles only files and directories).
+    # Fallback mode requires the gh CLI (GitHub API lists the directory).
     local repo_path="$1"
     local local_path="$2"
+
+    if _vendor_checkout_mode; then
+        local src="$VENDOR_CHECKOUT/$repo_path"
+        if [ -L "$src" ] || [ ! -d "$src" ]; then
+            echo "Error: failed to list directory $repo_path from ${VENDOR_REPO:-the vendor checkout}" >&2
+            return 1
+        fi
+        mkdir -p "$local_path"
+        local entry name
+        while IFS= read -r -d '' entry; do
+            name="${entry##*/}"
+            [ "$name" = ".git" ] && continue
+            [ -L "$entry" ] && continue
+            if [ -d "$entry" ]; then
+                # A submodule is a gitlink: initialized it holds .git,
+                # uninitialized it is empty (git tracks no empty directory).
+                [ -e "$entry/.git" ] && continue
+                _vendor_is_empty_dir "$entry" && continue
+                fetch_dir "${repo_path%/}/$name" "$local_path/$name" || return 1
+            elif [ -f "$entry" ]; then
+                fetch_file "${repo_path%/}/$name" "$local_path/$name" || return 1
+            fi
+        done < <(_vendor_list_dir "$src")
+        return 0
+    fi
+
     local repo="${VENDOR_REPO:?VENDOR_REPO not set}"
     local ref="${VENDOR_REF:?VENDOR_REF not set}"
 

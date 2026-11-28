@@ -24,9 +24,13 @@ When git-semver's config (.vendored/configs/git-semver.json) sets
 (checked by `git-semver check-bump`) and a merge or manual run instead tags
 the landed commit: for each component whose version has no tag yet, an
 annotated tag at the landed commit, pushed by name, and one GitHub release
-per new tag. It never bumps, commits, pushes to the branch, consults the
-commit-subject rules or creates/moves `latest`, and refuses (non-zero) a
-version that the merge set but that is already tagged at another commit.
+per new tag. It never bumps, commits, pushes to the branch or consults the
+commit-subject rules, and refuses (non-zero) a version that the merge set
+but that is already tagged at another commit.
+
+No path creates, moves or pushes a `latest` tag, and tags are never
+force-pushed: each new version tag is pushed by name. A `latest` tag left
+in a repository by an older git-semver is left alone and never released.
 
 The same script serves a git-cicd job and the version-bump.yml workflow:
 git-cicd's CICD_* variables win over the GitHub Actions ones whenever they

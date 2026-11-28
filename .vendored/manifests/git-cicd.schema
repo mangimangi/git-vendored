@@ -3,7 +3,45 @@
     "jobs": {
       "type": "object",
       "required": true,
-      "description": "Job name (letters, digits, - and _) -> job. A job declares: name (optional display name, a non-empty single line of printable characters, shown exactly as written; write it in title case, e.g. Unit Tests; default: the job name in title case, - and _ as spaces, e.g. unit-tests shows as Unit Tests; rows show as <name> / <repo>:<job>), on (array of open, merge, cron; none means manual-only), branches (required, non-empty array of patterns; literal names for cron jobs), paths (array of patterns), setup (one executable repository file), steps (required, ordered, non-empty; each a file or [file, fixed args...], run without a shell), cron (five-field expression, required exactly when on contains cron), manual (boolean, default true), blocking (boolean, default true), inputs (object: input name, lowercase letters, digits and _ starting with a letter -> declaration with description, required (boolean, default false), default (string, not with required) and choices (non-empty array of distinct strings); every value is a string, reaching scripts as CICD_INPUT_<NAME upper-cased>; a manual run gives values as a JSON object in the Manual workflow's inputs field). Unknown fields are refused; enforced by git-cicd validate."
+      "description": "Job name (letters, digits, - and _) -> job. A job declares: name (optional display name, a non-empty single line of printable characters, shown exactly as written; write it in title case, e.g. Unit Tests; default: the job name in title case, - and _ as spaces, e.g. unit-tests shows as Unit Tests; rows show as <name> / <repo>:<job>), on (array of open, merge, cron; none means manual-only), branches (required, non-empty array of patterns; literal names for cron jobs), paths (array of patterns), setup (one executable repository file), steps (required, ordered, non-empty; each a file or [file, fixed args...], run without a shell), cron (five-field expression, required exactly when on contains cron), manual (boolean, default true), blocking (boolean, default true), inputs (object: input name, lowercase letters, digits and _ starting with a letter -> declaration with description, required (boolean, default false), default (string, not with required) and choices (non-empty array of distinct strings); every value is a string, reaching scripts as CICD_INPUT_<NAME upper-cased>; the inputs of the jobs that allow manual runs are named fields of the generated Manual workflow's form, one field per input name shared by every such job declaring it (their choices and defaults must be the same; an absent default and \"\" are the same), job is reserved for the form's job dropdown, and the form holds at most 25 fields including job (24 distinct input names); descriptions, defaults and choices of manual jobs cannot contain ${{; changing them means running generate and committing; a manual run gives the chosen job the values of the fields it declares, ignores (and reports) the others, and refuses a required input left empty or a value outside its choices)., secrets (array of distinct secret names from CICD_WRITE_TOKEN, CICD_READ_TOKEN and VENDOR_PAT, the last deprecated; a script's environment holds a documented secret if and only if its job declares it and it is set non-empty, on every trigger and in a local check; a declared secret that is not set reaches the script unset and the report names it)., permissions (object, scope -> level, in GitHub's syntax, e.g. {\"packages\": \"write\"}: the permissions of the workflow's own token beyond the trigger's default, scopes contents, pull-requests, issues, packages, levels read and write; no write on a job with open in on, since open runs a pull request's own code; the job runs with its trigger's default merged with the declaration, the higher level winning, and no other job gains anything from it; changing it means running generate and committing). Unknown fields are refused; enforced by git-cicd validate.",
+      "properties": {
+        "secrets": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "enum": [
+              "CICD_WRITE_TOKEN",
+              "CICD_READ_TOKEN",
+              "VENDOR_PAT"
+            ]
+          },
+          "unique": true,
+          "default": [],
+          "description": "The secrets the job's scripts receive as environment variables, by name (default: none). CICD_WRITE_TOKEN pushes branches, opens pull requests and writes workflow files; CICD_READ_TOKEN reads private repositories and cannot write; VENDOR_PAT is deprecated (the old name of CICD_WRITE_TOKEN, still declarable so a repository can upgrade before renaming its secret). Nothing is passed undeclared, on any trigger; GITHUB_TOKEN reaches every job."
+        },
+        "permissions": {
+          "type": "object",
+          "required": false,
+          "keys": {
+            "enum": [
+              "contents",
+              "pull-requests",
+              "issues",
+              "packages"
+            ]
+          },
+          "values": {
+            "type": "string",
+            "enum": [
+              "read",
+              "write"
+            ]
+          },
+          "default": {},
+          "description": "Permissions of the workflow's own token (GITHUB_TOKEN) the job needs beyond its trigger's default (open: contents read; merge, cron, manual: contents write and pull-requests write), e.g. {\"packages\": \"write\"} for a release that publishes packages. The job gets its trigger's default merged with this, the higher level winning, in a generated run job of its own per distinct permission set; a sibling job gains nothing. A write level is refused on a job whose on contains open: open runs a pull request's own code, and a job that must write there declares the CICD_WRITE_TOKEN secret instead."
+        }
+      }
     },
     "needs_nothing": {
       "type": "array",

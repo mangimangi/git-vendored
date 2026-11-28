@@ -8,14 +8,21 @@ Subcommands:
     bump-all --since <commit> [opts] Check all components, bump all triggered
     tag [--push] [--subdir <name>]   Create version tags from VERSION files
     released [<ref>]                 Print the version tags at a commit (read-only)
-    check-bump [--base <rev>] [--head <rev>]
+    label <version> defect --reason "..." [--fixed-in <version>]
+                                     Label a released version in git-deps.labels.json
+    unlabel <version> <name>         Withdraw a label
+    labels [<version>] [--json]      List labels
+    check-bump [--base <rev>] [--head <rev>] [--fix|--no-fix]
                                      Fail when a change touches configured files
-                                     without raising the version (read-only)
+                                     without raising the version; in fixing mode
+                                     also commit the missing patch bump and
+                                     push it with CICD_WRITE_TOKEN
 
 Config: .vendored/configs/git-semver.json (see README for schema)
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -31,6 +38,7 @@ DEFAULT_VERSION_FILE = "VERSION"
 # Keys reserved for root-level config (not subdirectory names)
 RESERVED_KEYS = frozenset({
     "version_file", "files", "updates", "changelog", "install", "bump_on",
+    "push_bump",
 })
 
 
@@ -235,14 +243,18 @@ def check_files_changed(changed_files, patterns):
 
 # ── Git helpers ─────────────────────────────────────────────────────────────
 
-def git(*args, check=True, capture=True):
-    """Run a git command and return stdout."""
+def git(*args, check=True, capture=True, env=None):
+    """Run a git command and return stdout.
+
+    `env`, when given, is the whole environment of the command.
+    """
     cmd = ["git"] + list(args)
     result = subprocess.run(
         cmd,
         capture_output=capture,
         text=True,
         check=False,
+        env=env,
     )
     if check and result.returncode != 0:
         stderr = result.stderr.strip() if capture else ""
@@ -457,6 +469,159 @@ def bump_component(config, subdir=None, bump_type="patch", description=None):
     return subdir, current, new_version, tag
 
 
+# ── Labels ──────────────────────────────────────────────────────────────────
+#
+# git-deps.labels.json, at the repository root, says what the publisher
+# knows about released versions (README "Labels (git-deps.labels.json)").
+# Reading is strict about structure and tolerant about content: an unknown
+# label name, label field or top-level key is kept and written back as read.
+
+LABELS_FILE = "git-deps.labels.json"
+LABELS_FORMAT = 1
+# Label fields in the order they are written; unknown fields follow them.
+LABEL_FIELDS = ("name", "reason", "date", "commit", "fixed_in")
+COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+LABEL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def empty_labels():
+    """The content of a labels file with no labels."""
+    return {"format": LABELS_FORMAT, "versions": {}}
+
+
+def split_version_tag(tag):
+    """Split a version tag into (component, (major, minor, patch)).
+
+    The component is None for the root (`vX.Y.Z`) and the subdirectory for
+    `<subdir>/vX.Y.Z`. Raises SemverError for anything else.
+    """
+    if not isinstance(tag, str) or not VERSION_TAG_RE.fullmatch(tag):
+        raise SemverError(f"not a version tag: {tag!r}")
+    component, _, version = tag.rpartition("/")
+    return component or None, parse_version(version[1:])
+
+
+def version_tag_sort_key(tag):
+    """Root first, then subdirectories by name; versions by precedence."""
+    component, version = split_version_tag(tag)
+    return (component is not None, component or "", version)
+
+
+def _check_label(label, where):
+    """Raise SemverError unless `label` is a structurally valid label."""
+    if not isinstance(label, dict):
+        raise SemverError(f"{where}: a label must be an object")
+    name = label.get("name")
+    if not isinstance(name, str) or not name:
+        raise SemverError(f"{where}: 'name' must be a non-empty string")
+    commit = label.get("commit")
+    if not isinstance(commit, str) or not COMMIT_SHA_RE.match(commit):
+        raise SemverError(f"{where}: 'commit' must be a 40-hex commit sha")
+    date = label.get("date")
+    valid_date = isinstance(date, str) and LABEL_DATE_RE.match(date)
+    if valid_date:
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            valid_date = False
+    if not valid_date:
+        raise SemverError(f"{where}: 'date' must be a YYYY-MM-DD date")
+    if "reason" in label:
+        reason = label["reason"]
+        if not isinstance(reason, str) or "\n" in reason or "\r" in reason:
+            raise SemverError(f"{where}: 'reason' must be a one-line string")
+    if "fixed_in" in label:
+        fixed_in = label["fixed_in"]
+        if not isinstance(fixed_in, str) or _try_parse_version(fixed_in) is None:
+            raise SemverError(f"{where}: 'fixed_in' must be an X.Y.Z version")
+
+
+def parse_labels(text, source=LABELS_FILE):
+    """Parse and check the text of a labels file; returns its content.
+
+    Raises SemverError naming what is wrong, and where, when the structure
+    is not format 1. Unknown label names, label fields and top-level keys
+    are kept.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SemverError(f"{source}: invalid JSON: {e}")
+    if not isinstance(data, dict):
+        raise SemverError(f"{source}: the top level must be an object")
+    if "format" not in data:
+        raise SemverError(f"{source}: 'format' is missing")
+    fmt = data["format"]
+    if not isinstance(fmt, int) or isinstance(fmt, bool):
+        raise SemverError(f"{source}: 'format' must be an integer")
+    if fmt != LABELS_FORMAT:
+        raise SemverError(
+            f"{source}: format {fmt} is not supported (this git-semver reads "
+            f"format {LABELS_FORMAT})"
+        )
+    if "versions" not in data:
+        raise SemverError(f"{source}: 'versions' is missing")
+    versions = data["versions"]
+    if not isinstance(versions, dict):
+        raise SemverError(f"{source}: 'versions' must be an object")
+    for tag, labels in versions.items():
+        if not VERSION_TAG_RE.fullmatch(tag):
+            raise SemverError(
+                f"{source}: versions[{tag!r}]: not a version tag "
+                "(vX.Y.Z or <subdir>/vX.Y.Z)"
+            )
+        if not isinstance(labels, list):
+            raise SemverError(f"{source}: versions[{tag!r}]: must be a list of labels")
+        for i, label in enumerate(labels):
+            _check_label(label, f"{source}: versions[{tag!r}][{i}]")
+    return data
+
+
+def load_labels(path=LABELS_FILE):
+    """Read a labels file; a missing file reads as empty."""
+    p = Path(path)
+    if not p.exists():
+        return empty_labels()
+    return parse_labels(p.read_text(encoding="utf-8"), source=str(path))
+
+
+def _canonical_label(label):
+    """`label` with its known fields first, in LABEL_FIELDS order."""
+    out = {k: label[k] for k in LABEL_FIELDS if k in label}
+    out.update((k, v) for k, v in label.items() if k not in out)
+    return out
+
+
+def canonical_labels(data):
+    """`data` in the order it is written.
+
+    Top level: format, versions, then unknown keys as read. Versions by
+    component (root first), then version precedence. Labels by name (a
+    stable sort), fields in LABEL_FIELDS order, then unknown fields as read.
+    """
+    versions = data["versions"]
+    out = {
+        "format": data["format"],
+        "versions": {
+            tag: [_canonical_label(label)
+                  for label in sorted(versions[tag], key=lambda lb: lb["name"])]
+            for tag in sorted(versions, key=version_tag_sort_key)
+        },
+    }
+    out.update((k, v) for k, v in data.items() if k not in out)
+    return out
+
+
+def dump_labels(data):
+    """The text of a labels file holding `data`, in canonical form."""
+    return json.dumps(canonical_labels(data), indent=2, ensure_ascii=False) + "\n"
+
+
+def save_labels(path, data):
+    """Write `data` to the labels file at `path` in canonical form."""
+    Path(path).write_text(dump_labels(data), encoding="utf-8")
+
+
 # ── Subcommands ─────────────────────────────────────────────────────────────
 
 def cmd_version(args):
@@ -521,17 +686,23 @@ def _try_parse_version(version_str):
 
 
 def check_bump_component(changed, base, head, effective, subdir=None):
-    """Check one component for cmd_check_bump. Returns (ok, lines)."""
+    """Check one component for cmd_check_bump.
+
+    Returns (ok, lines, fixable). `fixable` is True only when the component
+    failed because its version is unchanged from the base's, the one case
+    fixing mode raises by a patch; a version that went down, is malformed or
+    is missing is an error, never fixed.
+    """
     label = subdir or "root"
     patterns = effective.get("files")
     if not patterns:
-        return True, [f"{label}: skipped (no 'files' configured)"]
+        return True, [f"{label}: skipped (no 'files' configured)"], False
 
     version_file = get_version_file(effective)
     matches = check_files_changed(changed, patterns)
     version_file_changed = version_file in changed
     if not matches and not version_file_changed:
-        return True, [f"{label}: no configured file changed"]
+        return True, [f"{label}: no configured file changed"], False
 
     base_version = read_version_at(base, version_file)
     head_version = read_version_at(head, version_file)
@@ -541,40 +712,241 @@ def check_bump_component(changed, base, head, effective, subdir=None):
     if head_tuple is not None and (base_tuple is None or head_tuple > base_tuple):
         shown_base = base_version if base_tuple is not None else "none"
         return True, [f"{label}: version raised {shown_base} -> {head_version} "
-                      f"({version_file})"]
+                      f"({version_file})"], False
 
     if matches:
         files = ", ".join(f for f, _ in matches)
         why = f"configured files changed ({files})"
     else:
         why = f"{version_file} changed"
+    fixable = False
     if head_version is None:
         found = f"{version_file} is missing"
     elif head_tuple is None:
         found = f"{version_file} holds {head_version!r}, not a valid X.Y.Z version"
     elif head_tuple == base_tuple:
         found = f"{version_file} is still {head_version}"
+        fixable = True
     else:
         found = f"{version_file} went down to {head_version}"
-    fix = "git-semver bump patch --no-push"
-    if subdir:
-        fix += f" --subdir {subdir}"
     return False, [
         f"{label}: FAIL: {why}, but the version was not raised: {found} "
         f"(base {base} has {base_version if base_version is not None else 'no version'})",
-        f"  fix: run `{fix}` on the branch and push the commit "
+        f"  fix: run `{bump_fix_command(subdir)}` on the branch and push the commit "
         "(minor or major instead of patch are accepted too)",
-    ]
+    ], fixable
+
+
+def bump_fix_command(subdir=None):
+    """The command a person runs to make the bump check-bump asks for."""
+    fix = "git-semver bump patch --no-push"
+    if subdir:
+        fix += f" --subdir {subdir}"
+    return fix
+
+
+def resolve_fix_mode(args, config):
+    """Whether check-bump runs in fixing mode.
+
+    --fix / --no-fix win. Otherwise the `push_bump` key decides, and it only
+    applies with `"bump_on": "pull_request"`, where it defaults to true.
+    """
+    forced = getattr(args, "fix", None)
+    if forced is not None:
+        return bool(forced)
+    if config.get("bump_on") != "pull_request":
+        return False
+    return bool(config.get("push_bump", True))
+
+
+def bump_written_paths(config, subdir=None):
+    """The files bump_component writes for a component, as it will write them.
+
+    The version file always; each `updates` target that exists; the changelog
+    file when the changelog is enabled and the file exists.
+    """
+    effective = get_subdir_config(config, subdir) if subdir else config
+    paths = [get_version_file(effective)]
+    paths += [f for f in effective.get("updates", {}) if Path(f).exists()]
+    cl_enabled, cl_file, _ = parse_changelog_config(config, subdir)
+    if cl_enabled and Path(cl_file).exists():
+        paths.append(cl_file)
+    return paths
+
+
+def commit_identity_args():
+    """`-c` options naming a committer when git has none configured (CI)."""
+    if git("config", "user.email", check=False).stdout.strip():
+        return []
+    return ["-c", "user.name=git-semver",
+            "-c", "user.email=git-semver@users.noreply.github.com"]
+
+
+def fix_missing_bumps(config, base, head, fixable):
+    """Raise each fixable component by a patch and make one commit.
+
+    The commit is made on top of `head`, which must be the checked-out HEAD,
+    and holds only the files the bumps wrote. Returns (raised, sha) with
+    raised a list of (label, old, new).
+    """
+    head_sha = git("rev-parse", f"{head}^{{commit}}").stdout.strip()
+    checked_out = git("rev-parse", "HEAD").stdout.strip()
+    if head_sha != checked_out:
+        raise SemverError(
+            f"fixing mode needs the commit under test checked out: head is "
+            f"{head_sha}, HEAD is {checked_out} (check out the head, or pass "
+            "--no-fix)"
+        )
+
+    raised = []
+    paths = []
+    for subdir in fixable:
+        effective = get_subdir_config(config, subdir) if subdir else config
+        base_tuple = parse_version(read_version_at(base, get_version_file(effective)))
+        for path in bump_written_paths(config, subdir):
+            if path not in paths:
+                paths.append(path)
+        _, old, new, _ = bump_component(config, subdir=subdir, bump_type="patch")
+        assert parse_version(new) > base_tuple, (new, base_tuple)
+        raised.append((subdir or "root", old, new))
+
+    summary = ", ".join(f"{label} {old} -> {new}" for label, old, new in raised)
+    message = f"chore: bump version ({summary})"
+    git("add", "--", *paths)
+    git(*commit_identity_args(), "commit", "-m", message)
+    sha = git("rev-parse", "HEAD").stdout.strip()
+    print(f"Committed {sha}: {message}")
+    return raised, sha
+
+
+# ── Pushing the fix ─────────────────────────────────────────────────────────
+
+PUSH_REMOTE = "origin"
+TOKEN_HEADER_KEY = "http.https://github.com/.extraheader"
+
+
+def token_header(token):
+    """The extraheader value actions/checkout writes for a token."""
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return f"AUTHORIZATION: basic {basic}"
+
+
+def token_git_env(token):
+    """An environment that gives git `token` for github.com and nothing else.
+
+    The token travels as config in GIT_CONFIG_* variables, never on the
+    command line or in .git/config. The first, empty entry resets the
+    extraheader actions/checkout persisted (with GITHUB_TOKEN, whose pushes
+    start no workflow), the second adds the token's.
+    """
+    env = dict(os.environ)
+    env.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": TOKEN_HEADER_KEY,
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": TOKEN_HEADER_KEY,
+        "GIT_CONFIG_VALUE_1": token_header(token),
+    })
+    return env
+
+
+def redact(text, token):
+    """`text` with the token, its basic-auth form and its header removed."""
+    basic = token_header(token).split(" ", 2)[2]
+    for secret in (basic, token):
+        text = text.replace(secret, "***")
+    return text
+
+
+def is_release_branch(branch, target):
+    """The branches that are released from: the target, main and master."""
+    return branch in {target, "main", "master"}
+
+
+def push_refusal(token, source, target, head_sha, env):
+    """Why the fix commit may not be pushed to `source`, or None."""
+    if not token:
+        return "no CICD_WRITE_TOKEN: declare it on the version check job"
+    if not source:
+        return ("source branch unknown: pass --source-branch or set "
+                "CICD_SOURCE_BRANCH")
+    if source == target:
+        return f"source branch {source} is the target branch"
+    if is_release_branch(source, target):
+        return f"source branch {source} is a release branch"
+    result = git("ls-remote", "--heads", PUSH_REMOTE, f"refs/heads/{source}",
+                 check=False, env=env)
+    if result.returncode != 0:
+        return (f"cannot read {PUSH_REMOTE}: "
+                f"{redact(result.stderr.strip(), token)}")
+    remote_sha = result.stdout.split("\t", 1)[0].strip()
+    if not remote_sha:
+        return (f"branch {source} is not on {PUSH_REMOTE} (a fork's branch "
+                "is not pushed to)")
+    if remote_sha != head_sha:
+        return f"branch {source} moved on from {head_sha} (now {remote_sha})"
+    return None
+
+
+def push_fix(raised, sha, head_sha, args):
+    """Push the fix commit to the pull request's source branch, if allowed.
+
+    Prints what happened; the token never appears in the output. Returns
+    True when pushed.
+    """
+    token = os.environ.get("CICD_WRITE_TOKEN", "")
+    source = (getattr(args, "source_branch", None)
+              or os.environ.get("CICD_SOURCE_BRANCH", ""))
+    target = (getattr(args, "target_branch", None)
+              or os.environ.get("CICD_TARGET_BRANCH", ""))
+    env = token_git_env(token) if token else None
+
+    reason = push_refusal(token, source, target, head_sha, env)
+    if reason is None:
+        result = git("push", PUSH_REMOTE, f"HEAD:refs/heads/{source}",
+                     check=False, env=env)
+        if result.returncode == 0:
+            print(f"Pushed {sha} to {source}")
+            print(f"The pushed commit {sha} starts its own run; wait for "
+                  "that one")
+            return True
+        output = (result.stderr.strip() or result.stdout.strip())
+        reason = f"git push failed: {redact(output, token)}"
+
+    print(f"Not pushing the bump: {reason}")
+    for label, _, _ in raised:
+        command = bump_fix_command(None if label == "root" else label)
+        print(f"  fix: run `{command}` on the branch and push the commit")
+    return False
 
 
 def cmd_check_bump(args):
     """Fail when the change under test touches configured files without
-    raising the version.
+    raising the version; in fixing mode, also make the missing bump.
 
     Compares `head` with `base` (--base/--head, else CICD_BASE/CICD_HEAD;
     head defaults to HEAD) for the root and every subdirectory component.
-    Read-only and local: needs no token or network and writes nothing.
-    Returns 0 when every component passes, 1 otherwise.
+    The check itself is local and needs no token or network.
+
+    Fixing mode (--fix/--no-fix, else `push_bump`, default on with
+    `"bump_on": "pull_request"`): when every failing component failed only
+    because its version equals the base's, each is raised by a patch the
+    way `bump` does it and one commit is made on top of the checked-out
+    head. A component already raised by any amount is left alone. A version
+    that went down, is malformed or is missing is an error and no commit is
+    made at all.
+
+    The fix commit is then pushed to the pull request's source branch
+    (--source-branch/--target-branch, else CICD_SOURCE_BRANCH/
+    CICD_TARGET_BRANCH) with CICD_WRITE_TOKEN, never forced. It is not
+    pushed, with a reason and the command to run, when there is no token,
+    no source branch, or the source branch is the target or a release
+    branch, is not on origin (a fork) or moved on from the head.
+
+    Returns 0 when every component passes, 1 otherwise (including when a
+    fix commit was made or pushed: the commit under test still lacked the
+    bump, and the pushed commit's own run is the one that can pass).
     """
     config = load_config(args.config)
     base = getattr(args, "base", None) or os.environ.get("CICD_BASE", "")
@@ -589,12 +961,44 @@ def cmd_check_bump(args):
     changed = get_changed_files_between(base, head)
     components = [(None, config)] + list(get_subdirectories(config).items())
     ok = True
+    fixable = []
+    unfixable = []
     for subdir, effective in components:
-        passed, lines = check_bump_component(changed, base, head, effective, subdir)
+        passed, lines, can_fix = check_bump_component(
+            changed, base, head, effective, subdir)
         ok = ok and passed
+        if not passed:
+            (fixable if can_fix else unfixable).append(subdir)
         for line in lines:
             print(line)
-    return 0 if ok else 1
+    if ok:
+        return 0
+    if not resolve_fix_mode(args, config):
+        return 1
+    if unfixable:
+        names = ", ".join(s or "root" for s in unfixable)
+        print(f"Not fixing: the version of {names} went down, is malformed "
+              "or is missing; fix it by hand")
+        return 1
+
+    head_sha = git("rev-parse", f"{head}^{{commit}}").stdout.strip()
+    raised, sha = fix_missing_bumps(config, base, head, fixable)
+    for label, old, new in raised:
+        print(f"Raised {label}: {old} -> {new}")
+    print(f"Made commit {sha} with the missing bump; the commit under test "
+          "still lacked it")
+    push_fix(raised, sha, head_sha, args)
+    return 1
+
+
+def push_tags(tags):
+    """Push each of `tags` to origin by name, never forced.
+
+    Not `git push --tags`: that would also push any other local tag, such
+    as a stale `latest`, and fail on "would clobber existing tag".
+    """
+    for tag in tags:
+        git("push", PUSH_REMOTE, tag, check=True)
 
 
 def cmd_bump(args):
@@ -622,12 +1026,11 @@ def cmd_bump(args):
 
     # Tag
     git("tag", "-a", tag, "-m", tag)
-    git("tag", "-f", "latest")
-    print(f"Tagged: {tag} + latest")
+    print(f"Tagged: {tag}")
 
-    # Push
+    # Push the commit, then the new tag by name (never forced, never --tags)
     git("push", check=True)
-    git("push", "--tags", "--force", check=True)
+    push_tags([tag])
     print(f"\nVersion bumped to {new_version} and pushed")
 
 
@@ -697,12 +1100,11 @@ def cmd_bump_all(args):
     # Create tags
     for _, _, _, tag in bumps:
         git("tag", "-a", tag, "-m", tag)
-    git("tag", "-f", "latest")
-    print(f"Tagged: {tags_str} + latest")
+    print(f"Tagged: {tags_str}")
 
-    # Push
+    # Push the commit, then the new tags by name (never forced, never --tags)
     git("push", check=True)
-    git("push", "--tags", "--force", check=True)
+    push_tags(tags)
     print(f"\nBumped {len(bumps)} component(s) and pushed")
 
 
@@ -756,18 +1158,15 @@ def cmd_tag(args):
         print(f"Tagged {label}: {tag_name}")
         tags_created.append(tag_name)
 
-    # Always update latest tag
-    git("tag", "-f", "latest")
-
     if not tags_created:
         print("No tags created")
         return
 
     tags_str = ", ".join(tags_created)
-    print(f"Created tags: {tags_str} + latest")
+    print(f"Created tags: {tags_str}")
 
     if getattr(args, "push", False):
-        git("push", "--tags", "--force", check=True)
+        push_tags(tags_created)
         print("Tags pushed")
 
 
@@ -788,6 +1187,164 @@ def cmd_released(args):
     tags = sorted(t for t in result.stdout.split("\n") if VERSION_TAG_RE.match(t))
     for tag in tags:
         print(tag)
+
+
+# The one label git-semver makes; others in the file are kept, not made.
+DEFECT_LABEL = "defect"
+
+
+def labels_path():
+    """git-deps.labels.json at the root of the working tree."""
+    top = git("rev-parse", "--show-toplevel").stdout.strip()
+    return Path(top) / LABELS_FILE
+
+
+def version_arg(version):
+    """'X.Y.Z' or 'vX.Y.Z' as (version string, tuple)."""
+    plain = version[1:] if version.startswith("v") else version
+    parsed = parse_version(plain)
+    return format_version(*parsed), parsed
+
+
+def tag_commit(tag):
+    """The commit tag `tag` points at, or None when there is no such tag."""
+    result = git("rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}",
+                 check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _commit_hint(path):
+    print(f"Commit {path.name} and bring it to the default branch with a pull "
+          "request; nothing was committed, tagged or pushed")
+
+
+def cmd_label(args):
+    """Label a released version in git-deps.labels.json (working tree only).
+
+    The version must have a tag; the label records the commit it points at.
+    Only `defect` is made, and it needs a one-line --reason. --fixed-in must
+    be a tagged, higher version of the same component. Labelling again
+    updates the reason (and fixed_in when given) and keeps date and commit.
+    Never commits, tags, pushes or needs a token or the network.
+    """
+    subdir = getattr(args, "subdir", None)
+    if args.name != DEFECT_LABEL:
+        raise SemverError(
+            f"git-semver makes only the {DEFECT_LABEL!r} label, not {args.name!r} "
+            "(other labels in the file are kept and can be removed with unlabel)"
+        )
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise SemverError(f"a {DEFECT_LABEL} label needs --reason \"...\"")
+    if "\n" in reason or "\r" in reason:
+        raise SemverError("--reason must be one line")
+
+    version, parsed = version_arg(args.version)
+    tag = format_tag(version, subdir)
+    commit = tag_commit(tag)
+    if commit is None:
+        raise SemverError(f"no tag {tag}: only a released (tagged) version can be labelled")
+
+    fixed_in = None
+    if args.fixed_in:
+        fixed_in, fixed_parsed = version_arg(args.fixed_in)
+        fixed_tag = format_tag(fixed_in, subdir)
+        if tag_commit(fixed_tag) is None:
+            raise SemverError(f"--fixed-in {fixed_in}: no tag {fixed_tag}")
+        if fixed_parsed <= parsed:
+            raise SemverError(
+                f"--fixed-in {fixed_in} is not higher than the labelled {version}")
+
+    path = labels_path()
+    data = load_labels(path)
+    labels = data["versions"].setdefault(tag, [])
+    existing = next((lb for lb in labels if lb["name"] == args.name), None)
+    if existing is None:
+        label = {
+            "name": args.name,
+            "reason": reason,
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "commit": commit,
+        }
+        if fixed_in:
+            label["fixed_in"] = fixed_in
+        labels.append(label)
+        action = f"Labelled {tag} {args.name}"
+    else:
+        existing["reason"] = reason
+        if fixed_in:
+            existing["fixed_in"] = fixed_in
+        action = f"Updated {args.name} on {tag}"
+    save_labels(path, data)
+    print(f"{action} in {path.name}")
+    _commit_hint(path)
+
+
+def cmd_unlabel(args):
+    """Remove a label from a version in git-deps.labels.json.
+
+    Any name can be removed and the tag need not exist. A version left with
+    no labels is dropped; a file left with nothing else is deleted. When
+    there was no such label it says so and exits 0.
+    """
+    subdir = getattr(args, "subdir", None)
+    version, _ = version_arg(args.version)
+    tag = format_tag(version, subdir)
+    path = labels_path()
+    data = load_labels(path)
+    labels = data["versions"].get(tag, [])
+    index = next((i for i, lb in enumerate(labels) if lb["name"] == args.name), None)
+    if index is None:
+        print(f"No {args.name} label on {tag}")
+        return 0
+    del labels[index]
+    if not labels:
+        del data["versions"][tag]
+    if not data["versions"] and set(data) == {"format", "versions"}:
+        path.unlink()
+    else:
+        save_labels(path, data)
+    print(f"Removed {args.name} from {tag} in {path.name}")
+    _commit_hint(path)
+    return 0
+
+
+def format_label_line(tag, label):
+    """One readable line for a label."""
+    parts = [tag, label["name"], label["date"], label["commit"][:7]]
+    if "fixed_in" in label:
+        parts.append(f"fixed in {label['fixed_in']}")
+    line = "  ".join(parts)
+    if label.get("reason"):
+        line += f"  \u2014 {label['reason']}"
+    return line
+
+
+def cmd_labels(args):
+    """List the labels in git-deps.labels.json, all or one version's.
+
+    One readable line per label in the file's canonical order, or with
+    --json the (filtered) content in canonical form. --subdir alone lists
+    one component. Prints nothing when there are none.
+    """
+    subdir = getattr(args, "subdir", None)
+    data = canonical_labels(load_labels(labels_path()))
+    versions = data["versions"]
+    if getattr(args, "version", None):
+        version, _ = version_arg(args.version)
+        tag = format_tag(version, subdir)
+        versions = {t: v for t, v in versions.items() if t == tag}
+    elif subdir:
+        versions = {t: v for t, v in versions.items()
+                    if split_version_tag(t)[0] == subdir}
+    data["versions"] = versions
+    if getattr(args, "json", False):
+        print(dump_labels(data), end="")
+        return 0
+    for tag, labels in versions.items():
+        for label in labels:
+            print(format_label_line(tag, label))
+    return 0
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -858,6 +1415,34 @@ def build_parser():
         "ref", nargs="?", default="HEAD", help="Commit to ask about (default: HEAD)",
     )
 
+    # label / unlabel / labels
+    label_parser = subparsers.add_parser(
+        "label", help=f"Label a released version in {LABELS_FILE}",
+    )
+    label_parser.add_argument("version", help="Released version (X.Y.Z or vX.Y.Z)")
+    label_parser.add_argument("name", help=f"Label name (only {DEFECT_LABEL!r})")
+    label_parser.add_argument("--reason", default=None, help="Why, in one line (required)")
+    label_parser.add_argument(
+        "--fixed-in", default=None, help="Tagged, higher version that fixes it",
+    )
+    label_parser.add_argument("--subdir", default=None, help="Subdirectory name")
+
+    unlabel_parser = subparsers.add_parser(
+        "unlabel", help=f"Remove a label from a version in {LABELS_FILE}",
+    )
+    unlabel_parser.add_argument("version", help="Version (X.Y.Z or vX.Y.Z)")
+    unlabel_parser.add_argument("name", help="Label name")
+    unlabel_parser.add_argument("--subdir", default=None, help="Subdirectory name")
+
+    labels_parser = subparsers.add_parser(
+        "labels", help=f"List the labels in {LABELS_FILE}",
+    )
+    labels_parser.add_argument(
+        "version", nargs="?", default=None, help="Only this version (X.Y.Z or vX.Y.Z)",
+    )
+    labels_parser.add_argument("--subdir", default=None, help="Subdirectory name")
+    labels_parser.add_argument("--json", action="store_true", help="Print JSON")
+
     # check-bump
     check_bump_parser = subparsers.add_parser(
         "check-bump",
@@ -870,6 +1455,25 @@ def build_parser():
     check_bump_parser.add_argument(
         "--head", default=None,
         help="Commit under test (default: $CICD_HEAD, else HEAD)",
+    )
+    fix_group = check_bump_parser.add_mutually_exclusive_group()
+    fix_group.add_argument(
+        "--fix", dest="fix", action="store_true", default=None,
+        help="Raise a missing version by a patch and commit it (default: "
+             "push_bump, on with bump_on pull_request)",
+    )
+    fix_group.add_argument(
+        "--no-fix", dest="fix", action="store_false",
+        help="Check only: never commit a bump",
+    )
+    check_bump_parser.add_argument(
+        "--source-branch", default=None,
+        help="Pull request branch the fix is pushed to "
+             "(default: $CICD_SOURCE_BRANCH)",
+    )
+    check_bump_parser.add_argument(
+        "--target-branch", default=None,
+        help="Branch the pull request goes into (default: $CICD_TARGET_BRANCH)",
     )
 
     return parser
@@ -889,6 +1493,9 @@ def main():
         "bump-all": cmd_bump_all,
         "tag": cmd_tag,
         "released": cmd_released,
+        "label": cmd_label,
+        "unlabel": cmd_unlabel,
+        "labels": cmd_labels,
         "check-bump": cmd_check_bump,
     }
 
