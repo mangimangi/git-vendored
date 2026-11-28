@@ -17,7 +17,8 @@ git-vendored: automated vendor install control for repo-embedded tools via GitHu
   lib/               # shared Python modules
 install.sh           # bootstrap installer (repo root)
 tests/               # pytest suite
-ci/                  # git-cicd job scripts (setup.sh, test.sh, vendor-check.sh)
+ci/                  # git-cicd job scripts (setup.sh, test.sh, vendor-check.sh,
+                     #   update-vendored.sh, validate.sh)
 docs/                # guides and planning
 ```
 
@@ -32,6 +33,23 @@ python3 .vendored/check                       # run file protection checks
 python3 .vendored/audit                       # validate configs against schemas
 python3 .vendored/feedback                    # vendor support/bug-report info
 python3 .vendored/install --list              # list installed vendors
+python3 validate <owner/repo> --version latest # check a repo implements the vendor contract
+```
+
+Release, vendor update and vendor validation are git-cicd jobs too
+(`.vendored/configs/git-cicd.json`): `release` (runs on merge to `main`;
+`.vendored/pkg/git-semver/release` decides bump, publish or nothing),
+`update-vendored` (cron Mondays 09:00 UTC on `main`; `ci/update-vendored.sh`
+runs `.vendored/install <vendor> --version <version> --pr --deps=install`,
+`GH_TOKEN` from `VENDOR_PAT` when set) and `validate` (manual only;
+`ci/validate.sh` runs `validate <repo> --version <version>`). Start one by
+hand: Actions tab -> **Manual** workflow -> Run workflow, `job` = the job name,
+`inputs` = its inputs as a JSON object of strings:
+
+```
+release          {"bump_type": "minor"}          # patch|minor|major; subdirectory, changelog_description
+update-vendored  {"vendor": "git-cicd", "version": "latest"}   # defaults: all, latest; private: "true"|"false"
+validate         {"repo": "owner/repo"}          # version defaults to latest
 ```
 
 ## Tests
@@ -54,7 +72,8 @@ Or just the suite: `pip install pytest pyyaml && python3 -m pytest tests/ -v`.
 
 `install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts have
 bats tests under `tests/bats/` (`install.bats`, `vendor-helpers.bats`,
-`ci-setup.bats`, `ci-test.bats`, `ci-vendor-check.bats`). `ci/test.sh` runs
+`ci-setup.bats`, `ci-test.bats`, `ci-vendor-check.bats`,
+`ci-update-vendored.bats`, `ci-validate.bats`). `ci/test.sh` runs
 them after pytest, and a failing bats test fails the `test` job. They stub
 `curl`, `gh`, `uv`, the Python interpreters and `bats` on a temporary `PATH`
 and run in temp dirs: no network, nothing installed. `ci/setup.sh` provides
@@ -98,13 +117,14 @@ A change that lowers coverage below 99% adds its tests in the same pull
 request. A line is excluded with `# pragma: no cover` only when no test can
 reach it, with the reason in a comment on that line.
 After changing the git-cicd config, run `.vendored/pkg/git-cicd/git-cicd generate`
-and commit `.github/workflows/git-cicd-open.yml`.
+and commit every `.github/workflows/git-cicd-*.yml` it writes (open, merge,
+cron, manual); `git-cicd verify` checks they match.
 
 ## Contributing
 
 - Commits: `<type>: <description>` (e.g., `feat:`, `fix:`, `chore:`)
 - Keep every shipped Python script at >= 99% line coverage: a change that lowers it fails the `test` job, so add its tests in the same PR (`# pragma: no cover` only for lines no test can reach, reason on the line)
-- PRs run `tests/` and `.vendored/check` as git-cicd jobs (`Open / ... / git-vendored:<job>` rows, `Verdict / git-cicd:verdict` status)
+- PRs run `tests/` and `.vendored/check` as git-cicd jobs (`Open / ... / git-vendored:<job>` rows, `Verdict / git-cicd:verdict` status); `release`, `update-vendored` and `validate` are git-cicd jobs on merge, cron and manual runs
 - Vendor configs live in `.vendored/configs/<vendor>.json`, not the legacy `config.json`
 - All vendor-installed files go under `.vendored/pkg/<vendor>/`
 - Manifests at `.vendored/manifests/<vendor>.files` drive protection rules

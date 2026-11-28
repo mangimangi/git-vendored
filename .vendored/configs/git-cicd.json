@@ -25,6 +25,65 @@
       "branches": ["**"],
       "paths": ["**"],
       "steps": ["ci/vendor-check.sh"]
+    },
+    "release": {
+      "name": "Release",
+      "on": ["merge"],
+      "branches": ["main"],
+      "inputs": {
+        "bump_type": {
+          "description": "Version bump type",
+          "choices": ["patch", "minor", "major"],
+          "default": "patch"
+        },
+        "subdirectory": {
+          "description": "Subdirectory to bump (leave empty for root)",
+          "default": ""
+        },
+        "changelog_description": {
+          "description": "Changelog entry (what changed in this release)",
+          "default": ""
+        }
+      },
+      "steps": [".vendored/pkg/git-semver/release"]
+    },
+    "update-vendored": {
+      "name": "Update Vendored",
+      "on": ["cron"],
+      "cron": "0 9 * * 1",
+      "branches": ["main"],
+      "inputs": {
+        "vendor": {
+          "description": "Vendor to update, or all",
+          "default": "all"
+        },
+        "version": {
+          "description": "Version to install (default: latest)",
+          "default": "latest"
+        },
+        "private": {
+          "description": "Vendor repo is private (use VENDOR_PAT)",
+          "choices": ["false", "true"],
+          "default": "false"
+        }
+      },
+      "steps": ["ci/update-vendored.sh"]
+    },
+    "validate": {
+      "name": "Validate Vendor",
+      "on": [],
+      "branches": ["**"],
+      "inputs": {
+        "repo": {
+          "description": "GitHub repo to validate (owner/repo)",
+          "required": true
+        },
+        "version": {
+          "description": "Version to validate against (default: latest)",
+          "default": "latest"
+        }
+      },
+      "steps": ["ci/validate.sh"]
     }
   },
   "needs_nothing": [

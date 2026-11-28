@@ -322,10 +322,23 @@ This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_I
 
 ## Developing git-vendored
 
-git-vendored's own pull request checks run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
+git-vendored's own pull request checks, releases, vendor updates and vendor validations run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
 
 - `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names, plus `pytest` and `pyyaml`, plus `coverage` (with a startup hook so subprocess runs are measured), into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` under coverage with it and prints the line coverage of the six shipped Python scripts (`templates/install`, `templates/check`, `templates/remove`, `templates/audit`, `templates/feedback`, `validate`): `Stmts` executable lines, `Miss` lines no test ran, `Cover` the percentage, `Missing` their line numbers. Scripts a test starts as a subprocess are counted too. For one file: `python -m coverage report --include=templates/check` after a run. The job fails when the total or any one of those files is below 99% (`fail_under` in `pyproject.toml`, and a per-file check in `ci/test.sh`): a change that lowers coverage below 99% fails the verdict, so it adds its tests in the same pull request. A line is excluded (`# pragma: no cover`) only when no test can reach it, with the reason on the line. After pytest, `ci/test.sh` runs the bats tests in `tests/bats/` for `install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts (`ci/setup.sh` provides a pinned bats-core when none is on `PATH`); a failing bats test fails the job. Run them alone with `bats tests/bats/`.
 - `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
+- `release` (Release): runs on every merge to `main`, and by hand. Its step is `.vendored/pkg/git-semver/release` with no subcommand: git-semver decides whether to bump the version, publish (tag and GitHub release after a bump lands) or do nothing. Inputs: `bump_type` (`patch`, `minor` or `major`; default `patch`), `subdirectory` and `changelog_description` (both default empty).
+- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `VENDOR_PAT` secret when it is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
+- `validate` (Validate Vendor): by hand only. `ci/validate.sh` runs this repository's `validate <repo> --version <version>` to check whether a repository implements the vendor contract (nothing is installed). Inputs: `repo` (`owner/repo`, required) and `version` (default `latest`).
+
+To start a release, an update or a validation by hand: Actions tab → **Manual** workflow → **Run workflow**, pick the branch (`main` for `release` and `update-vendored`), set `job` to the job name (`release`, `update-vendored` or `validate`) and `inputs` to the job's inputs as a JSON object of strings, for example:
+
+| `job` | `inputs` |
+|---|---|
+| `release` | `{"bump_type": "minor"}` |
+| `update-vendored` | `{"vendor": "git-cicd", "version": "latest"}` (empty: every vendor, latest) |
+| `validate` | `{"repo": "owner/repo"}` |
+
+An input left out gets its default; an undeclared input, a value outside the choices or a missing `repo` refuses the run, with the reason in the report.
 
 Documents and tracker records (`*.md`, `docs/**`, `.pearls/issues.jsonl`, `.pearls/docs/**`, `.madreperla/sessions.jsonl`, ...) are in `needs_nothing`, so a change to them alone needs no job. No Python version is written in any workflow: `pyproject.toml` is the one place it is declared.
 
@@ -336,4 +349,4 @@ Run the checks locally the way CI runs them:
 .vendored/pkg/git-cicd/git-cicd check           # later runs reuse the virtualenv
 ```
 
-`.github/workflows/git-cicd-open.yml` is generated: after changing the config or upgrading git-cicd, run `.vendored/pkg/git-cicd/git-cicd generate` and commit what it writes (`git-cicd verify` checks it matches).
+The workflows `.github/workflows/git-cicd-open.yml`, `git-cicd-merge.yml`, `git-cicd-cron.yml` and `git-cicd-manual.yml` are generated: after changing the config or upgrading git-cicd, run `.vendored/pkg/git-cicd/git-cicd generate` and commit what it writes (`git-cicd verify` checks it matches).
