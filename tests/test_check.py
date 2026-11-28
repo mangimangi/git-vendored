@@ -18,7 +18,7 @@ ROOT = Path(__file__).parent.parent
 def _import_check():
     filepath = str(ROOT / "templates" / "check")
     loader = importlib.machinery.SourceFileLoader("vendored_check", filepath)
-    spec = importlib.util.spec_from_loader("vendored_check", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_check", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["vendored_check"] = module
     spec.loader.exec_module(module)

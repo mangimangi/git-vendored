@@ -5,7 +5,7 @@ load ci-helpers
 
 setup() {
     ci_setup
-    VENV="$XDG_CACHE_HOME/git-vendored-ci/venv-3.8"
+    VENV="$XDG_CACHE_HOME/git-vendored-ci/venv-3.11"
     export STUB_SITE="$BATS_TEST_TMPDIR/site"
     export STUB_COVERAGE_JSON="$BATS_TEST_TMPDIR/coverage.json"
     coverage_json "$STUB_COVERAGE_JSON" "templates/check=100:" "validate=99.5:12"
@@ -18,7 +18,7 @@ run_test_sh() { run env PATH="$BIN" "$@" bash "$ROOT/ci/test.sh"; }
 @test "with the setup venv: runs coverage, pytest, report, the per-file check and bats" {
     run_test_sh
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Python 3.8.99"* ]]
+    [[ "$output" == *"Python 3.11.99"* ]]
     [[ "$output" == *"PYTEST-OUTPUT"* ]]
     [[ "$output" == *"REPORT-OUTPUT"* ]]
     [[ "$output" != *"below"* ]]
@@ -95,7 +95,7 @@ run_test_sh() { run env PATH="$BIN" "$@" bash "$ROOT/ci/test.sh"; }
 }
 
 @test "the per-file threshold is fail_under from pyproject.toml" {
-    write_pyproject ">=3.8" 95
+    write_pyproject ">=3.11" 95
     coverage_json "$STUB_COVERAGE_JSON" "templates/check=96:1" "validate=94:2"
     run_test_sh
     [ "$status" -eq 1 ]
@@ -104,7 +104,7 @@ run_test_sh() { run env PATH="$BIN" "$@" bash "$ROOT/ci/test.sh"; }
 }
 
 @test "without fail_under the per-file threshold is 99" {
-    write_pyproject ">=3.8"
+    write_pyproject ">=3.11"
     coverage_json "$STUB_COVERAGE_JSON" "validate=98.9:2"
     run_test_sh
     [ "$status" -eq 1 ]
@@ -112,9 +112,9 @@ run_test_sh() { run env PATH="$BIN" "$@" bash "$ROOT/ci/test.sh"; }
 }
 
 @test "the venv is found from requires-python" {
-    write_pyproject ">=3.11" 99
+    write_pyproject ">=3.13" 99
     rm -rf "$VENV"
-    fake_python "$XDG_CACHE_HOME/git-vendored-ci/venv-3.11/bin/python"
+    fake_python "$XDG_CACHE_HOME/git-vendored-ci/venv-3.13/bin/python"
     run_test_sh
     [ "$status" -eq 0 ]
     logged "python -m coverage run"

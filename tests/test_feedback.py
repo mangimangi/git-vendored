@@ -16,7 +16,7 @@ ROOT = Path(__file__).parent.parent
 def _import_feedback():
     filepath = str(ROOT / "templates" / "feedback")
     loader = importlib.machinery.SourceFileLoader("vendored_feedback", filepath)
-    spec = importlib.util.spec_from_loader("vendored_feedback", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_feedback", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     module.__file__ = filepath
     sys.modules["vendored_feedback"] = module

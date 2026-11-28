@@ -20,7 +20,7 @@ ROOT = Path(__file__).parent.parent
 def _import_remove():
     filepath = str(ROOT / "templates" / "remove")
     loader = importlib.machinery.SourceFileLoader("vendored_remove", filepath)
-    spec = importlib.util.spec_from_loader("vendored_remove", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_remove", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["vendored_remove"] = module
     spec.loader.exec_module(module)

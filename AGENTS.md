@@ -148,7 +148,7 @@ cron, manual); `git-cicd verify` checks they match.
 ## Key files
 
 - `VERSION` — current release version
-- `pyproject.toml` — declares the Python floor (`requires-python`); CI tests on it
+- `pyproject.toml` — declares the Python floor (`requires-python = ">=3.11"`); CI tests on Python 3.11
 - `madreperla.yaml` — repo metadata for madreperla orchestration
 - `pearls.yaml` — issue tracker config for pearls/prl
 - See `docs/` for adoption guide and vendor install dir guide

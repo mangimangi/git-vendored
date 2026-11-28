@@ -10,7 +10,7 @@ setup() {
     CACHE="$XDG_CACHE_HOME/git-vendored-ci"
     export STUB_SITE="$BATS_TEST_TMPDIR/site-packages"
     # A uv that "installs" a Python and reports a fake interpreter's path.
-    export STUB_FOUND_PYTHON="$BATS_TEST_TMPDIR/uv-python/bin/python3.8"
+    export STUB_FOUND_PYTHON="$BATS_TEST_TMPDIR/uv-python/bin/python3.11"
     fake_python "$STUB_FOUND_PYTHON"
     export STUB_UV="$BATS_TEST_TMPDIR/uv-template"
     cat > "$STUB_UV" <<'STUB'
@@ -24,11 +24,6 @@ STUB
     stub "$BIN/bats" 0 "Bats 9.9.9"
 }
 
-teardown() {
-    if [ -n "${TOOLCACHE_DIR:-}" ]; then rm -rf "$TOOLCACHE_DIR"; fi
-    if [ -n "${TOOLCACHE_CREATED:-}" ]; then rm -rf "$TOOLCACHE_CREATED"; fi
-}
-
 run_setup() { run env PATH="$BIN" "$@" bash "$ROOT/ci/setup.sh"; }
 
 @test "no requires-python in pyproject.toml: error, exit 1" {
@@ -39,68 +34,68 @@ run_setup() { run env PATH="$BIN" "$@" bash "$ROOT/ci/setup.sh"; }
 }
 
 @test "python<floor> on PATH is used; venv built in XDG_CACHE_HOME with pytest, pyyaml, coverage" {
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
     run_setup
     [ "$status" -eq 0 ]
-    [[ "$output" == *"ci/setup.sh: using Python 3.8 at $BIN/python3.8"* ]]
-    logged "python3.8 -m venv --clear $CACHE/venv-3.8"
+    [[ "$output" == *"ci/setup.sh: using Python 3.11 at $BIN/python3.11"* ]]
+    logged "python3.11 -m venv --clear $CACHE/venv-3.11"
     logged "python -m pip install --quiet --upgrade pip"
-    logged 'python -m pip install --quiet pytest pyyaml coverage[toml]>=7.2,<7.7'
-    [ -x "$CACHE/venv-3.8/bin/python" ]
-    [[ "$output" == *"Python 3.8.99"* ]]
+    logged 'python -m pip install --quiet pytest pyyaml coverage>=7.2'
+    [ -x "$CACHE/venv-3.11/bin/python" ]
+    [[ "$output" == *"Python 3.11.99"* ]]
     ! logged "uv "
 }
 
 @test "writes the coverage startup hook into the venv's site-packages" {
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
     run_setup
     [ "$status" -eq 0 ]
     [ "$(cat "$STUB_SITE/git-vendored-coverage.pth")" = "import coverage; coverage.process_startup()" ]
 }
 
 @test "the venv goes under HOME/.cache when XDG_CACHE_HOME is unset" {
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
     run env -u XDG_CACHE_HOME PATH="$BIN" bash "$ROOT/ci/setup.sh"
     [ "$status" -eq 0 ]
-    [ -x "$HOME/.cache/git-vendored-ci/venv-3.8/bin/python" ]
+    [ -x "$HOME/.cache/git-vendored-ci/venv-3.11/bin/python" ]
 }
 
 @test "the floor comes from requires-python" {
-    write_pyproject ">= 3.11"
-    fake_python "$BIN/python3.11"
+    write_pyproject ">= 3.13"
+    fake_python "$BIN/python3.13"
     run_setup
     [ "$status" -eq 0 ]
-    [[ "$output" == *"using Python 3.11 at $BIN/python3.11"* ]]
-    [ -x "$CACHE/venv-3.11/bin/python" ]
+    [[ "$output" == *"using Python 3.13 at $BIN/python3.13"* ]]
+    [ -x "$CACHE/venv-3.13/bin/python" ]
 }
 
 @test "the runner tool cache is used when python<floor> is not on PATH" {
-    # The path is fixed in setup.sh, so this test writes a uniquely named
-    # version under it and removes it (and the tree, if it made it) after.
-    if [ -d /opt/hostedtoolcache ]; then
-        [ -w /opt/hostedtoolcache/Python ] || [ -w /opt/hostedtoolcache ] \
-            || skip "cannot write /opt/hostedtoolcache here"
-    else
-        [ -w /opt ] || skip "cannot write /opt here"
-        TOOLCACHE_CREATED=/opt/hostedtoolcache
-    fi
-    local floor="0.$$$RANDOM"
-    write_pyproject ">=$floor"
-    TOOLCACHE_DIR="/opt/hostedtoolcache/Python/$floor.1"
-    fake_python "$TOOLCACHE_DIR/x64/bin/python3"
+    fake_python "$RUNNER_TOOL_CACHE/Python/3.11.7/x64/bin/python3"
     run_setup
     [ "$status" -eq 0 ]
-    [[ "$output" == *"using Python $floor at $TOOLCACHE_DIR/x64/bin/python3"* ]]
+    [[ "$output" == *"using Python 3.11 at $RUNNER_TOOL_CACHE/Python/3.11.7/x64/bin/python3"* ]]
+    logged "python3 -m venv --clear $CACHE/venv-3.11"
+}
+
+@test "the tool cache of another Python version is not used" {
+    fake_python "$RUNNER_TOOL_CACHE/Python/3.12.1/x64/bin/python3"
+    run_setup CI=true STUB_PIP_UV_STATUS=1
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Python 3.11 not found"* ]]
+}
+
+@test "RUNNER_TOOL_CACHE unset: the tool cache is /opt/hostedtoolcache" {
+    grep -qF 'TOOLCACHE="${RUNNER_TOOL_CACHE:-/opt/hostedtoolcache}"' "$ROOT/ci/setup.sh"
 }
 
 @test "uv on PATH installs the floor when no interpreter is found" {
     cp "$STUB_UV" "$BIN/uv"
     run_setup
     [ "$status" -eq 0 ]
-    logged "uv python install 3.8"
-    logged "uv python find 3.8"
-    [[ "$output" == *"using Python 3.8 at $STUB_FOUND_PYTHON"* ]]
-    logged "python3.8 -m venv --clear $CACHE/venv-3.8"
+    logged "uv python install 3.11"
+    logged "uv python find 3.11"
+    [[ "$output" == *"using Python 3.11 at $STUB_FOUND_PYTHON"* ]]
+    logged "python3.11 -m venv --clear $CACHE/venv-3.11"
 }
 
 @test "without uv, uv is installed into a tools venv in the cache and used" {
@@ -110,8 +105,8 @@ run_setup() { run env PATH="$BIN" "$@" bash "$ROOT/ci/setup.sh"; }
     logged "python3 -m venv $CACHE/tools"
     logged "python -m pip install --quiet uv"
     [ -x "$CACHE/tools/bin/uv" ]
-    logged "uv python install 3.8"
-    [[ "$output" == *"using Python 3.8 at $STUB_FOUND_PYTHON"* ]]
+    logged "uv python install 3.11"
+    [[ "$output" == *"using Python 3.11 at $STUB_FOUND_PYTHON"* ]]
 }
 
 @test "uv that cannot install the floor: falls back to local python3 outside CI" {
@@ -119,15 +114,15 @@ run_setup() { run env PATH="$BIN" "$@" bash "$ROOT/ci/setup.sh"; }
     cp "$STUB_UV" "$BIN/uv"
     run_setup STUB_UV_INSTALL_STATUS=1
     [ "$status" -eq 0 ]
-    [[ "$output" == *"ci/setup.sh: Python 3.8 not found; using Python 3.8.99 locally (CI runs the floor)"* ]]
-    logged "python3 -m venv --clear $CACHE/venv-3.8"
+    [[ "$output" == *"ci/setup.sh: Python 3.11 not found; using Python 3.11.99 locally (CI runs the floor)"* ]]
+    logged "python3 -m venv --clear $CACHE/venv-3.11"
 }
 
 @test "uv cannot be installed: falls back to local python3 outside CI" {
     fake_python "$BIN/python3"
     run_setup STUB_PIP_UV_STATUS=1
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Python 3.8 not found; using Python 3.8.99 locally"* ]]
+    [[ "$output" == *"Python 3.11 not found; using Python 3.11.99 locally"* ]]
     ! logged "uv python"
 }
 
@@ -135,27 +130,27 @@ run_setup() { run env PATH="$BIN" "$@" bash "$ROOT/ci/setup.sh"; }
     fake_python "$BIN/python3"
     run_setup CI=true STUB_PIP_UV_STATUS=1
     [ "$status" -eq 1 ]
-    [[ "$output" == *"ci/setup.sh: Python 3.8 not found (looked for python3.8 and the runner tool cache; uv could not install it)"* ]]
-    [ ! -e "$CACHE/venv-3.8" ]
+    [[ "$output" == *"ci/setup.sh: Python 3.11 not found (looked for python3.11 and the runner tool cache; uv could not install it)"* ]]
+    [ ! -e "$CACHE/venv-3.11" ]
 }
 
 @test "floor not found and local python3 older than the floor: error, exit 1" {
-    write_pyproject ">=99.0"
     fake_python "$BIN/python3"
-    run_setup STUB_PIP_UV_STATUS=1
+    run_setup STUB_PIP_UV_STATUS=1 STUB_PY_VERSION=3.10.14
     [ "$status" -eq 1 ]
-    [[ "$output" == *"ci/setup.sh: Python 99.0 not found"* ]]
+    [[ "$output" == *"ci/setup.sh: Python 3.11 not found"* ]]
+    [ ! -e "$CACHE/venv-3.11" ]
 }
 
 @test "a failing pip install fails setup" {
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
     run_setup STUB_PIP_STATUS=1
     [ "$status" -ne 0 ]
     [ ! -e "$STUB_SITE/git-vendored-coverage.pth" ]
 }
 
 @test "bats on PATH is used as is" {
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
     run_setup
     [ "$status" -eq 0 ]
     [[ "$output" == *"ci/setup.sh: using Bats 9.9.9 at $BIN/bats"* ]]
@@ -163,7 +158,7 @@ run_setup() { run env PATH="$BIN" "$@" bash "$ROOT/ci/setup.sh"; }
 }
 
 @test "a cached bats is reused without downloading" {
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
     rm "$BIN/bats"
     stub "$CACHE/bats-1.11.1/bin/bats"
     run_setup
@@ -192,7 +187,7 @@ cp "$BATS_TEST_TMPDIR/bats.tgz" "\$out"
 STUB
     chmod +x "$BIN/curl"
     rm "$BIN/bats"
-    fake_python "$BIN/python3.8"
+    fake_python "$BIN/python3.11"
 }
 
 @test "no bats: downloads the pinned release, checks its sha256, unpacks it into the cache" {
