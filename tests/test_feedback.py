@@ -183,3 +183,101 @@ class TestMain:
         fb.main()
         output = capsys.readouterr().out
         assert "No installed vendors" in output
+
+
+class TestLoadVendorsFallbacks:
+    def test_flat_config_without_vendor_key(self, tmp_repo):
+        (tmp_repo / ".vendored" / "configs" / "tool.json").write_text(
+            json.dumps({"repo": "owner/tool"}))
+        assert fb.load_vendors() == {"tool": {"repo": "owner/tool"}}
+
+    def test_monolithic_config_json(self, tmp_repo):
+        (tmp_repo / ".vendored" / "config.json").write_text(json.dumps(
+            {"vendors": {"legacy": {"repo": "owner/legacy"}}}))
+        assert fb.load_vendors() == {"legacy": {"repo": "owner/legacy"}}
+
+    def test_monolithic_config_without_vendors_key(self, tmp_repo):
+        (tmp_repo / ".vendored" / "config.json").write_text("{}")
+        assert fb.load_vendors() == {}
+
+    def test_no_vendored_dir_at_all(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert fb.load_vendors() == {}
+
+
+class TestMainOutput:
+    def test_specific_vendor_full_output(self, make_vendor, capsys, monkeypatch):
+        make_vendor("alpha", {
+            "repo": "owner/alpha",
+            "support": {"instructions": "Attach logs", "labels": ["bug", "vendored"]},
+        }, version="1.4.2")
+        make_vendor("beta", {"repo": "owner/beta"})
+        monkeypatch.setattr(sys, "argv", ["feedback", "alpha"])
+        fb.main()
+        out = capsys.readouterr().out
+        assert out == (
+            "Vendor support info:\n\n"
+            "  alpha\n"
+            "    repo:    owner/alpha\n"
+            "    version: 1.4.2\n"
+            "    issues:  https://github.com/owner/alpha/issues\n"
+            "    info:    Attach logs\n"
+            "    labels:  bug, vendored\n"
+            "\n"
+        )
+
+    def test_specific_vendor_not_installed_has_no_version(
+            self, tmp_repo, capsys, monkeypatch):
+        """A configured vendor without a .version file still shows; no version line."""
+        (tmp_repo / ".vendored" / "configs" / "tool.json").write_text(
+            json.dumps({"_vendor": {}}))
+        monkeypatch.setattr(sys, "argv", ["feedback", "tool"])
+        fb.main()
+        out = capsys.readouterr().out
+        assert "  tool\n    repo:    unknown\n" in out
+        assert "version:" not in out
+        assert "issues:" not in out
+
+    def test_all_vendors_sorted_and_only_installed(self, make_vendor, tmp_repo,
+                                                   capsys, monkeypatch):
+        make_vendor("zeta", {"repo": "owner/zeta"}, version="3.0.0")
+        make_vendor("alpha", {"repo": "owner/alpha"}, version="1.0.0")
+        # configured but not installed (no .version)
+        (tmp_repo / ".vendored" / "configs" / "ghost.json").write_text(
+            json.dumps({"_vendor": {"repo": "owner/ghost"}}))
+        monkeypatch.setattr(sys, "argv", ["feedback"])
+        fb.main()
+        out = capsys.readouterr().out
+        assert out.startswith("Vendor support info:\n\n")
+        assert out.index("  alpha\n") < out.index("  zeta\n")
+        assert "ghost" not in out
+        assert "version: 3.0.0" in out
+
+    def test_unknown_vendor_message(self, make_vendor, capsys, monkeypatch):
+        make_vendor("beta", {"repo": "owner/beta"})
+        make_vendor("alpha", {"repo": "owner/alpha"})
+        monkeypatch.setattr(sys, "argv", ["feedback", "nope"])
+        with pytest.raises(SystemExit) as exc_info:
+            fb.main()
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Unknown vendor: nope" in captured.err
+        assert "Installed vendors: alpha, beta" in captured.err
+
+    def test_no_manifests_dir(self, tmp_path, capsys, monkeypatch):
+        """Configs present but manifests/ missing: nothing counts as installed."""
+        monkeypatch.chdir(tmp_path)
+        configs = tmp_path / ".vendored" / "configs"
+        configs.mkdir(parents=True)
+        (configs / "tool.json").write_text(json.dumps({"_vendor": {"repo": "o/tool"}}))
+        monkeypatch.setattr(sys, "argv", ["feedback"])
+        fb.main()
+        assert capsys.readouterr().out == "No installed vendors found.\n"
+
+    def test_installed_but_unconfigured_is_skipped(self, tmp_repo, capsys,
+                                                   monkeypatch):
+        (tmp_repo / ".vendored" / "manifests" / "orphan.version").write_text("1\n")
+        monkeypatch.setattr(sys, "argv", ["feedback"])
+        fb.main()
+        assert capsys.readouterr().out == "No installed vendors found.\n"

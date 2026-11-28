@@ -134,8 +134,9 @@ def check_version_resolvable(repo, token, requested_version, result):
     if proc.returncode == 0 and proc.stdout.strip():
         try:
             version = base64.b64decode(proc.stdout.strip()).decode().strip()
-            result.passed("Version resolvable", version)
-            return version
+            if version:
+                result.passed("Version resolvable", version)
+                return version
         except Exception:
             pass
 

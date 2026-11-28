@@ -1,0 +1,38 @@
+[project]
+name = "git-vendored"
+description = "Automated vendor install control for repo-embedded tools"
+requires-python = ">=3.8"
+dependencies = []
+dynamic = ["version"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# Line coverage of the six Python scripts git-vendored ships (they have no
+# .py extension, so they are named by path; `source` discovery would miss
+# them). Subprocess runs are counted: ci/test.sh exports
+# COVERAGE_PROCESS_START=pyproject.toml and ci/setup.sh puts a .pth startup
+# hook in the venv, so every Python process a test starts records its own
+# data file (parallel = true) and `coverage combine` merges them.
+# GIT_VENDORED_ROOT (exported by ci/test.sh as the checkout) anchors the paths,
+# so a subprocess a test starts in a temporary directory still matches the
+# scripts and writes its data next to the others; unset, it means ".".
+[tool.coverage.run]
+include = [
+    "${GIT_VENDORED_ROOT-.}/templates/install",
+    "${GIT_VENDORED_ROOT-.}/templates/check",
+    "${GIT_VENDORED_ROOT-.}/templates/remove",
+    "${GIT_VENDORED_ROOT-.}/templates/audit",
+    "${GIT_VENDORED_ROOT-.}/templates/feedback",
+    "${GIT_VENDORED_ROOT-.}/validate",
+]
+relative_files = true
+parallel = true
+data_file = "${GIT_VENDORED_ROOT-.}/.coverage"
+
+# 99% is the rule: ci/test.sh fails the `test` job below it, in total
+# (fail_under) and for each file (coverage has no per-file setting, so
+# ci/test.sh checks each one).
+[tool.coverage.report]
+show_missing = true
+fail_under = 99

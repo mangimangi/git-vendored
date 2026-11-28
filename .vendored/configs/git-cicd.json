@@ -1,4 +1,88 @@
 {
-  "jobs": {},
-  "needs_nothing": []
+  "jobs": {
+    "test": {
+      "name": "Unit Tests",
+      "on": ["open"],
+      "branches": ["**"],
+      "paths": [
+        ".vendored/**",
+        "templates/**",
+        "tests/**",
+        "install.sh",
+        "validate",
+        "VERSION",
+        "madreperla.yaml",
+        "pearls.yaml",
+        "pyproject.toml",
+        "ci/**"
+      ],
+      "setup": "ci/setup.sh",
+      "steps": ["ci/test.sh"]
+    },
+    "vendor-check": {
+      "name": "Vendor Check",
+      "on": ["open"],
+      "branches": ["**"],
+      "paths": ["**"],
+      "steps": ["ci/vendor-check.sh"]
+    },
+    "version-check": {
+      "name": "Version Check",
+      "on": ["open"],
+      "branches": ["main"],
+      "paths": ["**"],
+      "steps": [[".vendored/pkg/git-semver/git-semver", "check-bump"]]
+    },
+    "release": {
+      "name": "Release",
+      "on": ["merge"],
+      "branches": ["main"],
+      "steps": [".vendored/pkg/git-semver/release"]
+    },
+    "update-vendored": {
+      "name": "Update Vendored",
+      "on": ["cron"],
+      "cron": "0 9 * * 1",
+      "branches": ["main"],
+      "inputs": {
+        "vendor": {
+          "description": "Vendor to update, or all",
+          "default": "all"
+        },
+        "version": {
+          "description": "Version to install (default: latest)",
+          "default": "latest"
+        },
+        "private": {
+          "description": "Vendor repo is private (use VENDOR_PAT)",
+          "choices": ["false", "true"],
+          "default": "false"
+        }
+      },
+      "steps": ["ci/update-vendored.sh"]
+    },
+    "validate": {
+      "name": "Validate Vendor",
+      "on": [],
+      "branches": ["**"],
+      "inputs": {
+        "repo": {
+          "description": "GitHub repo to validate (owner/repo)",
+          "required": true
+        },
+        "version": {
+          "description": "Version to validate against (default: latest)",
+          "default": "latest"
+        }
+      },
+      "steps": ["ci/validate.sh"]
+    }
+  },
+  "needs_nothing": [
+    "LICENSE",
+    ".pearls/issues.jsonl",
+    ".pearls/docs/**",
+    ".pearls/archive/**",
+    ".madreperla/sessions.jsonl"
+  ]
 }

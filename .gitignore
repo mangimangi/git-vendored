@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 .claude/skills/
 commands/
+.coverage
+.coverage.*
+.claude/worktrees/

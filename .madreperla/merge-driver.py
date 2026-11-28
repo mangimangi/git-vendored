@@ -8,8 +8,15 @@ Git merge driver interface:
     - %B = theirs
     - Exit 0 on success, non-zero on conflict.
 
-Strategy: keep all unique lines from both sides, ordered by the line's
+Strategy: keep one line per ``id`` from both sides, ordered by the line's
 JSON ``created_at`` field (falls back to insertion order).
+
+A session row is appended with null ``updated_at``/``exit_code``/``cost`` and
+finalized later by an in-place edit. When both sides carry the same ``id``,
+the row with the later ``updated_at`` wins (a null ``updated_at`` loses to
+any value). Keeping "ours" unconditionally is wrong during a rebase, where
+"ours" is upstream: it kept the unfinalized row, turned the finalization
+commit into an empty patch, and git dropped it.
 """
 from __future__ import annotations
 
@@ -44,25 +51,31 @@ def _sort_key(line: str) -> str:
         return ""
 
 
+def _updated_at(line: str) -> str:
+    """``updated_at`` of a JSONL line; empty string when absent or null."""
+    try:
+        value = json.loads(line).get("updated_at")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return ""
+    return str(value) if value else ""
+
+
 def merge(base_path: Path, ours_path: Path, theirs_path: Path) -> int:
     """Three-way append-only merge. Result is written to *ours_path*."""
     ours_lines = _read_lines(ours_path)
     theirs_lines = _read_lines(theirs_path)
 
-    seen: set[str] = set()
+    index: dict[str, int] = {}
     merged: list[str] = []
 
-    for line in ours_lines:
+    for line in ours_lines + theirs_lines:
         lid = _line_id(line)
-        if lid not in seen:
-            seen.add(lid)
+        if lid not in index:
+            index[lid] = len(merged)
             merged.append(line)
-
-    for line in theirs_lines:
-        lid = _line_id(line)
-        if lid not in seen:
-            seen.add(lid)
-            merged.append(line)
+        elif _updated_at(line) > _updated_at(merged[index[lid]]):
+            # Same row on both sides: the more recently finalized copy wins.
+            merged[index[lid]] = line
 
     merged.sort(key=_sort_key)
 

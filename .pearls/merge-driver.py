@@ -5,12 +5,16 @@ Understands the JSONL issue schema and auto-resolves conflicts when changes
 are compatible (e.g., independent estimate appends, dep additions, one-side
 scalar changes).
 
+Refuses (conflict) when a merge would produce a record nobody wrote: an
+evaluation or close joined to a different commit, an estimate removed on one
+side and modified on the other, or duplicate ids within one side.
+
 Git merge driver interface:
     merge-driver.py %O %A %B
     - %O = base (ancestor)
     - %A = ours (also where result is written)
     - %B = theirs
-    - Exit 0 on success, non-zero on unresolvable conflict.
+    - Exit 0 on success, non-zero on unresolvable conflict (reason on stderr).
 """
 from __future__ import annotations
 
@@ -97,10 +101,14 @@ def merge_estimates(base: list[Any], ours: list[Any], theirs: list[Any]) -> list
             # Both sides removed — omit
             continue
         if in_base and not in_ours:
-            # Ours removed — omit
+            # Ours removed — omit, unless theirs modified it (conflict)
+            if theirs_by_key[key] != base_by_key[key]:
+                return None
             continue
         if in_base and not in_theirs:
-            # Theirs removed — omit
+            # Theirs removed — omit, unless ours modified it (conflict)
+            if ours_by_key[key] != base_by_key[key]:
+                return None
             continue
 
         if in_ours and in_theirs:
@@ -229,9 +237,44 @@ def merge_references(base: list[Any], ours: list[Any], theirs: list[Any]) -> lis
     return merged
 
 
+def commit_evaluation_conflict(base: Issue, ours: Issue, theirs: Issue) -> str | None:
+    """Detect an evaluation or close that would be joined to a commit it never judged.
+
+    Conflict when one side changed ``commit`` and the other side, without making
+    the same commit change, changed ``evaluation`` or moved status to ``closed``.
+    Returns a description of the conflicting fields, or None.
+    """
+    b: dict[str, Any] = cast("dict[str, Any]", base)
+    for label_a, label_b, side_a, side_b in (
+        ("ours", "theirs", cast("dict[str, Any]", ours), cast("dict[str, Any]", theirs)),
+        ("theirs", "ours", cast("dict[str, Any]", theirs), cast("dict[str, Any]", ours)),
+    ):
+        if side_a.get("commit") == b.get("commit"):
+            continue
+        if side_b.get("commit") == side_a.get("commit"):
+            continue
+        fields = []
+        if side_b.get("evaluation") != b.get("evaluation"):
+            fields.append("evaluation")
+        if side_b.get("status") == "closed" and b.get("status") != "closed":
+            fields.append("status")
+        if fields:
+            return f"{label_a} changed commit, {label_b} changed {' and '.join(fields)}"
+    return None
+
+
 def merge_issue(base: Issue, ours: Issue, theirs: Issue) -> Issue | None:
-    """Three-way merge of a single issue. Returns merged dict or None on conflict."""
+    """Three-way merge of a single issue. Returns merged dict or None on conflict.
+
+    The reason for a conflict is printed to stderr.
+    """
     merged: dict[str, Any] = {}
+    issue_id = base.get("id", "?")
+
+    reason = commit_evaluation_conflict(base, ours, theirs)
+    if reason:
+        print(f"CONFLICT: issue {issue_id}: {reason}", file=sys.stderr)
+        return None
 
     # Collect all keys across all three versions
     all_keys = list(base.keys())
@@ -263,6 +306,7 @@ def merge_issue(base: Issue, ours: Issue, theirs: Issue) -> Issue | None:
                 result = None
 
             if result is None:
+                print(f"CONFLICT: issue {issue_id}: field '{key}' changed incompatibly on both sides", file=sys.stderr)
                 return None
             if result:  # Only include non-empty arrays
                 merged[key] = result
@@ -282,6 +326,7 @@ def merge_issue(base: Issue, ours: Issue, theirs: Issue) -> Issue | None:
                     merged[key] = ours_val
             else:
                 # Both sides changed to different values — conflict
+                print(f"CONFLICT: issue {issue_id}: field '{key}' changed to different values on both sides", file=sys.stderr)
                 return None
 
     return cast("Issue", merged)
@@ -296,6 +341,18 @@ def merge_jsonl(base_path: Path, ours_path: Path, theirs_path: Path) -> bool:
     base_issues = read_jsonl(base_path)
     ours_issues = read_jsonl(ours_path)
     theirs_issues = read_jsonl(theirs_path)
+
+    # Duplicate ids within one side would silently collapse to the last line.
+    for label, side in (("base", base_issues), ("ours", ours_issues), ("theirs", theirs_issues)):
+        seen_ids: set[str] = set()
+        duplicates: list[str] = []
+        for i in side:
+            if i["id"] in seen_ids and i["id"] not in duplicates:
+                duplicates.append(i["id"])
+            seen_ids.add(i["id"])
+        if duplicates:
+            print(f"CONFLICT: duplicate issue id(s) in {label}: {', '.join(duplicates)}", file=sys.stderr)
+            return False
 
     base_by_id = {i["id"]: i for i in base_issues}
     ours_by_id = {i["id"]: i for i in ours_issues}
@@ -335,6 +392,7 @@ def merge_jsonl(base_path: Path, ours_path: Path, theirs_path: Path) -> bool:
                 continue
             else:
                 # Theirs modified something ours deleted — conflict
+                print(f"CONFLICT: issue {issue_id}: deleted in ours, modified in theirs", file=sys.stderr)
                 return False
         if in_base and not in_theirs:
             # Theirs deleted, ours unchanged or also modified
@@ -343,6 +401,7 @@ def merge_jsonl(base_path: Path, ours_path: Path, theirs_path: Path) -> bool:
                 continue
             else:
                 # Ours modified something theirs deleted — conflict
+                print(f"CONFLICT: issue {issue_id}: modified in ours, deleted in theirs", file=sys.stderr)
                 return False
 
         if not in_base:
@@ -352,6 +411,7 @@ def merge_jsonl(base_path: Path, ours_path: Path, theirs_path: Path) -> bool:
                     merged.append(ours_by_id[issue_id])
                 else:
                     # Both sides created same ID with different content — conflict
+                    print(f"CONFLICT: issue {issue_id}: created on both sides with different content", file=sys.stderr)
                     return False
             elif in_ours:
                 merged.append(ours_by_id[issue_id])

@@ -476,3 +476,200 @@ class TestReverseDeps:
 
         assert "Removed" in capsys.readouterr().out
         assert not (tmp_repo / ".tool" / "script.sh").exists()
+
+
+# ── Tests: registry file, config deletion, prompts, what removal leaves ──
+
+def _write_manifests(tmp_repo, vendor, files, **extra):
+    manifests_dir = tmp_repo / ".vendored" / "manifests"
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+    (manifests_dir / f"{vendor}.files").write_text("".join(f + "\n" for f in files))
+    for suffix, content in extra.items():
+        (manifests_dir / f"{vendor}.{suffix}").write_text(content)
+    return manifests_dir
+
+
+def _write_file(tmp_repo, rel, content="x"):
+    path = tmp_repo / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return path
+
+
+class TestRegistryFile:
+    def test_load_config_prefers_registry_file(self, tmp_repo):
+        """The .registry manifest wins over the config's _vendor block."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps(
+            {"_vendor": {"repo": "owner/old"}, "custom": 1}))
+        _write_manifests(tmp_repo, "tool", [],
+                         registry=json.dumps({"repo": "owner/new"}))
+        config = rem.load_config()
+        assert config["vendors"]["tool"] == {"repo": "owner/new"}
+
+    def test_vendor_known_only_via_registry_is_removable(self, tmp_repo, capsys):
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"prefix": "t"}))
+        _write_file(tmp_repo, ".vendored/pkg/tool/run.sh")
+        manifests_dir = _write_manifests(
+            tmp_repo, "tool", [".vendored/pkg/tool/run.sh"],
+            registry=json.dumps({"repo": "owner/tool"}), version="1.0.0\n")
+
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+
+        assert not (manifests_dir / "tool.registry").exists()
+        assert not (configs_dir / "tool.json").exists()
+        assert "(4 files deleted)" in capsys.readouterr().out
+
+
+class TestDeleteVendorConfig:
+    def test_deletes_existing_config(self, tmp_repo):
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text("{}")
+        (configs_dir / "other.json").write_text("{}")
+        rem.delete_vendor_config("tool")
+        assert not (configs_dir / "tool.json").exists()
+        assert (configs_dir / "other.json").exists()
+
+    def test_missing_config_is_noop(self, tmp_repo):
+        rem.delete_vendor_config("tool")  # no configs dir at all: no error
+
+
+class TestPrompts:
+    def _setup(self, make_config, tmp_repo, with_dependent=False):
+        vendors = {"tool": SAMPLE_VENDOR}
+        extra = {"version": "1.0.0\n"}
+        if with_dependent:
+            vendors["other"] = SAMPLE_VENDOR
+        make_config({"vendors": vendors})
+        _write_file(tmp_repo, ".tool/script.sh")
+        manifests_dir = _write_manifests(tmp_repo, "tool", [".tool/script.sh"], **extra)
+        if with_dependent:
+            (manifests_dir / "other.deps").write_text("tool\n")
+        return manifests_dir
+
+    def test_eof_on_confirm_aborts(self, make_config, tmp_repo, capsys):
+        """No stdin (EOF) at the confirm prompt is treated as 'no'."""
+        self._setup(make_config, tmp_repo)
+        with patch("sys.argv", ["remove", "tool"]):
+            with patch("builtins.input", side_effect=EOFError):
+                with pytest.raises(SystemExit) as exc_info:
+                    rem.main()
+        assert exc_info.value.code == 0
+        assert "Aborted." in capsys.readouterr().out
+        assert (tmp_repo / ".tool" / "script.sh").exists()
+        config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert "tool" in config["vendors"]
+
+    def test_eof_on_reverse_dep_prompt_aborts(self, make_config, tmp_repo, capsys):
+        manifests_dir = self._setup(make_config, tmp_repo, with_dependent=True)
+        with patch("sys.argv", ["remove", "tool"]):
+            with patch("builtins.input", side_effect=EOFError) as mock_input:
+                with pytest.raises(SystemExit) as exc_info:
+                    rem.main()
+        assert exc_info.value.code == 0
+        assert mock_input.call_count == 1  # never reaches the second prompt
+        out = capsys.readouterr().out
+        assert "  - other" in out
+        assert "Aborted." in out
+        assert (manifests_dir / "tool.files").exists()
+
+    def test_yes_to_both_prompts_removes(self, make_config, tmp_repo, capsys):
+        self._setup(make_config, tmp_repo, with_dependent=True)
+        with patch("sys.argv", ["remove", "tool"]):
+            with patch("builtins.input", return_value="YES") as mock_input:
+                rem.main()
+        assert mock_input.call_count == 2
+        assert not (tmp_repo / ".tool" / "script.sh").exists()
+        config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())
+        assert config["vendors"] == {"other": SAMPLE_VENDOR}
+
+    def test_listing_marks_missing_files(self, make_config, tmp_repo, capsys):
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        _write_file(tmp_repo, ".tool/present.sh")
+        _write_manifests(tmp_repo, "tool", [".tool/present.sh", ".tool/gone.sh"])
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+        out = capsys.readouterr().out
+        assert "    .tool/present.sh" in out
+        assert "  ? .tool/gone.sh" in out
+        assert "(2 files deleted)" in out  # present.sh + tool.files
+
+
+class TestUnknownVendorMessage:
+    def test_lists_registered_vendors(self, make_config, capsys):
+        make_config({"vendors": {"zeta": SAMPLE_VENDOR, "alpha": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["remove", "nope", "--force"]):
+            with pytest.raises(SystemExit) as exc_info:
+                rem.main()
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "::error::Unknown vendor: nope" in out
+        assert "Registered vendors: alpha, zeta" in out
+
+    def test_missing_manifest_message(self, make_config, capsys):
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            with pytest.raises(SystemExit) as exc_info:
+                rem.main()
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "::error::No manifest found for vendor 'tool'" in out
+        assert "Expected: .vendored/manifests/tool.files" in out
+
+    def test_no_config_at_all(self, tmp_repo, capsys):
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            with pytest.raises(SystemExit) as exc_info:
+                rem.main()
+        assert exc_info.value.code == 1
+        assert "::error::Config not found: .vendored/config.json" in capsys.readouterr().out
+
+
+class TestWhatRemovalLeaves:
+    def test_full_removal_scope(self, tmp_repo, capsys):
+        """Deletes manifest-listed files, its manifests and config; keeps the rest."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"_vendor": SAMPLE_VENDOR}))
+        (configs_dir / "other.json").write_text(json.dumps({"_vendor": {"repo": "o/other"}}))
+
+        listed = [
+            ".vendored/pkg/tool/bin/tool",
+            ".vendored/pkg/tool/lib/x.py",
+            ".github/workflows/tool.yml",
+        ]
+        for rel in listed:
+            _write_file(tmp_repo, rel)
+        other_workflow = _write_file(tmp_repo, ".github/workflows/ci.yml")
+        other_pkg = _write_file(tmp_repo, ".vendored/pkg/other/run.sh")
+        untracked = _write_file(tmp_repo, ".vendored/pkg/tool/local-notes.txt")
+
+        manifests_dir = _write_manifests(
+            tmp_repo, "tool", listed, version="1.0.0\n", deps="other\n",
+            schema="{}\n", registry=json.dumps(SAMPLE_VENDOR))
+        (manifests_dir / "other.files").write_text(".vendored/pkg/other/run.sh\n")
+        (manifests_dir / "other.version").write_text("2.0.0\n")
+
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+
+        for rel in listed:
+            assert not (tmp_repo / rel).exists()
+        for suffix in ("files", "version", "deps", "schema", "registry"):
+            assert not (manifests_dir / f"tool.{suffix}").exists()
+        assert not (configs_dir / "tool.json").exists()
+        assert not (tmp_repo / ".vendored/pkg/tool/bin").exists()
+        assert not (tmp_repo / ".vendored/pkg/tool/lib").exists()
+
+        # Left alone: other vendors, unrelated workflows, files not in manifest
+        assert (configs_dir / "other.json").exists()
+        assert (manifests_dir / "other.files").exists()
+        assert (manifests_dir / "other.version").exists()
+        assert other_workflow.exists()
+        assert other_pkg.exists()
+        assert untracked.exists()
+        assert "(8 files deleted)" in capsys.readouterr().out

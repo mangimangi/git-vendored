@@ -9,6 +9,9 @@ Usage:
     python3 .vendored/install <owner/repo|vendor|all> [--version <version>]
                               [--force] [--pr] [--name <name>]
 
+    owner/repo of a vendor that is already registered updates it. Surrounding
+    whitespace is trimmed from the arguments.
+
 Output (key=value lines for workflow consumption):
     vendor=<name>
     old_version=<version>
@@ -16,9 +19,17 @@ Output (key=value lines for workflow consumption):
     changed=true|false
 
 Environment:
-    GITHUB_TOKEN - Auth for public repos
-    VENDOR_PAT   - Auth for private repos (vendor.private: true)
+    GITHUB_TOKEN - Auth for public repos; opens the PR in --pr mode
+    VENDOR_PAT   - Auth for private repos (vendor.private: true). In --pr
+                   mode, also pushes the install branch when it carries
+                   workflow files (needs workflow write permission)
     GH_TOKEN     - Fallback auth token
+
+    The arguments can also be given through the environment (command-line
+    arguments win):
+    VENDORED_VENDOR  - target, used when no positional target is given
+    VENDORED_VERSION - version, used when --version is not given
+    VENDORED_PRIVATE - true/1/yes sets --private; false/0/no/empty does not
 """
 
 import argparse
@@ -43,6 +54,16 @@ MULTI_VENDOR_INSTALL_BRANCH = "chore/install-vendors"
 REGISTRY_FIELDS = {"repo", "install_branch", "protected", "allowed",
                    "private", "automerge", "dogfood", "dependency_mode",
                    "support"}
+
+# Registry fields the vendor owns: replaced by what the installed version
+# ships on every install (add or update). They describe the vendor's files
+# and identity.
+VENDOR_OWNED_FIELDS = {"repo", "install_branch", "protected", "allowed",
+                       "dogfood", "support"}
+
+# Registry fields the consuming repository owns: its own choices about auth,
+# merging and dependencies. An update keeps them as they are.
+REPO_OWNED_FIELDS = REGISTRY_FIELDS - VENDOR_OWNED_FIELDS
 
 
 # ── Config helpers ────────────────────────────────────────────────────────
@@ -729,6 +750,160 @@ def validate_entry(vendor_name, entry):
         sys.exit(1)
 
 
+# ── Registry refresh (update path) ────────────────────────────────────────
+
+def _read_bytes(path):
+    """Return a file's bytes, or None if it does not exist."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def snapshot_vendor_state(vendor_name):
+    """Snapshot what an install may rewrite: the vendor's config and registry.
+
+    Taken before install.sh runs so refresh_registry() can tell what the
+    installed version shipped from what the repository already had.
+    """
+    config_path = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+    return {
+        "config": _read_bytes(config_path),
+        "registry": _read_bytes(registry_path),
+        "legacy": _read_bytes(CONFIG_PATH),
+    }
+
+
+def _shipped_registry(vendor_name, snapshot):
+    """Return the registry the installed version shipped, or None.
+
+    Looked for in the same places the add path reads: the `_vendor` block of
+    .vendored/configs/<vendor>.json, the vendor's entry under `vendors` in the
+    legacy .vendored/config.json, or a .vendored/manifests/<vendor>.registry
+    install.sh wrote. A block left over from before the install (the file is
+    byte-for-byte what it was) is not counted as shipped, unless no registry
+    file existed, in which case it is the registry in use anyway.
+    """
+    config_path = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    after = _read_bytes(config_path)
+    if after is not None:
+        raw = json.loads(after)
+        changed = after != snapshot["config"]
+        if "_vendor" in raw and (changed or snapshot["registry"] is None):
+            return dict(raw["_vendor"])
+
+    after = _read_bytes(CONFIG_PATH)
+    if after is not None and after != snapshot["legacy"]:
+        entry = json.loads(after).get("vendors", {}).get(vendor_name)
+        if entry is not None:
+            return {k: v for k, v in entry.items() if k in REGISTRY_FIELDS}
+
+    registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+    after = _read_bytes(registry_path)
+    if after is not None and after != snapshot["registry"]:
+        return json.loads(after)
+    return None
+
+
+def _restore_project_config(vendor_name, snapshot):
+    """Keep the repository's own .vendored/configs/<vendor>.json.
+
+    The repository's keys keep the values they had before the install; a key
+    install.sh added that the repository did not have is kept. `_vendor` and
+    registry fields are stripped, as save_vendor_config() does. When nothing
+    but `_vendor` changed, the file is restored byte for byte.
+    """
+    config_path = os.path.join(CONFIGS_DIR, f"{vendor_name}.json")
+    after = _read_bytes(config_path)
+    before = snapshot["config"]
+    if after is None:
+        if before is not None:
+            with open(config_path, "wb") as f:
+                f.write(before)
+        return
+    old = json.loads(before) if before is not None else {}
+    new = json.loads(after)
+    merged = {k: v for k, v in new.items()
+              if k != "_vendor" and k not in REGISTRY_FIELDS}
+    for k, v in old.items():
+        if k != "_vendor" and k not in REGISTRY_FIELDS:
+            merged[k] = v
+    old_project = {k: v for k, v in old.items()
+                   if k != "_vendor" and k not in REGISTRY_FIELDS}
+    if before is not None and merged == old and old == old_project:
+        data = before
+    else:
+        data = (json.dumps(merged, indent=2) + "\n").encode()
+    if data != after:
+        with open(config_path, "wb") as f:
+            f.write(data)
+
+
+def _clean_legacy_entry(vendor_name, snapshot):
+    """Drop an entry install.sh wrote into the legacy config.json.
+
+    Only when the vendor already has its per-vendor config (it is registered
+    there) and the entry is new, as the add path does after migrating it.
+    """
+    after = _read_bytes(CONFIG_PATH)
+    if after is None or after == snapshot["legacy"]:
+        return
+    if not os.path.isfile(os.path.join(CONFIGS_DIR, f"{vendor_name}.json")):
+        return
+    before = json.loads(snapshot["legacy"]) if snapshot["legacy"] else {}
+    if vendor_name in before.get("vendors", {}):
+        return
+    raw_config = json.loads(after)
+    raw_vendors = raw_config.get("vendors", {})
+    if vendor_name not in raw_vendors:
+        return
+    del raw_vendors[vendor_name]
+    if not raw_vendors:
+        del raw_config["vendors"]
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(raw_config, f, indent=2)
+        f.write("\n")
+
+
+def refresh_registry(vendor_name, old_registry, snapshot):
+    """Make the registry that of the installed version.
+
+    Vendor-owned fields (VENDOR_OWNED_FIELDS) are replaced by what the
+    installed version shipped; one it no longer ships is removed, so a vendor
+    can drop entries from `allowed`. Repository-owned fields
+    (REPO_OWNED_FIELDS) keep the values the registry had. The repository's
+    .vendored/configs/<vendor>.json is not overwritten. When the installed
+    version ships no registry, the existing one is kept as it is.
+
+    Returns the registry now in force.
+    """
+    old_registry = {k: v for k, v in (old_registry or {}).items()
+                    if k in REGISTRY_FIELDS}
+    shipped = _shipped_registry(vendor_name, snapshot)
+    _restore_project_config(vendor_name, snapshot)
+    _clean_legacy_entry(vendor_name, snapshot)
+    if shipped is None:
+        # Keep the registry in force; write it out when it lived only in
+        # the config file, whose registry fields were just stripped.
+        registry_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.registry")
+        if snapshot["registry"] is not None:
+            with open(registry_path, "wb") as f:
+                f.write(snapshot["registry"])
+        elif old_registry:
+            write_registry(vendor_name, old_registry)
+        return old_registry
+
+    registry = {k: v for k, v in shipped.items() if k in VENDOR_OWNED_FIELDS}
+    if "repo" not in registry and "repo" in old_registry:
+        registry["repo"] = old_registry["repo"]
+    for k in REPO_OWNED_FIELDS:
+        if k in old_registry:
+            registry[k] = old_registry[k]
+    write_registry(vendor_name, registry)
+    return registry
+
+
 # ── Core install logic ────────────────────────────────────────────────────
 
 def install_new_vendor(repo, version, token, name=None, deps_mode=None,
@@ -903,20 +1078,29 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
         resolve_deps(deps, token, mode, installing_set)
 
     print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
+    snapshot = snapshot_vendor_state(vendor_name)
     manifest_files = download_and_run_install(repo, target_version, token,
                                               vendor_name=vendor_name,
                                               vendor_config=vendor_config)
+
+    # The registry and manifest become those of the installed version.
+    # Done before a re-exec so the new coordinator sees them.
+    registry = refresh_registry(vendor_name, vendor_config, snapshot)
+
+    # Process manifest if install.sh wrote one: it replaces the old one.
+    if manifest_files:
+        validate_manifest(manifest_files)
+        write_manifest(vendor_name, manifest_files)
+        write_manifest_version(vendor_name, target_version)
+
+    print(f"  protected: {', '.join(registry.get('protected', []))}")
+    if registry.get("allowed"):
+        print(f"  allowed: {', '.join(registry['allowed'])}")
 
     # Self-bootstrap: if install.sh updated the coordinator on disk,
     # re-exec so post-install steps use the new code.
     if not post_install_only:
         _maybe_reexec()
-
-    # Process manifest if install.sh wrote one
-    if manifest_files:
-        validate_manifest(manifest_files)
-        write_manifest(vendor_name, manifest_files)
-        write_manifest_version(vendor_name, target_version)
 
     # Cache resolved deps
     if deps:
@@ -1026,6 +1210,97 @@ def get_pr_metadata(results):
         }
 
 
+WORKFLOWS_DIR = ".github/workflows/"
+
+
+def staged_workflow_files():
+    """Return the staged paths under .github/workflows/ (written or removed)."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--no-renames", "--",
+         WORKFLOWS_DIR],
+        capture_output=True, text=True,
+    )
+    out = result.stdout if isinstance(result.stdout, str) else ""
+    return sorted(line.strip() for line in out.splitlines() if line.strip())
+
+
+def unstage_workflow_files():
+    """Unstage .github/workflows/ (the files stay on disk)."""
+    subprocess.run(
+        ["git", "reset", "HEAD", "--", WORKFLOWS_DIR],
+        capture_output=True,
+    )
+
+
+def _auth_header(token):
+    """The HTTP header value git sends to authenticate with `token`."""
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return f"AUTHORIZATION: basic {basic}"
+
+
+def _scrub(text, token):
+    """Remove a token (and its header form) from text that is printed."""
+    text = (text or "").strip()
+    if token:
+        for secret in (token, _auth_header(token).split()[-1]):
+            text = text.replace(secret, "***")
+    return text
+
+
+def push_branch(branch, token=None):
+    """Push the install branch, with `token` when given.
+
+    --force-with-lease: these install branches are ephemeral automation
+    artifacts; a stale remote ref from a prior run must not block the push.
+
+    With a token (VENDOR_PAT), it is passed as an http.extraheader for
+    github.com in the command's own -c options: never printed, never written
+    to .git/config. actions/checkout persists its own GITHUB_TOKEN header
+    under the same key, so an empty value is given first, which resets the
+    list of headers, and then the token's header.
+    """
+    cmd = ["git"]
+    if token:
+        key = "http.https://github.com/.extraheader"
+        cmd += ["-c", f"{key}=", "-c", f"{key}={_auth_header(token)}"]
+    cmd += ["push", "--force-with-lease", "-u", "origin", branch]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def workflow_files_note(results, paths):
+    """PR body section listing workflow files left out, and how to add them."""
+    changed = [r["vendor"] for r in results if r["changed"]]
+    owners = []
+    for vendor in changed:
+        manifest = set(read_manifest(vendor) or [])
+        if vendor == "git-cicd" or manifest.intersection(paths):
+            owners.append(vendor)
+    if not owners:
+        owners = changed
+    lines = [
+        "",
+        "",
+        "### Workflow files not included",
+        "",
+        "This branch was pushed with a token that may not write workflow "
+        "files, so these changes were left out:",
+        "",
+    ]
+    lines += [f"- `{path}`" for path in paths]
+    lines += ["", "To add them, on this branch:", ""]
+    for vendor in owners:
+        if vendor == "git-cicd":
+            lines.append(f"- {vendor}: run `.vendored/pkg/git-cicd/git-cicd "
+                         "generate` and commit `.github/workflows/`")
+        else:
+            lines.append(f"- {vendor}: run `python3 .vendored/install "
+                         f"{vendor} --force` with a token that may write "
+                         "workflow files and commit `.github/workflows/`")
+    lines += ["", "Set a `VENDOR_PAT` secret with workflow write permission "
+              "to carry them in future install PRs."]
+    return "\n".join(lines)
+
+
 def create_pull_request(results):
     """Create a PR with vendor install changes."""
     meta = get_pr_metadata(results)
@@ -1058,19 +1333,27 @@ def create_pull_request(results):
     )
     subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
-    # Unstage workflow files: the GITHUB_TOKEN used by CI lacks the
-    # `workflows` permission, so pushing commits that touch
-    # .github/workflows/ would be rejected.  Workflow templates are
-    # written to disk by install.sh for initial bootstrap; they should
-    # not be re-committed in automated update PRs.
-    subprocess.run(
-        ["git", "reset", "HEAD", "--", ".github/workflows/"],
-        capture_output=True,
-    )
+    # Workflow files (.github/workflows/) this install wrote or removed.
+    # The workflow's own GITHUB_TOKEN may not push them (it lacks the
+    # `workflows` permission), so they are kept only when VENDOR_PAT is set
+    # and the push is made with it; otherwise they are unstaged and the PR
+    # body lists them with what to run and commit.
+    workflow_files = staged_workflow_files()
+    pat = os.environ.get("VENDOR_PAT", "")
+    keep_workflows = bool(workflow_files and pat)
+    left_out = []
+    if not keep_workflows:
+        unstage_workflow_files()
+        left_out = workflow_files
 
     diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
     if diff_result.returncode == 0:
         print("No changes to commit")
+        if left_out:
+            print("Workflow files changed but were left out (set VENDOR_PAT "
+                  "to a token that may write workflows to carry them):")
+            for path in left_out:
+                print(f"  {path}")
         return
 
     # Skip git hooks: the install script is the authorized mechanism
@@ -1087,17 +1370,37 @@ def create_pull_request(results):
         ["git", "fetch", "origin", branch],
         capture_output=True,
     )
-    # --force-with-lease: these install branches are ephemeral automation
-    # artifacts; a stale remote ref from a prior run must not block the push.
-    push_result = subprocess.run(
-        ["git", "push", "--force-with-lease", "-u", "origin", branch],
-        capture_output=True, text=True,
-    )
+    push_result = push_branch(branch, pat if keep_workflows else None)
+    if (push_result.returncode != 0 and keep_workflows
+            and "workflow" in (push_result.stderr or "").lower()):
+        # VENDOR_PAT may not write workflow files: leave them out and push
+        # the rest, so the install still ends with a pull request.
+        print("Push with workflow files was refused (the token may not "
+              "write workflows); retrying without them")
+        subprocess.run(["git", "reset", "--soft", "HEAD~1"],
+                       check=True, capture_output=True)
+        unstage_workflow_files()
+        left_out = workflow_files
+        diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
+        if diff_result.returncode == 0:
+            print("Only workflow files changed and they could not be "
+                  "pushed; no PR created:")
+            for path in left_out:
+                print(f"  {path}")
+            return
+        subprocess.run(
+            ["git", "commit", "--no-verify", "-m", title],
+            check=True, capture_output=True,
+        )
+        push_result = push_branch(branch, None)
     if push_result.returncode != 0:
         print(f"git push failed (exit {push_result.returncode}):")
-        print(f"  stdout: {push_result.stdout.strip()}")
-        print(f"  stderr: {push_result.stderr.strip()}")
+        print(f"  stdout: {_scrub(push_result.stdout, pat)}")
+        print(f"  stderr: {_scrub(push_result.stderr, pat)}")
         sys.exit(1)
+
+    if left_out:
+        body += workflow_files_note(results, left_out)
 
     pr_result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body,
@@ -1306,6 +1609,79 @@ def _maybe_reexec():
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
+# Environment form of the arguments, for jobs that pass declared inputs
+# without building a command line. Command-line arguments win.
+ENV_VENDOR = "VENDORED_VENDOR"
+ENV_VERSION = "VENDORED_VERSION"
+ENV_PRIVATE = "VENDORED_PRIVATE"
+_TRUE_VALUES = {"true", "1", "yes"}
+_FALSE_VALUES = {"false", "0", "no", ""}
+
+
+def _given(argv, flag):
+    """True if `flag` was given on the command line (also as flag=value)."""
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
+def apply_env_args(args, argv):
+    """Fill the target, --version and --private from the environment.
+
+    VENDORED_VENDOR is used when no target was given, VENDORED_VERSION when
+    --version was not given, VENDORED_PRIVATE (true/1/yes, false/0/no or
+    empty) when --private was not given.
+    """
+    if args.target is None and os.environ.get(ENV_VENDOR) is not None:
+        args.target = os.environ[ENV_VENDOR]
+    if not _given(argv, "--version") and os.environ.get(ENV_VERSION):
+        args.version = os.environ[ENV_VERSION]
+    if not args.private and os.environ.get(ENV_PRIVATE) is not None:
+        value = os.environ[ENV_PRIVATE].strip().lower()
+        if value in _TRUE_VALUES:
+            args.private = True
+        elif value not in _FALSE_VALUES:
+            print(f"::error::Invalid {ENV_PRIVATE} "
+                  f"{os.environ[ENV_PRIVATE]!r}: expected true/1/yes or "
+                  "false/0/no")
+            sys.exit(1)
+
+
+def validate_target(target):
+    """Return what is wrong with a (trimmed) target, or None if it is fine."""
+    if not target:
+        return "it is empty"
+    if any(c.isspace() for c in target):
+        return "it contains whitespace"
+    if _is_repo_spec(target):
+        parts = target.split("/")
+        if len(parts) != 2:
+            return "owner/repo must contain exactly one '/'"
+        if not parts[0]:
+            return "the owner part of owner/repo is empty"
+        if not parts[1]:
+            return "the repo part of owner/repo is empty"
+    return None
+
+
+def registered_vendor_for_repo(repo, vendors, name=None):
+    """Return the registered vendor name for `repo`, or None.
+
+    A vendor whose registry `repo` is `repo` matches. Exits with an error
+    when the name the add path would use (--name or the repo's basename)
+    is registered for a different repo.
+    """
+    for vname, vcfg in vendors.items():
+        if vcfg.get("repo") == repo:
+            return vname
+    key = name or repo.split("/")[-1]
+    if key in vendors:
+        other = vendors[key].get("repo", "(no repo recorded)")
+        print(f"::error::Vendor '{key}' is already registered for {other}, "
+              f"not {repo}.")
+        print("Use --name <name> to add it under another name.")
+        sys.exit(1)
+    return None
+
+
 def _is_repo_spec(arg):
     """Check if an argument looks like owner/repo."""
     return "/" in arg and not arg.startswith("-")
@@ -1344,7 +1720,7 @@ def main():
     )
     parser.add_argument(
         "--version", default="latest",
-        help="Version to install (default: latest)"
+        help="Version to install (default: latest, or $VENDORED_VERSION)"
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -1382,8 +1758,25 @@ def main():
         list_vendors()
         return
 
-    if not args.target:
-        parser.error("target is required (unless using --list)")
+    apply_env_args(args, sys.argv[1:])
+    if args.version is not None:
+        args.version = args.version.strip()
+    if args.name is not None:
+        args.name = args.name.strip()
+    if not args.version:
+        args.version = "latest"
+
+    if args.target is None:
+        parser.error("target is required (unless using --list); give it as "
+                     f"an argument or in {ENV_VENDOR}")
+    raw_target = args.target
+    args.target = args.target.strip()
+    target_error = validate_target(args.target)
+    if target_error:
+        print(f"::error::Invalid vendor argument {raw_target!r}: {target_error}")
+        print("Expected one of: <vendor> (a registered vendor name), "
+              "owner/repo, or all")
+        sys.exit(1)
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
     if _should_migrate_config():
@@ -1422,6 +1815,11 @@ def main():
             create_pull_request(results)
         return
 
+    registered_name = None
+    if args.target != "all" and _is_repo_spec(args.target):
+        registered_name = registered_vendor_for_repo(args.target, vendors,
+                                                     args.name)
+
     if args.target == "all":
         # Update all registered vendors
         if not vendors:
@@ -1436,6 +1834,16 @@ def main():
                                         deps_mode=args.deps)
             )
         output_results(results)
+    elif _is_repo_spec(args.target) and registered_name:
+        # owner/repo of a vendor that is already registered — update path
+        name = registered_name
+        print(f"{args.target} is registered as vendor '{name}'; updating it")
+        result = install_existing_vendor(
+            name, vendors[name], args.version, args.force,
+            deps_mode=args.deps
+        )
+        output_result(result)
+        results = [result]
     elif _is_repo_spec(args.target):
         # New vendor (owner/repo format) — add path
         token = get_auth_token(private=args.private)
