@@ -9,12 +9,17 @@ counted. This wraps ``subprocess.Popen`` (which ``run``, ``call`` and
 test did not set them itself.
 
 Tokens: no test may read a token from the ambient environment. In CI the
-job's environment holds real secrets (VENDOR_PAT), and a failed assertion
-that compares against one prints part of it, which GitHub does not mask.
-So VENDOR_PAT, GH_TOKEN and GITHUB_TOKEN are removed from os.environ when
+job's environment holds real secrets (CICD_WRITE_TOKEN, CICD_READ_TOKEN,
+VENDOR_PAT), and a failed assertion that compares against one prints part of
+it, which GitHub does not mask. So CICD_WRITE_TOKEN, CICD_READ_TOKEN,
+VENDOR_PAT, GH_TOKEN and GITHUB_TOKEN are removed from os.environ when
 this file is imported (before collection and any session fixture), and again
 before every test by an autouse fixture; a test that needs one sets a fake
 value with monkeypatch.
+
+CI marker: GITHUB_ACTIONS is set in CI, and the installer's --pr mode refuses
+to run there without a write token. Each test starts without it, so a test
+behaves the same locally and in CI; a test of the CI behaviour sets it.
 """
 
 import os
@@ -22,7 +27,8 @@ import subprocess
 
 import pytest
 
-TOKEN_ENV_VARS = ("VENDOR_PAT", "GH_TOKEN", "GITHUB_TOKEN")
+TOKEN_ENV_VARS = ("CICD_WRITE_TOKEN", "CICD_READ_TOKEN", "VENDOR_PAT",
+                  "GH_TOKEN", "GITHUB_TOKEN")
 
 
 def clear_token_env():
@@ -39,6 +45,8 @@ def _no_ambient_tokens(monkeypatch):
     """Each test starts with no token variable set."""
     for name in TOKEN_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
 
 COVERAGE_ENV_VARS = ("COVERAGE_PROCESS_START", "GIT_VENDORED_ROOT", "COVERAGE_RCFILE")
 

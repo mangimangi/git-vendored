@@ -14,14 +14,16 @@
 #   VENDOR_REF       - Git ref to fetch files at
 #   VENDOR_MANIFEST  - Path to write the file manifest to
 #   VENDOR_INSTALL_DIR - Target directory for vendor files (optional)
-#   GH_TOKEN         - Auth token (optional, required for private repos)
-#   VENDOR_PAT       - Auth token for private repos (optional, overrides GH_TOKEN)
+#   CICD_READ_TOKEN  - Token that reads private repos (optional; first choice)
+#   CICD_WRITE_TOKEN - Token that may also write (optional; second choice)
+#   VENDOR_PAT       - Deprecated old name (optional; third choice)
+#   GH_TOKEN         - Auth token (optional; used when none of the above is set)
 set -euo pipefail
 
 # ── Internal helpers ─────────────────────────────────────────────────────
 
 _vendor_auth_header() {
-    local token="${VENDOR_PAT:-${GH_TOKEN:-}}"
+    local token="${CICD_READ_TOKEN:-${CICD_WRITE_TOKEN:-${VENDOR_PAT:-${GH_TOKEN:-}}}}"
     if [ -n "$token" ]; then
         echo "Authorization: token $token"
     fi

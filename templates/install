@@ -19,13 +19,21 @@ Output (key=value lines for workflow consumption):
     changed=true|false
 
 Environment:
-    GITHUB_TOKEN - Auth for public repos; opens the PR in --pr mode when
-                   VENDOR_PAT is not set (such a PR gets no checks)
-    VENDOR_PAT   - Auth for private repos (vendor.private: true). In --pr
-                   mode, also pushes the install branch when it carries
-                   workflow files (needs workflow write permission), and
-                   opens the PR and requests auto-merge, so checks run
-    GH_TOKEN     - Fallback auth token
+    CICD_WRITE_TOKEN - In --pr mode, pushes the install branch when it
+                       carries workflow files (needs workflow write
+                       permission), opens the PR and requests auto-merge,
+                       so the PR's checks run. Also reads private vendors
+                       when CICD_READ_TOKEN is not set. Under CI
+                       (GITHUB_ACTIONS set), --pr fails before changing
+                       anything when it is missing, unless
+                       --allow-workflow-token is given.
+    CICD_READ_TOKEN  - Reads private vendor repos (vendor.private: true);
+                       needs no write permission
+    VENDOR_PAT       - Deprecated: still read when CICD_WRITE_TOKEN (for
+                       writing) or both new names (for reading) are unset
+    GITHUB_TOKEN     - Auth for public repos; opens the PR in --pr mode when
+                       no write token is set (such a PR gets no checks)
+    GH_TOKEN         - Fallback auth token
 
     The arguments can also be given through the environment (command-line
     arguments win):
@@ -204,12 +212,30 @@ def save_config(config):
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
 
+WRITE_TOKEN_ENV = "CICD_WRITE_TOKEN"
+READ_TOKEN_ENV = "CICD_READ_TOKEN"
+LEGACY_TOKEN_ENV = "VENDOR_PAT"  # deprecated; still read
+ALLOW_WORKFLOW_TOKEN_FLAG = "--allow-workflow-token"
+
+
+def write_token():
+    """Token that may propose changes: CICD_WRITE_TOKEN, else VENDOR_PAT."""
+    return (os.environ.get(WRITE_TOKEN_ENV, "")
+            or os.environ.get(LEGACY_TOKEN_ENV, ""))
+
+
+def read_token():
+    """Token that may read private vendors: read, then write, then old."""
+    return os.environ.get(READ_TOKEN_ENV, "") or write_token()
+
+
 def get_auth_token(vendor_config=None, private=False):
     """Get the appropriate auth token for a vendor."""
     if private or (vendor_config and vendor_config.get("private")):
-        token = os.environ.get("VENDOR_PAT", "")
+        token = read_token()
         if not token:
-            print("::error::VENDOR_PAT required for private vendor repos")
+            print(f"::error::{READ_TOKEN_ENV} (or {WRITE_TOKEN_ENV}) required "
+                  "for private vendor repos")
             sys.exit(1)
         return token
     return os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
@@ -1255,7 +1281,7 @@ def push_branch(branch, token=None):
     --force-with-lease: these install branches are ephemeral automation
     artifacts; a stale remote ref from a prior run must not block the push.
 
-    With a token (VENDOR_PAT), it is passed as an http.extraheader for
+    With a token (the write token), it is passed as an http.extraheader for
     github.com in the command's own -c options: never printed, never written
     to .git/config. actions/checkout persists its own GITHUB_TOKEN header
     under the same key, so an empty value is given first, which resets the
@@ -1298,14 +1324,41 @@ def workflow_files_note(results, paths):
             lines.append(f"- {vendor}: run `python3 .vendored/install "
                          f"{vendor} --force` with a token that may write "
                          "workflow files and commit `.github/workflows/`")
-    lines += ["", "Set a `VENDOR_PAT` secret with workflow write permission "
-              "to carry them in future install PRs."]
+    lines += ["", f"Set a `{WRITE_TOKEN_ENV}` secret with workflow write "
+              "permission, declared by the job that runs the install, to "
+              "carry them in future install PRs."]
     return "\n".join(lines)
+
+
+def require_write_token_in_ci(allow_workflow_token=False):
+    """Fail --pr under CI when no write token is set, before anything changes.
+
+    Without CICD_WRITE_TOKEN (or the deprecated VENDOR_PAT) the pull request
+    would be opened with the workflow's own GITHUB_TOKEN: GitHub starts no
+    workflows for it, so it gets no checks and cannot merge where a verdict
+    is required, and where Actions may not open pull requests the run fails
+    after pushing its branch. Outside CI (GITHUB_ACTIONS unset), or with
+    --allow-workflow-token, nothing is checked.
+    """
+    if allow_workflow_token or not os.environ.get("GITHUB_ACTIONS"):
+        return
+    if write_token():
+        return
+    print(f"::error::--pr needs a {WRITE_TOKEN_ENV} secret in CI: without it "
+          "the pull request would be opened with the workflow's own token, "
+          "so no checks would run on it (and where GitHub Actions may not "
+          "open pull requests, the run would fail after pushing its branch).")
+    print(f"Add a {WRITE_TOKEN_ENV} secret (a token that may push branches, "
+          "open pull requests and write workflow files) and declare it in "
+          "the git-cicd job that runs this install, so the job is given it.")
+    print(f"To open the pull request with the workflow's own token on "
+          f"purpose, pass {ALLOW_WORKFLOW_TOKEN_FLAG}. Nothing was changed.")
+    sys.exit(1)
 
 
 NO_CHECKS_NOTE = (
     "\n\nOpened with the workflow's own token, so no checks will run on "
-    "this pull request; a `VENDOR_PAT` secret changes that.")
+    f"this pull request; a `{WRITE_TOKEN_ENV}` secret changes that.")
 
 
 def create_pull_request(results):
@@ -1319,10 +1372,11 @@ def create_pull_request(results):
     title = meta["title"]
     body = meta["body"]
 
-    # The pull request is opened (and auto-merge requested) with VENDOR_PAT
-    # when it is set: GitHub starts no workflows for a pull request opened
-    # with a workflow's own GITHUB_TOKEN, so it would get no checks.
-    pat = os.environ.get("VENDOR_PAT", "")
+    # The pull request is opened (and auto-merge requested) with the write
+    # token (CICD_WRITE_TOKEN, else the deprecated VENDOR_PAT) when it is set:
+    # GitHub starts no workflows for a pull request opened with a workflow's
+    # own GITHUB_TOKEN, so it would get no checks.
+    pat = write_token()
     gh_env = os.environ.copy()
     github_token = os.environ.get("GITHUB_TOKEN", "")
     pr_token = pat or github_token
@@ -1347,7 +1401,7 @@ def create_pull_request(results):
 
     # Workflow files (.github/workflows/) this install wrote or removed.
     # The workflow's own GITHUB_TOKEN may not push them (it lacks the
-    # `workflows` permission), so they are kept only when VENDOR_PAT is set
+    # `workflows` permission), so they are kept only when a write token is set
     # and the push is made with it; otherwise they are unstaged and the PR
     # body lists them with what to run and commit.
     workflow_files = staged_workflow_files()
@@ -1361,8 +1415,9 @@ def create_pull_request(results):
     if diff_result.returncode == 0:
         print("No changes to commit")
         if left_out:
-            print("Workflow files changed but were left out (set VENDOR_PAT "
-                  "to a token that may write workflows to carry them):")
+            print(f"Workflow files changed but were left out (set "
+                  f"{WRITE_TOKEN_ENV} to a token that may write workflows "
+                  "to carry them):")
             for path in left_out:
                 print(f"  {path}")
         return
@@ -1384,7 +1439,7 @@ def create_pull_request(results):
     push_result = push_branch(branch, pat if keep_workflows else None)
     if (push_result.returncode != 0 and keep_workflows
             and "workflow" in (push_result.stderr or "").lower()):
-        # VENDOR_PAT may not write workflow files: leave them out and push
+        # The write token may not write workflow files: leave them out and push
         # the rest, so the install still ends with a pull request.
         print("Push with workflow files was refused (the token may not "
               "write workflows); retrying without them")
@@ -1432,7 +1487,8 @@ def create_pull_request(results):
         print(f"  gh pr create --head {branch} --base main --fill")
         if not pat:
             print("If GitHub Actions may not create pull requests here, set "
-                  "a VENDOR_PAT secret so the pull request is opened with it.")
+                  f"a {WRITE_TOKEN_ENV} secret so the pull request is opened "
+                  "with it.")
         sys.exit(1)
 
     pr_url = pr_result.stdout.strip()
@@ -1768,7 +1824,14 @@ def main():
     )
     parser.add_argument(
         "--private", action="store_true",
-        help="Treat vendor as private (use VENDOR_PAT for auth)"
+        help="Treat vendor as private (read it with CICD_READ_TOKEN, "
+             "else CICD_WRITE_TOKEN)"
+    )
+    parser.add_argument(
+        ALLOW_WORKFLOW_TOKEN_FLAG, action="store_true",
+        dest="allow_workflow_token",
+        help="With --pr under CI and no CICD_WRITE_TOKEN, open the pull "
+             "request with the workflow's own token anyway (it gets no checks)"
     )
     args = parser.parse_args()
 
@@ -1796,6 +1859,9 @@ def main():
         print("Expected one of: <vendor> (a registered vendor name), "
               "owner/repo, or all")
         sys.exit(1)
+
+    if args.pr:
+        require_write_token_in_ci(args.allow_workflow_token)
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
     if _should_migrate_config():

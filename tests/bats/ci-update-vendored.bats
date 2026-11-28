@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # ci/update-vendored.sh: hands the update-vendored job's CICD_INPUT_ values
 # to the installed .vendored/install as argv elements, with GH_TOKEN from
-# VENDOR_PAT when it is set.
+# CICD_WRITE_TOKEN, else the deprecated VENDOR_PAT, when one is set.
 
 load ci-helpers
 
@@ -74,14 +74,29 @@ first_line() { head -n 1 "$STUB_LOG"; }
     [ ! -e "$ROOT/pwned-tick" ]
 }
 
-@test "VENDOR_PAT becomes GH_TOKEN and is never echoed" {
+@test "CICD_WRITE_TOKEN becomes GH_TOKEN, over VENDOR_PAT, and is never echoed" {
+    run_update CICD_WRITE_TOKEN=secret-write-value VENDOR_PAT=secret-pat-value \
+        GITHUB_TOKEN=workflow-token
+    [ "$status" -eq 0 ]
+    logged "gh_token=secret-write-value github_token=workflow-token"
+    [[ "$output" != *secret-write-value* ]]
+    [[ "$output" != *secret-pat-value* ]]
+}
+
+@test "an empty CICD_WRITE_TOKEN falls back to VENDOR_PAT" {
+    run_update CICD_WRITE_TOKEN= VENDOR_PAT=secret-pat-value GITHUB_TOKEN=workflow-token
+    [ "$status" -eq 0 ]
+    logged "gh_token=secret-pat-value github_token=workflow-token"
+}
+
+@test "VENDOR_PAT alone becomes GH_TOKEN and is never echoed" {
     run_update VENDOR_PAT=secret-pat-value GITHUB_TOKEN=workflow-token
     [ "$status" -eq 0 ]
     logged "gh_token=secret-pat-value github_token=workflow-token"
     [[ "$output" != *secret-pat-value* ]]
 }
 
-@test "without VENDOR_PAT, GH_TOKEN and GITHUB_TOKEN are left as they are" {
+@test "without a write token, GH_TOKEN and GITHUB_TOKEN are left as they are" {
     run_update GH_TOKEN=gh-token GITHUB_TOKEN=workflow-token
     [ "$status" -eq 0 ]
     logged "gh_token=gh-token github_token=workflow-token"
@@ -99,8 +114,11 @@ first_line() { head -n 1 "$STUB_LOG"; }
 }
 
 @test "ci_setup removes token variables the outer environment holds" {
+    export CICD_WRITE_TOKEN=outer-fake-write CICD_READ_TOKEN=outer-fake-read
     export VENDOR_PAT=outer-fake-pat GH_TOKEN=outer-fake-gh GITHUB_TOKEN=outer-fake-gt
     BATS_TEST_TMPDIR="$BATS_TEST_TMPDIR/again" ci_setup
+    [ -z "${CICD_WRITE_TOKEN+set}" ]
+    [ -z "${CICD_READ_TOKEN+set}" ]
     [ -z "${VENDOR_PAT+set}" ]
     [ -z "${GH_TOKEN+set}" ]
     [ -z "${GITHUB_TOKEN+set}" ]

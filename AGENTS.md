@@ -43,7 +43,8 @@ creates the GitHub release, or does nothing if that version is tagged; it
 pushes nothing to `main`),
 `update-vendored` (cron Mondays 09:00 UTC on `main`; `ci/update-vendored.sh`
 runs `.vendored/install <vendor> --version <version> --pr --deps=install`,
-`GH_TOKEN` from `VENDOR_PAT` when set) and `validate` (manual only;
+`GH_TOKEN` from `CICD_WRITE_TOKEN`, else the deprecated `VENDOR_PAT`,
+when set) and `validate` (manual only;
 `ci/validate.sh` runs `validate <repo> --version <version>`). Start one by
 hand: Actions tab -> **Manual** workflow -> Run workflow, `job` = the job name,
 `inputs` = its inputs as a JSON object of strings:
