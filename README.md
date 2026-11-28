@@ -286,7 +286,7 @@ This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_I
 
 git-vendored's own pull request checks run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
 
-- `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names, plus `pytest` and `pyyaml`, into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` with it.
+- `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names, plus `pytest` and `pyyaml`, plus `coverage` (with a startup hook so subprocess runs are measured), into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` under coverage with it and prints the line coverage of the six shipped Python scripts (`templates/install`, `templates/check`, `templates/remove`, `templates/audit`, `templates/feedback`, `validate`): `Stmts` executable lines, `Miss` lines no test ran, `Cover` the percentage, `Missing` their line numbers. Scripts a test starts as a subprocess are counted too. For one file: `python -m coverage report --include=templates/check` after a run.
 - `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
 
 Documents and tracker records (`*.md`, `docs/**`, `.pearls/issues.jsonl`, `.pearls/docs/**`, `.madreperla/sessions.jsonl`, ...) are in `needs_nothing`, so a change to them alone needs no job. No Python version is written in any workflow: `pyproject.toml` is the one place it is declared.

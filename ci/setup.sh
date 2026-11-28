@@ -4,8 +4,9 @@
 # Reads the Python floor from requires-python in pyproject.toml, uses that
 # Python if present (python3.X, the runner tool cache) or installs it with uv
 # (itself installed into a small venv when missing), and installs what the
-# test suite needs (pytest, pyyaml) into a virtualenv ci/test.sh finds on
-# disk. No Python version is written in the workflow or the config: this
+# test suite needs (pytest, pyyaml, coverage) into a virtualenv ci/test.sh
+# finds on disk, with a .pth startup hook so Python processes the tests start
+# as subprocesses are measured too. No Python version is written in the workflow or the config: this
 # script is the only place that decides it.
 set -euo pipefail
 
@@ -50,5 +51,13 @@ fi
 
 "$PYTHON" -m venv --clear "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet pytest pyyaml
+# coverage 7.6 is the last line that supports Python 3.8 (the floor); [toml]
+# pulls tomli there so the [tool.coverage] settings in pyproject.toml are read.
+"$VENV/bin/python" -m pip install --quiet pytest pyyaml "coverage[toml]>=7.2,<7.7"
+# Subprocess measurement: every interpreter started from this venv runs this
+# hook, which starts coverage only when COVERAGE_PROCESS_START is set (as
+# ci/test.sh does). coverage 7.10's patch = ["subprocess"] would replace it,
+# but does not support Python 3.8.
+SITE="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+echo "import coverage; coverage.process_startup()" > "$SITE/git-vendored-coverage.pth"
 "$VENV/bin/python" --version

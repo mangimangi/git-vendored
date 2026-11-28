@@ -48,6 +48,30 @@ locally the same way:
 ```
 
 Or just the suite: `pip install pytest pyyaml && python3 -m pytest tests/ -v`.
+
+### Coverage
+
+The `test` job measures line coverage of the six Python scripts the repo
+ships, and nothing else: `templates/install`, `templates/check`,
+`templates/remove`, `templates/audit`, `templates/feedback` and `validate`
+(named by path in `[tool.coverage.run]` in `pyproject.toml`, since they have
+no `.py` extension; `tests/` and `.vendored/` are not measured). `ci/test.sh`
+runs `coverage run -m pytest tests/ -v`, then `coverage combine` and
+`coverage report`.
+
+Subprocess runs count: `ci/setup.sh` puts a `.pth` startup hook
+(`coverage.process_startup()`) in the floor venv, and `ci/test.sh` exports
+`COVERAGE_PROCESS_START` and `GIT_VENDORED_ROOT`, so a script a test starts as
+a program is measured too (`tests/test_entrypoints.py` does this for the
+`__main__` lines). `tests/conftest.py` keeps those variables in any `env=` a
+test passes to subprocess. Use the venv (`git-cicd check --setup` once) for
+the same figures as CI; without the hook `ci/test.sh` warns that subprocess
+runs are not counted.
+
+Reading the report: `Stmts` is the executable lines in the file, `Miss` how
+many of them no test ran, `Cover` the percentage run, and `Missing` the line
+numbers (ranges like `100-113`) still untested. To see one file after a run:
+`<venv>/bin/python -m coverage report --include=templates/check`.
 After changing the git-cicd config, run `.vendored/pkg/git-cicd/git-cicd generate`
 and commit `.github/workflows/git-cicd-open.yml`.
 
