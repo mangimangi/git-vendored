@@ -561,3 +561,68 @@ class TestVendorLibEnvVar:
         """VENDOR_LIB should not be set when .vendored/lib/vendor-helpers.sh is missing."""
         lib_path = str((tmp_repo / ".vendored" / "lib" / "vendor-helpers.sh").resolve())
         assert not os.path.isfile(lib_path)
+
+
+# ── Checkout mode: VENDOR_CHECKOUT given by the framework ────────────────
+
+@pytest.fixture
+def checkout_mode(tmp_repo, mock_server):
+    """The fake repo as a vendor checkout; curl and gh fail if called."""
+    repo_dir, _ = mock_server
+    deny_bin = tmp_repo / "deny_bin"
+    deny_bin.mkdir()
+    for tool in ("curl", "gh"):
+        stub = deny_bin / tool
+        stub.write_text(f"#!/bin/bash\necho '{tool} called' >&2\nexit 99\n")
+        stub.chmod(0o755)
+    return repo_dir, deny_bin
+
+
+class TestCheckoutMode:
+    def test_fetch_file_copies_from_checkout(self, tmp_repo, checkout_mode):
+        repo_dir, deny_bin = checkout_mode
+        manifest = tmp_repo / "manifest.txt"
+        result = run_helper_script(
+            tmp_repo, deny_bin,
+            'fetch_file "script.sh" "out/script.sh" +x',
+            {"VENDOR_CHECKOUT": str(repo_dir), "VENDOR_MANIFEST": str(manifest),
+             "GH_TOKEN": "fake-token"},
+        )
+        assert result.returncode == 0, result.stderr
+        out = tmp_repo / "out" / "script.sh"
+        assert out.read_bytes() == (repo_dir / "script.sh").read_bytes()
+        assert os.access(out, os.X_OK)
+        assert manifest.read_text() == "out/script.sh\n"
+
+    def test_fetch_dir_copies_tree(self, tmp_repo, checkout_mode):
+        repo_dir, deny_bin = checkout_mode
+        manifest = tmp_repo / "manifest.txt"
+        result = run_helper_script(
+            tmp_repo, deny_bin,
+            'fetch_dir "lib" "out/lib"',
+            {"VENDOR_CHECKOUT": str(repo_dir), "VENDOR_MANIFEST": str(manifest)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert sorted(manifest.read_text().split()) == [
+            "out/lib/core.py", "out/lib/utils.py"]
+        assert (tmp_repo / "out" / "lib" / "utils.py").read_text() == "# utils\n"
+
+    def test_missing_file_fails(self, tmp_repo, checkout_mode):
+        repo_dir, deny_bin = checkout_mode
+        result = run_helper_script(
+            tmp_repo, deny_bin, 'fetch_file "nope" "out/nope"',
+            {"VENDOR_CHECKOUT": str(repo_dir)},
+        )
+        assert result.returncode != 0
+        assert "nope not found in the vendor checkout" in result.stderr
+        assert "called" not in result.stderr
+
+    def test_empty_checkout_falls_back_to_download(self, tmp_repo, mock_server):
+        repo_dir, mock_bin = mock_server
+        result = run_helper_script(
+            tmp_repo, mock_bin, 'fetch_file "script.sh" "out/script.sh"',
+            {"VENDOR_CHECKOUT": ""},
+        )
+        assert result.returncode == 0, result.stderr
+        assert (tmp_repo / "out" / "script.sh").read_text() == \
+            "#!/bin/bash\necho hello\n"

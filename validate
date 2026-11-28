@@ -4,19 +4,49 @@
 Standalone validation tool — does not install the vendor, just checks contract
 compliance. Eight checks covering the full v2 vendor contract.
 
+The vendor is read with git, the same way an install reads it: its version
+tags from `git ls-remote --tags`, then one shallow fetch at the version's tag
+into a temporary directory outside the repository, removed afterwards. Both
+come from templates/install, which this script ships next to.
+
 Usage:
-    python3 validate <owner/repo> [--version <version>]
+    python3 validate <url|owner/repo> [--version <version>]
+
+    <url> is any URL git can fetch (https://, ssh://, git@host:path,
+    file://); owner/repo means that repository on github.com.
 
 Environment:
-    GH_TOKEN / GITHUB_TOKEN - Auth token for GitHub API access
+    GH_TOKEN / GITHUB_TOKEN - Token handed to git (and to the dry-run
+                              install.sh as GH_TOKEN) for private repos;
+                              with none, git reads anonymously
 """
 
 import argparse
-import base64
+import contextlib
+import importlib.machinery
+import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HELPERS_LIB = os.path.join(HERE, "templates", "lib", "vendor-helpers.sh")
+
+
+def _load_install():
+    """Load templates/install as a module: its tag listing and fetch."""
+    path = os.path.join(HERE, "templates", "install")
+    loader = importlib.machinery.SourceFileLoader("gv_validate_install", path)
+    spec = importlib.util.spec_from_loader("gv_validate_install", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+INSTALL = _load_install()
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────
@@ -27,7 +57,7 @@ def get_auth_token():
 
 
 def _gh_env(token):
-    """Build environment dict with GH_TOKEN set."""
+    """Environment for the dry-run install.sh, with GH_TOKEN set."""
     env = os.environ.copy()
     if token:
         env["GH_TOKEN"] = token
@@ -81,93 +111,51 @@ class ValidationResult:
 # ── Fail-fast checks (1-3) ──────────────────────────────────────────────
 
 def check_repo_exists(repo, token, result):
-    """Check 1: Repo exists and is accessible."""
-    env = _gh_env(token)
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}", "--jq", ".full_name"],
-        capture_output=True, text=True, env=env
-    )
-    if proc.returncode != 0:
+    """Check 1: Repo exists and is accessible (git ls-remote).
+
+    Returns the repo's tags (tag -> commit), or None.
+    """
+    tags = INSTALL.ls_remote_tags(repo, token)
+    if tags is None:
         result.failed("Repo exists", f"cannot access {repo}")
-        return False
+        return None
     result.passed("Repo exists")
-    return True
+    return tags
 
 
-def check_install_sh_exists(repo, token, result):
-    """Check 2: install.sh exists at repo root."""
-    env = _gh_env(token)
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/install.sh", "--jq", ".name"],
-        capture_output=True, text=True, env=env
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
+def resolve(tags, requested_version):
+    """Resolve a version as an install does: (Resolved, None) or (None, why)."""
+    return INSTALL.pick_version(tags, requested_version or "latest")
+
+
+def check_install_sh_exists(repo, checkout, result):
+    """Check 2: install.sh exists at repo root, at the version's tag."""
+    if checkout is None or not os.path.isfile(
+            os.path.join(checkout, "install.sh")):
         result.failed("install.sh exists", f"no install.sh at root of {repo}")
         return False
     result.passed("install.sh exists")
     return True
 
 
-def check_version_resolvable(repo, token, requested_version, result):
-    """Check 3: Version is resolvable. Returns resolved version or None."""
-    if requested_version and requested_version != "latest":
-        result.passed("Version resolvable", requested_version)
-        return requested_version
-
-    env = _gh_env(token)
-
-    # Try releases API first
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
-        capture_output=True, text=True, env=env
-    )
-    if proc.returncode == 0 and proc.stdout.strip():
-        version = proc.stdout.strip().lstrip("v")
-        result.passed("Version resolvable", version)
-        return version
-
-    # Fallback to VERSION file
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/VERSION", "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-    if proc.returncode == 0 and proc.stdout.strip():
-        try:
-            version = base64.b64decode(proc.stdout.strip()).decode().strip()
-            if version:
-                result.passed("Version resolvable", version)
-                return version
-        except Exception:
-            pass
-
-    result.failed("Version resolvable", "no releases or VERSION file found")
-    return None
+def check_version_resolvable(resolved, reason, result):
+    """Check 3: Version is resolvable from the repo's version tags."""
+    if resolved is None:
+        result.failed("Version resolvable", reason)
+        return None
+    result.passed("Version resolvable", resolved.version)
+    return resolved.version
 
 
 # ── Collect-and-report checks (4-8) ─────────────────────────────────────
 
-def download_install_sh(repo, version, token):
-    """Download install.sh content from the repo at the given version."""
-    env = _gh_env(token)
-    ref = f"v{version}"
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/install.sh?ref={ref}",
-         "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-    if proc.returncode != 0 or not proc.stdout.strip():
-        # Retry without v prefix
-        proc = subprocess.run(
-            ["gh", "api", f"repos/{repo}/contents/install.sh?ref={version}",
-             "--jq", ".content"],
-            capture_output=True, text=True, env=env
-        )
-    if proc.returncode == 0 and proc.stdout.strip():
-        try:
-            return base64.b64decode(proc.stdout.strip()).decode()
-        except Exception:
-            return None
-    return None
+def read_install_sh(checkout):
+    """Read install.sh from the vendor checkout, or None."""
+    try:
+        with open(os.path.join(checkout, "install.sh")) as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def check_valid_shebang(script_content, result):
@@ -207,8 +195,14 @@ def check_syntax_valid(script_content, result):
         os.unlink(tmp_path)
 
 
-def run_dryrun_install(repo, version, script_content, token, result):
-    """Checks 6-8: Dry-run install in sandbox, manifest written, files exist."""
+def run_dryrun_install(repo, version, script_content, token, result,
+                       checkout=None, ref=None):
+    """Checks 6-8: Dry-run install in sandbox, manifest written, files exist.
+
+    With `checkout`, install.sh gets VENDOR_CHECKOUT and VENDOR_LIB (this
+    repository's helper library), so a vendor using the helpers validates
+    from the checkout without the network.
+    """
     if script_content is None:
         result.failed("Dry-run install", "could not download install.sh")
         result.failed("Manifest written", "skipped (no install.sh)")
@@ -218,7 +212,7 @@ def run_dryrun_install(repo, version, script_content, token, result):
     sandbox = tempfile.mkdtemp(prefix="gv-validate-")
     try:
         # Set up sandbox paths
-        vendor_name = repo.split("/")[-1] if "/" in repo else repo
+        vendor_name = INSTALL.vendor_name_for(repo)
         install_dir = os.path.join(".vendored", "pkg", vendor_name)
         manifest_file = os.path.join(sandbox, "manifest.files")
         script_path = os.path.join(sandbox, "install.sh")
@@ -235,9 +229,12 @@ def run_dryrun_install(repo, version, script_content, token, result):
         # Build environment
         env = _gh_env(token)
         env["VENDOR_REPO"] = repo
-        env["VENDOR_REF"] = f"v{version}"
+        env["VENDOR_REF"] = ref or f"v{version}"
         env["VENDOR_MANIFEST"] = manifest_file
         env["VENDOR_INSTALL_DIR"] = install_dir
+        if checkout:
+            env["VENDOR_CHECKOUT"] = os.path.abspath(checkout)
+            env["VENDOR_LIB"] = HELPERS_LIB
 
         # Check 6: Dry-run succeeds
         proc = subprocess.run(
@@ -289,11 +286,19 @@ def run_dryrun_install(repo, version, script_content, token, result):
 
     finally:
         # Clean up sandbox
-        import shutil
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
+
+def _fetch(stack, repo, resolved, token):
+    """Fetch the vendor at the resolved tag, as an install does; or None."""
+    try:
+        return stack.enter_context(
+            INSTALL.fetch_vendor(repo, resolved.tag, token, resolved.commit))
+    except SystemExit:
+        return None
+
 
 def validate(repo, requested_version=None):
     """Run all validation checks against a repo. Returns exit code."""
@@ -302,27 +307,34 @@ def validate(repo, requested_version=None):
 
     print(f"\nValidating vendor contract: {repo}\n")
 
-    # Fail-fast checks (1-3)
-    if not check_repo_exists(repo, token, result):
+    # Fail-fast checks (1-3), reported in that order. Check 2 is evaluated
+    # at the resolved tag, so the version is resolved (silently) first.
+    tags = check_repo_exists(repo, token, result)
+    if tags is None:
         print(f"\n{result.summary()}")
         return 1
 
-    if not check_install_sh_exists(repo, token, result):
+    resolved, reason = resolve(tags, requested_version)
+    if resolved is None:
+        result.failed("install.sh exists", "skipped (no version)")
+        check_version_resolvable(resolved, reason, result)
         print(f"\n{result.summary()}")
         return 1
 
-    version = check_version_resolvable(repo, token, requested_version, result)
-    if version is None:
-        print(f"\n{result.summary()}")
-        return 1
+    with contextlib.ExitStack() as stack:
+        checkout = _fetch(stack, repo, resolved, token)
+        if not check_install_sh_exists(repo, checkout, result):
+            print(f"\n{result.summary()}")
+            return 1
+        version = check_version_resolvable(resolved, reason, result)
 
-    # Download install.sh for remaining checks
-    script_content = download_install_sh(repo, version, token)
+        script_content = read_install_sh(checkout)
 
-    # Collect-and-report checks (4-8)
-    check_valid_shebang(script_content, result)
-    check_syntax_valid(script_content, result)
-    run_dryrun_install(repo, version, script_content, token, result)
+        # Collect-and-report checks (4-8)
+        check_valid_shebang(script_content, result)
+        check_syntax_valid(script_content, result)
+        run_dryrun_install(repo, version, script_content, token, result,
+                           checkout=checkout, ref=resolved.tag)
 
     print(f"\n{result.summary()}")
     return 0 if result.all_passed else 1
@@ -332,7 +344,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Validate whether a repo implements the git-vendored "
                     "vendor contract.")
-    parser.add_argument("repo", help="GitHub repo to validate (owner/repo)")
+    parser.add_argument("repo", help="Repo to validate: a git URL, or "
+                                     "owner/repo for github.com")
     parser.add_argument("--version", default="latest",
                         help="Version to validate against (default: latest)")
     args = parser.parse_args()

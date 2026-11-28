@@ -4,7 +4,8 @@
 # repository's own `validate` (nothing is installed).
 #
 # git-cicd hands the job's declared inputs to the step as CICD_INPUT_
-# variables: CICD_INPUT_REPO (owner/repo, required) and CICD_INPUT_VERSION
+# variables: CICD_INPUT_REPO (a git URL, or owner/repo for github.com;
+# required) and CICD_INPUT_VERSION
 # (default latest). Each is one argv element, never part of a shell string.
 set -euo pipefail
 

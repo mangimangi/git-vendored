@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -86,46 +87,49 @@ class TestValidationResult:
         assert r.all_passed is False
 
 
+SHA = "a" * 40
+
+
+def _resolved(version="1.0.0", tag=None, commit=SHA):
+    return val.INSTALL.Resolved(version, tag or f"v{version}", commit)
+
+
 # ── Tests: check_repo_exists (Check 1) ──────────────────────────────────
 
 class TestCheckRepoExists:
-    @patch("vendored_validate.subprocess.run")
-    def test_pass(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="owner/repo\n")
+    def test_pass(self, vendor_repo):
+        repo = vendor_repo()
+        commit = repo.commit("one")
+        repo.tag("v1.0.0")
         r = val.ValidationResult()
-        assert val.check_repo_exists("owner/repo", "tok", r) is True
-        assert r.pass_count == 1
+        assert val.check_repo_exists(repo.url, None, r) == {"v1.0.0": commit}
+        assert r.checks == [("PASS", "  [PASS] Repo exists")]
 
-    @patch("vendored_validate.subprocess.run")
-    def test_fail(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not found")
+    def test_fail(self, vendor_repo, tmp_path):
+        url = (tmp_path / "missing").as_uri()
         r = val.ValidationResult()
-        assert val.check_repo_exists("owner/repo", "tok", r) is False
-        assert r.fail_count == 1
+        assert val.check_repo_exists(url, "tok", r) is None
+        assert r.checks == [("FAIL", f"  [FAIL] Repo exists -- cannot access {url}")]
 
 
 # ── Tests: check_install_sh_exists (Check 2) ────────────────────────────
 
 class TestCheckInstallShExists:
-    @patch("vendored_validate.subprocess.run")
-    def test_pass(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="install.sh\n")
+    def test_pass(self, tmp_path):
+        (tmp_path / "install.sh").write_text("#!/bin/bash\n")
         r = val.ValidationResult()
-        assert val.check_install_sh_exists("owner/repo", "tok", r) is True
-        assert r.pass_count == 1
+        assert val.check_install_sh_exists("owner/repo", str(tmp_path), r) is True
+        assert r.checks == [("PASS", "  [PASS] install.sh exists")]
 
-    @patch("vendored_validate.subprocess.run")
-    def test_fail_not_found(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+    def test_fail_not_found(self, tmp_path):
         r = val.ValidationResult()
-        assert val.check_install_sh_exists("owner/repo", "tok", r) is False
-        assert r.fail_count == 1
+        assert val.check_install_sh_exists("owner/repo", str(tmp_path), r) is False
+        assert r.checks == [("FAIL", "  [FAIL] install.sh exists -- "
+                                     "no install.sh at root of owner/repo")]
 
-    @patch("vendored_validate.subprocess.run")
-    def test_fail_empty_stdout(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="")
+    def test_fail_no_checkout(self):
         r = val.ValidationResult()
-        assert val.check_install_sh_exists("owner/repo", "tok", r) is False
+        assert val.check_install_sh_exists("owner/repo", None, r) is False
         assert r.fail_count == 1
 
 
@@ -133,82 +137,46 @@ class TestCheckInstallShExists:
 
 class TestCheckVersionResolvable:
     def test_explicit_version(self):
-        """Explicit version (not 'latest') passes immediately."""
         r = val.ValidationResult()
-        v = val.check_version_resolvable("owner/repo", "tok", "1.2.3", r)
-        assert v == "1.2.3"
-        assert r.pass_count == 1
+        resolved, reason = val.resolve({"v1.2.3": SHA}, "1.2.3")
+        assert val.check_version_resolvable(resolved, reason, r) == "1.2.3"
+        assert r.checks == [("PASS", "  [PASS] Version resolvable (1.2.3)")]
 
-    @patch("vendored_validate.subprocess.run")
-    def test_resolves_from_releases(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="v2.0.0\n")
-        r = val.ValidationResult()
-        v = val.check_version_resolvable("owner/repo", "tok", "latest", r)
-        assert v == "2.0.0"
-        assert r.pass_count == 1
-
-    @patch("vendored_validate.subprocess.run")
-    def test_resolves_from_version_file(self, mock_run):
-        """Falls back to VERSION file when no releases."""
-        encoded = base64.b64encode(b"3.0.0").decode()
-
-        def side_effect(cmd, **kwargs):
-            if "releases/latest" in cmd[2]:
-                return MagicMock(returncode=1, stdout="")
-            if "contents/VERSION" in cmd[2]:
-                return MagicMock(returncode=0, stdout=encoded + "\n")
-            return MagicMock(returncode=1, stdout="")
-
-        mock_run.side_effect = side_effect
-        r = val.ValidationResult()
-        v = val.check_version_resolvable("owner/repo", "tok", "latest", r)
-        assert v == "3.0.0"
-        assert r.pass_count == 1
-
-    @patch("vendored_validate.subprocess.run")
-    def test_fail_no_version(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="")
-        r = val.ValidationResult()
-        v = val.check_version_resolvable("owner/repo", "tok", "latest", r)
-        assert v is None
-        assert r.fail_count == 1
+    def test_latest_is_highest_version_tag(self):
+        resolved, _ = val.resolve({"v0.0.9": SHA, "v0.0.10": "b" * 40,
+                                   "latest": SHA}, "latest")
+        assert resolved == _resolved("0.0.10", commit="b" * 40)
 
     def test_none_version_treated_as_latest(self):
-        """None version should try to resolve (same as 'latest')."""
+        resolved, _ = val.resolve({"v1.0.0": SHA}, None)
+        assert resolved.version == "1.0.0"
+
+    def test_fail_no_version_tags(self):
         r = val.ValidationResult()
-        with patch("vendored_validate.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout="v1.0.0\n")
-            v = val.check_version_resolvable("owner/repo", "tok", None, r)
-            assert v == "1.0.0"
+        resolved, reason = val.resolve({"latest": SHA}, "latest")
+        assert val.check_version_resolvable(resolved, reason, r) is None
+        assert r.checks == [("FAIL", "  [FAIL] Version resolvable -- "
+                                     "no version tags found")]
+
+    def test_fail_explicit_without_tag(self):
+        r = val.ValidationResult()
+        resolved, reason = val.resolve({"v1.0.0": SHA}, "2.0.0")
+        val.check_version_resolvable(resolved, reason, r)
+        assert r.checks == [("FAIL", "  [FAIL] Version resolvable -- "
+                                     "no tag for 2.0.0")]
 
 
-# ── Tests: download_install_sh ───────────────────────────────────────────
+# ── Tests: read_install_sh ───────────────────────────────────────────────
 
-class TestDownloadInstallSh:
-    @patch("vendored_validate.subprocess.run")
-    def test_download_with_v_prefix(self, mock_run):
-        content = base64.b64encode(b"#!/bin/bash\necho hi\n").decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=content + "\n")
-        result = val.download_install_sh("owner/repo", "1.0.0", "tok")
-        assert result == "#!/bin/bash\necho hi\n"
-        # Should use v prefix
-        assert "ref=v1.0.0" in mock_run.call_args_list[0][0][0][2]
+class TestReadInstallSh:
+    def test_reads_checkout(self, tmp_path):
+        (tmp_path / "install.sh").write_text("#!/bin/bash\necho hi\n")
+        assert val.read_install_sh(str(tmp_path)) == "#!/bin/bash\necho hi\n"
 
-    @patch("vendored_validate.subprocess.run")
-    def test_fallback_without_v_prefix(self, mock_run):
-        content = base64.b64encode(b"#!/bin/bash\necho hi\n").decode()
-        mock_run.side_effect = [
-            MagicMock(returncode=1, stdout=""),
-            MagicMock(returncode=0, stdout=content + "\n"),
-        ]
-        result = val.download_install_sh("owner/repo", "1.0.0", "tok")
-        assert result == "#!/bin/bash\necho hi\n"
-
-    @patch("vendored_validate.subprocess.run")
-    def test_returns_none_on_failure(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="")
-        result = val.download_install_sh("owner/repo", "1.0.0", "tok")
-        assert result is None
+    def test_missing_or_undecodable_is_none(self, tmp_path):
+        assert val.read_install_sh(str(tmp_path)) is None
+        (tmp_path / "install.sh").write_bytes(b"\xff\xfe\xfa")
+        assert val.read_install_sh(str(tmp_path)) is None
 
 
 # ── Tests: check_valid_shebang (Check 4) ────────────────────────────────
@@ -319,91 +287,6 @@ class TestRunDryrunInstall:
                     if _ == "FAIL")
 
 
-# ── Tests: validate (integration) ────────────────────────────────────────
-
-class TestValidate:
-    @patch("vendored_validate.get_auth_token", return_value="tok")
-    @patch("vendored_validate.check_repo_exists", return_value=False)
-    def test_fail_fast_repo_not_found(self, mock_check, mock_auth):
-        """Stops after check 1 failure."""
-        exit_code = val.validate("owner/repo")
-        assert exit_code == 1
-        mock_check.assert_called_once()
-
-    @patch("vendored_validate.get_auth_token", return_value="tok")
-    @patch("vendored_validate.check_repo_exists", return_value=True)
-    @patch("vendored_validate.check_install_sh_exists", return_value=False)
-    def test_fail_fast_no_install_sh(self, mock_install, mock_repo, mock_auth):
-        """Stops after check 2 failure."""
-        exit_code = val.validate("owner/repo")
-        assert exit_code == 1
-        mock_install.assert_called_once()
-
-    @patch("vendored_validate.get_auth_token", return_value="tok")
-    @patch("vendored_validate.check_repo_exists", return_value=True)
-    @patch("vendored_validate.check_install_sh_exists", return_value=True)
-    @patch("vendored_validate.check_version_resolvable", return_value=None)
-    def test_fail_fast_no_version(self, mock_ver, mock_install, mock_repo,
-                                  mock_auth):
-        """Stops after check 3 failure."""
-        exit_code = val.validate("owner/repo")
-        assert exit_code == 1
-
-    @patch("vendored_validate.get_auth_token", return_value="tok")
-    @patch("vendored_validate.check_repo_exists", return_value=True)
-    @patch("vendored_validate.check_install_sh_exists", return_value=True)
-    @patch("vendored_validate.check_version_resolvable", return_value="1.0.0")
-    @patch("vendored_validate.download_install_sh",
-           return_value="#!/bin/bash\necho hi\n")
-    @patch("vendored_validate.check_valid_shebang", return_value=True)
-    @patch("vendored_validate.check_syntax_valid", return_value=True)
-    @patch("vendored_validate.run_dryrun_install")
-    def test_all_checks_run(self, mock_dryrun, mock_syntax, mock_shebang,
-                            mock_download, mock_ver, mock_install, mock_repo,
-                            mock_auth):
-        """All checks run when fail-fast checks pass."""
-        exit_code = val.validate("owner/repo")
-        assert exit_code == 0
-        mock_shebang.assert_called_once()
-        mock_syntax.assert_called_once()
-        mock_dryrun.assert_called_once()
-
-    @patch("vendored_validate.get_auth_token", return_value="tok")
-    @patch("vendored_validate.check_repo_exists", return_value=True)
-    @patch("vendored_validate.check_install_sh_exists", return_value=True)
-    @patch("vendored_validate.check_version_resolvable", return_value="1.0.0")
-    @patch("vendored_validate.download_install_sh", return_value=None)
-    def test_collect_and_report_on_download_failure(self, mock_download,
-                                                     mock_ver, mock_install,
-                                                     mock_repo, mock_auth):
-        """Checks 4-8 all run even when download fails (collect-and-report)."""
-        exit_code = val.validate("owner/repo")
-        assert exit_code == 1
-
-    @patch("vendored_validate.get_auth_token", return_value="tok")
-    @patch("vendored_validate.check_repo_exists", return_value=True)
-    @patch("vendored_validate.check_install_sh_exists", return_value=True)
-    @patch("vendored_validate.check_version_resolvable", return_value="2.0.0")
-    @patch("vendored_validate.download_install_sh",
-           return_value="#!/bin/bash\necho hi\n")
-    @patch("vendored_validate.check_valid_shebang", return_value=True)
-    @patch("vendored_validate.check_syntax_valid", return_value=False)
-    @patch("vendored_validate.run_dryrun_install")
-    def test_returns_1_on_partial_failure(self, mock_dryrun, mock_syntax,
-                                          mock_shebang, mock_download,
-                                          mock_ver, mock_install, mock_repo,
-                                          mock_auth):
-        """Returns exit code 1 when some collect-and-report checks fail."""
-        # Simulate: syntax check failed but dryrun modifies result
-        def dryrun_side_effect(repo, version, script, token, result):
-            result.failed("Dry-run install", "exit code 1")
-            result.failed("Manifest written", "no manifest")
-            result.failed("Manifest files exist", "skipped")
-        mock_dryrun.side_effect = dryrun_side_effect
-        exit_code = val.validate("owner/repo")
-        assert exit_code == 1
-
-
 # ── Tests: main / CLI ───────────────────────────────────────────────────
 
 class TestMain:
@@ -431,61 +314,7 @@ class TestMain:
             assert exc_info.value.code == 1
 
 
-# ── Tests: decode failures, empty/large manifests ───────────────────────
-
-def _b64(text):
-    return base64.b64encode(text.encode() if isinstance(text, str) else text).decode()
-
-
-class TestDecodeFailures:
-    @patch("vendored_validate.subprocess.run")
-    def test_undecodable_version_file_fails(self, mock_run):
-        """Releases missing and VERSION content is not valid base64 -> fail."""
-        mock_run.side_effect = [
-            MagicMock(returncode=1, stdout=""),
-            MagicMock(returncode=0, stdout="abc\n"),  # bad padding
-        ]
-        r = val.ValidationResult()
-        assert val.check_version_resolvable("owner/repo", "tok", "latest", r) is None
-        assert r.checks == [("FAIL", "  [FAIL] Version resolvable -- "
-                                     "no releases or VERSION file found")]
-
-    @patch("vendored_validate.subprocess.run")
-    def test_non_utf8_version_file_fails(self, mock_run):
-        mock_run.side_effect = [
-            MagicMock(returncode=1, stdout=""),
-            MagicMock(returncode=0, stdout=_b64(b"\xff\xfe")),
-        ]
-        r = val.ValidationResult()
-        assert val.check_version_resolvable("owner/repo", "tok", "latest", r) is None
-        assert r.fail_count == 1
-
-    @patch("vendored_validate.subprocess.run")
-    def test_empty_version_file_fails(self, mock_run):
-        """A VERSION file holding only whitespace does not resolve a version."""
-        mock_run.side_effect = [
-            MagicMock(returncode=1, stdout=""),
-            MagicMock(returncode=0, stdout=_b64("\n")),
-        ]
-        r = val.ValidationResult()
-        assert val.check_version_resolvable("owner/repo", "tok", "latest", r) is None
-        assert r.pass_count == 0
-        assert r.fail_count == 1
-
-    @patch("vendored_validate.subprocess.run")
-    def test_undecodable_install_sh_returns_none(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="abc\n")
-        assert val.download_install_sh("owner/repo", "1.0.0", "tok") is None
-        assert mock_run.call_count == 1  # first ref returned content; no retry
-
-    @patch("vendored_validate.subprocess.run")
-    def test_both_refs_tried_before_giving_up(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="")
-        assert val.download_install_sh("owner/repo", "1.0.0", "tok") is None
-        refs = [c[0][0][2] for c in mock_run.call_args_list]
-        assert refs == ["repos/owner/repo/contents/install.sh?ref=v1.0.0",
-                        "repos/owner/repo/contents/install.sh?ref=1.0.0"]
-
+# ── Tests: empty/large manifests ─────────────────────────────────────────
 
 class TestDryrunManifestEdgeCases:
     def test_empty_manifest(self):
@@ -521,7 +350,7 @@ class TestDryrunManifestEdgeCases:
         assert env["GH_TOKEN"] == "tok"
 
 
-# ── Tests: end-to-end validate with subprocess.run faked at the boundary ─
+# ── Tests: end-to-end validate against local git vendors ────────────────
 
 GOOD_SCRIPT = (
     "#!/bin/bash\n"
@@ -530,47 +359,72 @@ GOOD_SCRIPT = (
     "echo \"$VENDOR_INSTALL_DIR/tool\" > \"$VENDOR_MANIFEST\"\n"
 )
 
+HELPER_SCRIPT = (
+    "#!/bin/bash\n"
+    "set -euo pipefail\n"
+    "source \"$VENDOR_LIB\"\n"
+    "fetch_file tool \"$VENDOR_INSTALL_DIR/tool\" +x\n"
+    "fetch_dir templates \"$VENDOR_INSTALL_DIR/templates\"\n"
+)
 
-_REAL_RUN = _real_subprocess.run  # captured before any test patches it
+
+def _vendor(vendor_repo, script=GOOD_SCRIPT, tag="v1.2.0", name="tool"):
+    repo = vendor_repo(name)
+    repo.write("install.sh", script)
+    repo.write("tool", "#!/bin/bash\necho tool\n")
+    repo.write("templates/a.txt", "a\n")
+    repo.commit("v1")
+    if tag:
+        repo.tag(tag)
+    return repo
 
 
-def _fake_run(script=GOOD_SCRIPT, repo_ok=True, tag="v1.2.0", calls=None):
-    """Answer gh api calls from canned data; run bash for real (local only)."""
-    def run(cmd, **kwargs):
-        if calls is not None:
-            calls.append((cmd, kwargs))
-        if cmd[0] == "bash":
-            return _REAL_RUN(cmd, **kwargs)
-        assert cmd[:2] == ["gh", "api"]
-        path = cmd[2]
-        if path == "repos/owner/tool":
-            return MagicMock(returncode=0 if repo_ok else 1, stdout="owner/tool\n")
-        if path == "repos/owner/tool/contents/install.sh":
-            return MagicMock(returncode=0, stdout="install.sh\n")
-        if path == "repos/owner/tool/releases/latest":
-            return MagicMock(returncode=0 if tag else 1, stdout=(tag or "") + "\n")
-        if path.startswith("repos/owner/tool/contents/install.sh?ref="):
-            return MagicMock(returncode=0, stdout=_b64(script) + "\n")
-        return MagicMock(returncode=1, stdout="")
-    return run
+def _no_tmp_left(before):
+    after = {p for p in os.listdir(tempfile.gettempdir())
+             if p.startswith(("gv-vendor-", "gv-validate-"))}
+    return after <= before
+
+
+def _tmp_entries():
+    return {p for p in os.listdir(tempfile.gettempdir())
+            if p.startswith(("gv-vendor-", "gv-validate-"))}
 
 
 class TestValidateEndToEnd:
-    def test_compliant_repo_passes_all_eight(self, monkeypatch, capsys):
-        monkeypatch.setenv("GH_TOKEN", "gh-tok")
-        with patch("vendored_validate.subprocess.run", side_effect=_fake_run()):
-            assert val.validate("owner/tool") == 0
+    def test_compliant_repo_passes_all_eight(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo)
+        before = _tmp_entries()
+        assert val.validate(repo.url) == 0
         out = capsys.readouterr().out
-        assert "Validating vendor contract: owner/tool" in out
-        assert "  [PASS] Version resolvable (1.2.0)" in out
+        assert f"Validating vendor contract: {repo.url}" in out
+        assert [l for l in out.splitlines() if l.startswith("  [")] == [
+            "  [PASS] Repo exists",
+            "  [PASS] install.sh exists",
+            "  [PASS] Version resolvable (1.2.0)",
+            "  [PASS] Valid shebang (#!/bin/bash)",
+            "  [PASS] Syntax valid (bash -n passed)",
+            "  [PASS] Dry-run install (exit code 0)",
+            "  [PASS] Manifest written (1 files)",
+            "  [PASS] Manifest files exist (all 1 files found on disk)",
+        ]
         assert "Result: PASS (8/8 checks passed)" in out
+        assert _no_tmp_left(before)
 
-    def test_broken_script_collects_failures(self, monkeypatch, capsys):
-        monkeypatch.setenv("GH_TOKEN", "gh-tok")
-        script = "#!/bin/sh\nif then\n"
-        with patch("vendored_validate.subprocess.run",
-                   side_effect=_fake_run(script=script)):
-            assert val.validate("owner/tool", "2.0.0") == 1
+    def test_helper_vendor_validates_from_checkout(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo, script=HELPER_SCRIPT)
+        assert val.validate(repo.url) == 0, capsys.readouterr().out
+        assert "Manifest written (2 files)" in capsys.readouterr().out
+
+    def test_url_with_dot_git_names_sandbox_vendor(self, vendor_repo, capsys):
+        script = ("#!/bin/bash\n"
+                  "[ \"$VENDOR_INSTALL_DIR\" = .vendored/pkg/tool ] || exit 7\n"
+                  + GOOD_SCRIPT.split("\n", 1)[1])
+        repo = _vendor(vendor_repo, script=script, name="tool.git")
+        assert val.validate(repo.url) == 0, capsys.readouterr().out
+
+    def test_broken_script_collects_failures(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo, script="#!/bin/sh\nif then\n", tag="2.0.0")
+        assert val.validate(repo.url, "2.0.0") == 1
         out = capsys.readouterr().out
         assert "[FAIL] Valid shebang -- got: #!/bin/sh" in out
         assert "[FAIL] Syntax valid" in out
@@ -578,58 +432,145 @@ class TestValidateEndToEnd:
         assert "[FAIL] Manifest written" in out
         assert "Result: FAIL (5/8 checks failed)" in out
 
-    def test_inaccessible_repo_stops_early(self, monkeypatch, capsys):
-        calls = []
-        with patch("vendored_validate.subprocess.run",
-                   side_effect=_fake_run(repo_ok=False, calls=calls)):
-            assert val.validate("owner/tool") == 1
-        assert len(calls) == 1
+    def test_no_manifest_written(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo, script="#!/bin/bash\necho ok\n")
+        assert val.validate(repo.url) == 1
         out = capsys.readouterr().out
-        assert "[FAIL] Repo exists -- cannot access owner/tool" in out
+        assert ("[FAIL] Manifest written -- install.sh did not write to "
+                "$VENDOR_MANIFEST") in out
+
+    def test_manifest_lists_missing_file(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo,
+                       script="#!/bin/bash\necho gone.txt > \"$VENDOR_MANIFEST\"\n")
+        assert val.validate(repo.url) == 1
+        assert "[FAIL] Manifest files exist -- 1 missing: gone.txt" in \
+            capsys.readouterr().out
+
+    def test_inaccessible_repo_stops_early(self, vendor_repo, tmp_path, capsys):
+        url = (tmp_path / "missing").as_uri()
+        assert val.validate(url) == 1
+        out = capsys.readouterr().out
+        assert f"[FAIL] Repo exists -- cannot access {url}" in out
         assert "Result: FAIL (1/1 checks failed)" in out
 
-    def test_unresolvable_version_stops_early(self, capsys):
-        calls = []
-        with patch("vendored_validate.subprocess.run",
-                   side_effect=_fake_run(tag=None, calls=calls)):
-            assert val.validate("owner/tool") == 1
-        assert not any(c[0][0] == "bash" for c in calls)
-        assert "Result: FAIL (1/3 checks failed)" in capsys.readouterr().out
+    def test_no_version_tags_stops_early(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo, tag="latest")
+        assert val.validate(repo.url) == 1
+        out = capsys.readouterr().out
+        assert "[FAIL] install.sh exists -- skipped (no version)" in out
+        assert "[FAIL] Version resolvable -- no version tags found" in out
+        assert "Result: FAIL (2/3 checks failed)" in out
+
+    def test_explicit_version_without_tag(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo)
+        assert val.validate(repo.url, "9.9.9") == 1
+        assert "[FAIL] Version resolvable -- no tag for 9.9.9" in \
+            capsys.readouterr().out
+
+    def test_no_install_sh_at_tag(self, vendor_repo, capsys):
+        repo = vendor_repo()
+        repo.write("README", "x\n")
+        repo.commit("one")
+        repo.tag("v1.0.0")
+        repo.write("install.sh", GOOD_SCRIPT)
+        repo.commit("installer after the tag")
+        before = _tmp_entries()
+        assert val.validate(repo.url) == 1
+        out = capsys.readouterr().out
+        assert f"[FAIL] install.sh exists -- no install.sh at root of {repo.url}" in out
+        assert "Result: FAIL (1/2 checks failed)" in out
+        assert _no_tmp_left(before)
+
+    def test_fetch_failure_fails_check_2(self, vendor_repo, capsys):
+        repo = _vendor(vendor_repo)
+        with patch.object(val, "resolve",
+                          return_value=(_resolved("1.2.0", tag="v-gone"), None)):
+            assert val.validate(repo.url) == 1
+        assert "[FAIL] install.sh exists" in capsys.readouterr().out
+
+    def test_same_resolution_as_the_installer(self, vendor_repo):
+        repo = _vendor(vendor_repo)
+        repo.commit("two")
+        repo.tag("v1.10.0", annotated=True)
+        tags = val.check_repo_exists(repo.url, None, val.ValidationResult())
+        resolved, _ = val.resolve(tags, "latest")
+        installed = val.INSTALL.resolve_version("tool", repo.url, "latest", "")
+        assert resolved == installed
+        assert resolved.commit == repo.rev("v1.10.0^{commit}")
+
+
+class TestValidateNoGh:
+    def test_program_passes_with_gh_absent(self, vendor_repo, tmp_path):
+        repo = _vendor(vendor_repo, script=HELPER_SCRIPT)
+        bindir = tmp_path / "bin-no-gh"
+        bindir.mkdir()
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if not os.path.isdir(d):
+                continue
+            for entry in os.listdir(d):
+                src = os.path.join(d, entry)
+                dst = bindir / entry
+                if entry != "gh" and not dst.exists() and os.path.isfile(src) \
+                        and os.access(src, os.X_OK):
+                    dst.symlink_to(src)
+        env = dict(os.environ, PATH=str(bindir))
+        proc = _real_subprocess.run(
+            [sys.executable, str(ROOT / "validate"), repo.url],
+            cwd=str(tmp_path), capture_output=True, text=True, env=env,
+            timeout=120)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "Result: PASS (8/8 checks passed)" in proc.stdout
 
 
 class TestTokenSelection:
-    def _gh_envs(self, calls):
-        return [kw["env"] for cmd, kw in calls if cmd[0] == "gh"]
+    def _envs(self, monkeypatch):
+        calls = []
+        real = val.INSTALL.subprocess.run
 
-    def test_gh_token_wins_over_github_token(self, monkeypatch):
+        def spy(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return real(cmd, **kwargs)
+        monkeypatch.setattr(val.INSTALL.subprocess, "run", spy)
+        return calls
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_git_config(self, monkeypatch):
+        for key in list(os.environ):
+            if key.startswith("GIT_CONFIG_") and key not in (
+                    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+                monkeypatch.delenv(key)
+
+    def test_gh_token_wins_and_goes_to_git_as_header(self, vendor_repo,
+                                                     monkeypatch, capsys):
+        repo = _vendor(vendor_repo)
         monkeypatch.setenv("GH_TOKEN", "gh-tok")
         monkeypatch.setenv("GITHUB_TOKEN", "github-tok")
-        calls = []
-        with patch("vendored_validate.subprocess.run",
-                   side_effect=_fake_run(calls=calls)):
-            val.validate("owner/tool")
-        envs = self._gh_envs(calls)
-        assert envs and all(e["GH_TOKEN"] == "gh-tok" for e in envs)
+        calls = self._envs(monkeypatch)
+        assert val.validate(repo.url) == 0
+        git_calls = [(c, k) for c, k in calls if c[0] == "git" and "-C" not in c]
+        assert git_calls
+        for cmd, kw in git_calls:
+            assert not any("gh-tok" in part for part in cmd)
+            value = kw["env"]["GIT_CONFIG_VALUE_0"]
+            assert base64.b64decode(value.split()[-1]).decode() == \
+                "x-access-token:gh-tok"
+        assert "gh-tok" not in capsys.readouterr().out
 
-    def test_github_token_exported_as_gh_token(self, monkeypatch):
-        """gh only reads GH_TOKEN, so GITHUB_TOKEN is passed through under that name."""
-        monkeypatch.delenv("GH_TOKEN", raising=False)
+    def test_github_token_exported_as_gh_token_to_dryrun(self, vendor_repo,
+                                                         monkeypatch):
+        repo = _vendor(vendor_repo,
+                       script="#!/bin/bash\necho \"$GH_TOKEN\" > \"$VENDOR_MANIFEST\"\n")
         monkeypatch.setenv("GITHUB_TOKEN", "github-tok")
-        calls = []
-        with patch("vendored_validate.subprocess.run",
-                   side_effect=_fake_run(calls=calls)):
-            val.validate("owner/tool")
-        envs = self._gh_envs(calls)
-        assert envs and all(e["GH_TOKEN"] == "github-tok" for e in envs)
-        dryrun_env = [kw["env"] for cmd, kw in calls
-                      if cmd[0] == "bash" and cmd[1] != "-n"][0]
+        with patch.object(val.subprocess, "run",
+                          wraps=_real_subprocess.run) as mock_run:
+            val.validate(repo.url)
+        dryrun_env = [c[1]["env"] for c in mock_run.call_args_list
+                      if c[0][0][0] == "bash" and c[0][0][1] != "-n"][0]
         assert dryrun_env["GH_TOKEN"] == "github-tok"
 
-    def test_no_token_leaves_env_unset(self, monkeypatch):
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        calls = []
-        with patch("vendored_validate.subprocess.run",
-                   side_effect=_fake_run(calls=calls)):
-            val.validate("owner/tool")
-        assert all("GH_TOKEN" not in e for e in self._gh_envs(calls))
+    def test_no_token_reads_anonymously(self, vendor_repo, monkeypatch):
+        repo = _vendor(vendor_repo)
+        calls = self._envs(monkeypatch)
+        assert val.validate(repo.url) == 0
+        assert all("GIT_CONFIG_COUNT" not in k["env"]
+                   for c, k in calls if "env" in k and k["env"])
