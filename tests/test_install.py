@@ -1201,6 +1201,138 @@ class TestCreatePullRequest:
         assert env.get("GH_TOKEN") == "repo-token"
 
 
+class TestPullRequestToken:
+    """gv-0232: the PR is opened (and auto-merge requested) with VENDOR_PAT."""
+
+    PAT = "ghp_prTOKENvalue456"
+    RESULTS = [{"vendor": "tool", "old_version": "1.0.0",
+                "new_version": "2.0.0", "changed": True}]
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch, make_config):
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        monkeypatch.setenv("GH_TOKEN", "caller-token")
+        monkeypatch.delenv("VENDOR_PAT", raising=False)
+        make_config({"vendors": {"tool": dict(SAMPLE_VENDOR, automerge=True)}})
+
+    def _mock(self, pr_returncode=0, pr_stdout="https://github.com/o/r/pull/3\n",
+              pr_stderr=""):
+        def side_effect(cmd, **kwargs):
+            if cmd[:2] == ["git", "diff"] and "--name-only" in cmd:
+                return MagicMock(returncode=0, stdout="")
+            if cmd[:2] == ["git", "diff"]:
+                return MagicMock(returncode=1)
+            if cmd[:3] == ["gh", "pr", "create"]:
+                return MagicMock(returncode=pr_returncode, stdout=pr_stdout,
+                                 stderr=pr_stderr)
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return side_effect
+
+    @staticmethod
+    def _gh(mock_run, sub):
+        return [c for c in mock_run.call_args_list
+                if c[0][0][:3] == ["gh", "pr", sub]]
+
+    @staticmethod
+    def _body(call):
+        cmd = call[0][0]
+        return cmd[cmd.index("--body") + 1]
+
+    @patch("vendored_install.subprocess.run")
+    def test_vendor_pat_opens_pr_and_automerge(self, mock_run, monkeypatch,
+                                               capsys):
+        monkeypatch.setenv("VENDOR_PAT", self.PAT)
+        mock_run.side_effect = self._mock()
+
+        assert inst.create_pull_request(self.RESULTS) == \
+            "https://github.com/o/r/pull/3"
+        create = self._gh(mock_run, "create")
+        merge = self._gh(mock_run, "merge")
+        assert len(create) == 1 and len(merge) == 1
+        assert create[0][1]["env"]["GH_TOKEN"] == self.PAT
+        assert merge[0][1]["env"]["GH_TOKEN"] == self.PAT
+        assert merge[0][0][0][3:] == ["https://github.com/o/r/pull/3",
+                                      "--auto", "--squash"]
+        assert "no checks will run" not in self._body(create[0])
+        out = capsys.readouterr()
+        assert self.PAT not in out.out + out.err
+
+    @patch("vendored_install.subprocess.run")
+    def test_without_vendor_pat_uses_workflow_token_and_notes_it(
+            self, mock_run):
+        mock_run.side_effect = self._mock()
+
+        inst.create_pull_request(self.RESULTS)
+        create = self._gh(mock_run, "create")
+        merge = self._gh(mock_run, "merge")
+        assert create[0][1]["env"]["GH_TOKEN"] == "workflow-token"
+        assert merge[0][1]["env"]["GH_TOKEN"] == "workflow-token"
+        body = self._body(create[0])
+        assert body.endswith(inst.NO_CHECKS_NOTE)
+        note = inst.NO_CHECKS_NOTE.strip()
+        assert "\n" not in note
+        assert "no checks will run" in note and "`VENDOR_PAT`" in note
+
+    @patch("vendored_install.subprocess.run")
+    def test_no_token_leaves_callers_gh_token(self, mock_run, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN")
+        mock_run.side_effect = self._mock()
+
+        inst.create_pull_request(self.RESULTS)
+        create = self._gh(mock_run, "create")
+        assert create[0][1]["env"]["GH_TOKEN"] == "caller-token"
+
+    @patch("vendored_install.subprocess.run")
+    def test_failed_create_after_push_names_branch(self, mock_run, monkeypatch,
+                                                   capsys):
+        monkeypatch.setenv("VENDOR_PAT", self.PAT)
+        mock_run.side_effect = self._mock(
+            pr_returncode=1, pr_stdout="",
+            pr_stderr=f"GraphQL: not permitted (createPullRequest) {self.PAT}")
+
+        with pytest.raises(SystemExit) as exc:
+            inst.create_pull_request(self.RESULTS)
+        assert exc.value.code == 1
+        pushes = [c[0][0] for c in mock_run.call_args_list
+                  if "push" in c[0][0]]
+        assert len(pushes) == 1
+        assert not self._gh(mock_run, "merge")
+        out = capsys.readouterr()
+        assert self.PAT not in out.out + out.err
+        assert "not permitted (createPullRequest) ***" in out.out
+        assert "chore/install-tool-v2.0.0 was pushed but has no pull request" \
+            in out.out
+        assert "gh pr create --head chore/install-tool-v2.0.0 --base main" \
+            in out.out
+        assert "set a VENDOR_PAT" not in out.out
+
+    @patch("vendored_install.subprocess.run")
+    def test_failed_create_with_workflow_token_suggests_vendor_pat(
+            self, mock_run, capsys):
+        mock_run.side_effect = self._mock(
+            pr_returncode=1, pr_stdout="",
+            pr_stderr="GitHub Actions is not permitted to create or approve "
+                      "pull requests (createPullRequest)")
+
+        with pytest.raises(SystemExit) as exc:
+            inst.create_pull_request(self.RESULTS)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "chore/install-tool-v2.0.0" in out
+        assert "set a VENDOR_PAT secret" in out
+
+    @patch("vendored_install.subprocess.run")
+    def test_existing_pr_is_reused(self, mock_run, monkeypatch, capsys):
+        monkeypatch.setenv("VENDOR_PAT", self.PAT)
+        mock_run.side_effect = self._mock(
+            pr_returncode=1, pr_stdout="",
+            pr_stderr="a pull request for branch already exists")
+
+        assert inst.create_pull_request(self.RESULTS) is None
+        assert "PR already exists for chore/install-tool-v2.0.0" in \
+            capsys.readouterr().out
+
+
 # ── Tests: registry files ─────────────────────────────────────────────────
 
 class TestRegistryFiles:

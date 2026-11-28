@@ -19,10 +19,12 @@ Output (key=value lines for workflow consumption):
     changed=true|false
 
 Environment:
-    GITHUB_TOKEN - Auth for public repos; opens the PR in --pr mode
+    GITHUB_TOKEN - Auth for public repos; opens the PR in --pr mode when
+                   VENDOR_PAT is not set (such a PR gets no checks)
     VENDOR_PAT   - Auth for private repos (vendor.private: true). In --pr
                    mode, also pushes the install branch when it carries
-                   workflow files (needs workflow write permission)
+                   workflow files (needs workflow write permission), and
+                   opens the PR and requests auto-merge, so checks run
     GH_TOKEN     - Fallback auth token
 
     The arguments can also be given through the environment (command-line
@@ -1301,6 +1303,11 @@ def workflow_files_note(results, paths):
     return "\n".join(lines)
 
 
+NO_CHECKS_NOTE = (
+    "\n\nOpened with the workflow's own token, so no checks will run on "
+    "this pull request; a `VENDOR_PAT` secret changes that.")
+
+
 def create_pull_request(results):
     """Create a PR with vendor install changes."""
     meta = get_pr_metadata(results)
@@ -1312,10 +1319,15 @@ def create_pull_request(results):
     title = meta["title"]
     body = meta["body"]
 
+    # The pull request is opened (and auto-merge requested) with VENDOR_PAT
+    # when it is set: GitHub starts no workflows for a pull request opened
+    # with a workflow's own GITHUB_TOKEN, so it would get no checks.
+    pat = os.environ.get("VENDOR_PAT", "")
     gh_env = os.environ.copy()
     github_token = os.environ.get("GITHUB_TOKEN", "")
-    if github_token:
-        gh_env["GH_TOKEN"] = github_token
+    pr_token = pat or github_token
+    if pr_token:
+        gh_env["GH_TOKEN"] = pr_token
 
     subprocess.run(
         ["git", "config", "user.name", "github-actions[bot]"],
@@ -1339,7 +1351,6 @@ def create_pull_request(results):
     # and the push is made with it; otherwise they are unstaged and the PR
     # body lists them with what to run and commit.
     workflow_files = staged_workflow_files()
-    pat = os.environ.get("VENDOR_PAT", "")
     keep_workflows = bool(workflow_files and pat)
     left_out = []
     if not keep_workflows:
@@ -1401,6 +1412,8 @@ def create_pull_request(results):
 
     if left_out:
         body += workflow_files_note(results, left_out)
+    if not pat:
+        body += NO_CHECKS_NOTE
 
     pr_result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body,
@@ -1413,7 +1426,13 @@ def create_pull_request(results):
         if "already exists" in output:
             print(f"PR already exists for {branch}")
             return
-        print(f"Failed to create PR: {output}")
+        print(f"Failed to create PR: {_scrub(output, pr_token)}")
+        print(f"The branch {branch} was pushed but has no pull request. "
+              "Open it by hand:")
+        print(f"  gh pr create --head {branch} --base main --fill")
+        if not pat:
+            print("If GitHub Actions may not create pull requests here, set "
+                  "a VENDOR_PAT secret so the pull request is opened with it.")
         sys.exit(1)
 
     pr_url = pr_result.stdout.strip()
