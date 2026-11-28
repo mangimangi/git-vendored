@@ -9,6 +9,9 @@ Usage:
     python3 .vendored/install <owner/repo|vendor|all> [--version <version>]
                               [--force] [--pr] [--name <name>]
 
+    owner/repo of a vendor that is already registered updates it. Surrounding
+    whitespace is trimmed from the arguments.
+
 Output (key=value lines for workflow consumption):
     vendor=<name>
     old_version=<version>
@@ -21,6 +24,12 @@ Environment:
                    mode, also pushes the install branch when it carries
                    workflow files (needs workflow write permission)
     GH_TOKEN     - Fallback auth token
+
+    The arguments can also be given through the environment (command-line
+    arguments win):
+    VENDORED_VENDOR  - target, used when no positional target is given
+    VENDORED_VERSION - version, used when --version is not given
+    VENDORED_PRIVATE - true/1/yes sets --private; false/0/no/empty does not
 """
 
 import argparse
@@ -1600,6 +1609,79 @@ def _maybe_reexec():
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
+# Environment form of the arguments, for jobs that pass declared inputs
+# without building a command line. Command-line arguments win.
+ENV_VENDOR = "VENDORED_VENDOR"
+ENV_VERSION = "VENDORED_VERSION"
+ENV_PRIVATE = "VENDORED_PRIVATE"
+_TRUE_VALUES = {"true", "1", "yes"}
+_FALSE_VALUES = {"false", "0", "no", ""}
+
+
+def _given(argv, flag):
+    """True if `flag` was given on the command line (also as flag=value)."""
+    return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+
+def apply_env_args(args, argv):
+    """Fill the target, --version and --private from the environment.
+
+    VENDORED_VENDOR is used when no target was given, VENDORED_VERSION when
+    --version was not given, VENDORED_PRIVATE (true/1/yes, false/0/no or
+    empty) when --private was not given.
+    """
+    if args.target is None and os.environ.get(ENV_VENDOR) is not None:
+        args.target = os.environ[ENV_VENDOR]
+    if not _given(argv, "--version") and os.environ.get(ENV_VERSION):
+        args.version = os.environ[ENV_VERSION]
+    if not args.private and os.environ.get(ENV_PRIVATE) is not None:
+        value = os.environ[ENV_PRIVATE].strip().lower()
+        if value in _TRUE_VALUES:
+            args.private = True
+        elif value not in _FALSE_VALUES:
+            print(f"::error::Invalid {ENV_PRIVATE} "
+                  f"{os.environ[ENV_PRIVATE]!r}: expected true/1/yes or "
+                  "false/0/no")
+            sys.exit(1)
+
+
+def validate_target(target):
+    """Return what is wrong with a (trimmed) target, or None if it is fine."""
+    if not target:
+        return "it is empty"
+    if any(c.isspace() for c in target):
+        return "it contains whitespace"
+    if _is_repo_spec(target):
+        parts = target.split("/")
+        if len(parts) != 2:
+            return "owner/repo must contain exactly one '/'"
+        if not parts[0]:
+            return "the owner part of owner/repo is empty"
+        if not parts[1]:
+            return "the repo part of owner/repo is empty"
+    return None
+
+
+def registered_vendor_for_repo(repo, vendors, name=None):
+    """Return the registered vendor name for `repo`, or None.
+
+    A vendor whose registry `repo` is `repo` matches. Exits with an error
+    when the name the add path would use (--name or the repo's basename)
+    is registered for a different repo.
+    """
+    for vname, vcfg in vendors.items():
+        if vcfg.get("repo") == repo:
+            return vname
+    key = name or repo.split("/")[-1]
+    if key in vendors:
+        other = vendors[key].get("repo", "(no repo recorded)")
+        print(f"::error::Vendor '{key}' is already registered for {other}, "
+              f"not {repo}.")
+        print("Use --name <name> to add it under another name.")
+        sys.exit(1)
+    return None
+
+
 def _is_repo_spec(arg):
     """Check if an argument looks like owner/repo."""
     return "/" in arg and not arg.startswith("-")
@@ -1638,7 +1720,7 @@ def main():
     )
     parser.add_argument(
         "--version", default="latest",
-        help="Version to install (default: latest)"
+        help="Version to install (default: latest, or $VENDORED_VERSION)"
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -1676,8 +1758,25 @@ def main():
         list_vendors()
         return
 
-    if not args.target:
-        parser.error("target is required (unless using --list)")
+    apply_env_args(args, sys.argv[1:])
+    if args.version is not None:
+        args.version = args.version.strip()
+    if args.name is not None:
+        args.name = args.name.strip()
+    if not args.version:
+        args.version = "latest"
+
+    if args.target is None:
+        parser.error("target is required (unless using --list); give it as "
+                     f"an argument or in {ENV_VENDOR}")
+    raw_target = args.target
+    args.target = args.target.strip()
+    target_error = validate_target(args.target)
+    if target_error:
+        print(f"::error::Invalid vendor argument {raw_target!r}: {target_error}")
+        print("Expected one of: <vendor> (a registered vendor name), "
+              "owner/repo, or all")
+        sys.exit(1)
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
     if _should_migrate_config():
@@ -1716,6 +1815,11 @@ def main():
             create_pull_request(results)
         return
 
+    registered_name = None
+    if args.target != "all" and _is_repo_spec(args.target):
+        registered_name = registered_vendor_for_repo(args.target, vendors,
+                                                     args.name)
+
     if args.target == "all":
         # Update all registered vendors
         if not vendors:
@@ -1730,6 +1834,16 @@ def main():
                                         deps_mode=args.deps)
             )
         output_results(results)
+    elif _is_repo_spec(args.target) and registered_name:
+        # owner/repo of a vendor that is already registered — update path
+        name = registered_name
+        print(f"{args.target} is registered as vendor '{name}'; updating it")
+        result = install_existing_vendor(
+            name, vendors[name], args.version, args.force,
+            deps_mode=args.deps
+        )
+        output_result(result)
+        results = [result]
     elif _is_repo_spec(args.target):
         # New vendor (owner/repo format) — add path
         token = get_auth_token(private=args.private)

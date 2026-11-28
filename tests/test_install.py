@@ -3710,3 +3710,185 @@ class TestPullRequestWorkflowFiles:
         assert push == [["git", "push", "--force-with-lease", "-u", "origin",
                          "chore/install-git-cicd-v0.0.4"]]
         assert "Workflow files" not in self._body(mock_run)
+
+
+# ── Tests: forgiving vendor argument (gv-05c2.4) ─────────────────────────
+
+CICD_RESULT = {"vendor": "git-cicd", "old_version": "0.0.2",
+               "new_version": "0.0.4", "changed": True}
+
+
+class TestVendorArgument:
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        for var in ("VENDORED_VENDOR", "VENDORED_VERSION", "VENDORED_PRIVATE"):
+            monkeypatch.delenv(var, raising=False)
+
+    def _run(self, argv):
+        with patch("sys.argv", ["install", *argv]), \
+             patch("vendored_install.install_existing_vendor",
+                   return_value=dict(CICD_RESULT)) as update, \
+             patch("vendored_install.install_new_vendor",
+                   return_value=dict(CICD_RESULT)) as add, \
+             patch("vendored_install.get_auth_token", return_value="t"), \
+             patch("vendored_install.output_result"), \
+             patch("vendored_install.subprocess.run") as run:
+            inst.main()
+        return update, add, run
+
+    def test_padded_owner_repo_of_registered_vendor_updates(self, make_config,
+                                                            capsys):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        update, add, _ = self._run([" mangimangi/git-cicd "])
+        add.assert_not_called()
+        update.assert_called_once()
+        args, kwargs = update.call_args
+        assert args[0] == "git-cicd"
+        assert args[2] == "latest"
+        assert "registered as vendor 'git-cicd'; updating it" in \
+            capsys.readouterr().out
+
+    def test_owner_repo_of_registered_vendor_updates(self, make_config):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        update, add, _ = self._run(["mangimangi/git-cicd", "--version", "0.0.4",
+                                    "--force", "--deps", "install"])
+        add.assert_not_called()
+        args, kwargs = update.call_args
+        assert args == ("git-cicd", NEW_CICD_VENDOR, "0.0.4", True)
+        assert kwargs == {"deps_mode": "install"}
+
+    def test_owner_repo_registered_under_other_name_updates(self, make_config):
+        make_config({"vendors": {"cicd": NEW_CICD_VENDOR}})
+        update, add, _ = self._run(["mangimangi/git-cicd"])
+        assert update.call_args[0][0] == "cicd"
+        add.assert_not_called()
+
+    def test_unregistered_owner_repo_adds(self, make_config):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        update, add, _ = self._run([" owner/new-tool", "--name", " nt "])
+        update.assert_not_called()
+        args, kwargs = add.call_args
+        assert args[0] == "owner/new-tool"
+        assert args[3] == "nt"
+
+    def test_basename_registered_for_other_repo_fails(self, make_config, capsys):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        with pytest.raises(SystemExit) as exc:
+            self._run(["someone/git-cicd"])
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "mangimangi/git-cicd" in out and "someone/git-cicd" in out
+
+    def test_name_registered_for_other_repo_fails(self, make_config, capsys):
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with pytest.raises(SystemExit):
+            self._run(["owner/other", "--name", "tool"])
+        out = capsys.readouterr().out
+        assert "owner/tool" in out and "owner/other" in out
+
+    def test_env_form(self, make_config, monkeypatch):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        monkeypatch.setenv("VENDORED_VENDOR", "git-cicd ")
+        monkeypatch.setenv("VENDORED_VERSION", " 1.2.3")
+        monkeypatch.setenv("VENDORED_PRIVATE", "true")
+        update, add, _ = self._run([])
+        args, _ = update.call_args
+        assert args[0] == "git-cicd"
+        assert args[2] == "1.2.3"
+
+    def test_env_private_adds_with_private(self, make_config, monkeypatch):
+        make_config({"vendors": {}})
+        monkeypatch.setenv("VENDORED_VENDOR", "owner/tool")
+        monkeypatch.setenv("VENDORED_PRIVATE", "Yes")
+        _, add, _ = self._run([])
+        assert add.call_args[1]["private"] is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", ""])
+    def test_env_private_false_values(self, make_config, monkeypatch, value):
+        make_config({"vendors": {}})
+        monkeypatch.setenv("VENDORED_VENDOR", "owner/tool")
+        monkeypatch.setenv("VENDORED_PRIVATE", value)
+        _, add, _ = self._run([])
+        assert add.call_args[1]["private"] is False
+
+    def test_env_private_invalid_fails(self, make_config, monkeypatch, capsys):
+        make_config({"vendors": {}})
+        monkeypatch.setenv("VENDORED_VENDOR", "owner/tool")
+        monkeypatch.setenv("VENDORED_PRIVATE", "maybe")
+        with pytest.raises(SystemExit) as exc:
+            self._run([])
+        assert exc.value.code == 1
+        assert "VENDORED_PRIVATE 'maybe'" in capsys.readouterr().out
+
+    def test_args_override_env(self, make_config, monkeypatch):
+        make_config({"vendors": {
+            "git-cicd": NEW_CICD_VENDOR, "tool": SAMPLE_VENDOR}})
+        monkeypatch.setenv("VENDORED_VENDOR", "git-cicd")
+        monkeypatch.setenv("VENDORED_VERSION", "1.2.3")
+        update, _, _ = self._run(["tool", "--version=2.0.0"])
+        args, _ = update.call_args
+        assert args[0] == "tool"
+        assert args[2] == "2.0.0"
+
+    def test_empty_env_version_means_latest(self, make_config, monkeypatch):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        monkeypatch.setenv("VENDORED_VERSION", "")
+        update, _, _ = self._run(["git-cicd", "--version", "  "])
+        assert update.call_args[0][2] == "latest"
+
+    def test_no_target_anywhere_errors(self, make_config, capsys):
+        make_config({"vendors": {}})
+        with pytest.raises(SystemExit) as exc:
+            self._run([])
+        assert exc.value.code == 2
+        assert "VENDORED_VENDOR" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("target, problem", [
+        ("   ", "it is empty"),
+        ("mangimangi/ git-cicd", "it contains whitespace"),
+        ("git cicd", "it contains whitespace"),
+        ("a/b/c", "exactly one '/'"),
+        ("/repo", "owner part"),
+        ("owner/", "repo part"),
+    ])
+    def test_malformed_targets_fail_before_network(self, make_config, capsys,
+                                                   target, problem):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        with pytest.raises(SystemExit) as exc:
+            update, add, run = self._run([target])
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert f"Invalid vendor argument {target!r}" in out
+        assert problem in out
+        assert "<vendor>" in out and "owner/repo" in out and "all" in out
+        assert "GH_TOKEN" not in out
+
+    def test_malformed_target_makes_no_gh_call(self, make_config):
+        make_config({"vendors": {}})
+        with patch("sys.argv", ["install", "owner/"]), \
+             patch("vendored_install.subprocess.run") as run:
+            with pytest.raises(SystemExit):
+                inst.main()
+        run.assert_not_called()
+
+    def test_env_target_validated(self, make_config, monkeypatch, capsys):
+        make_config({"vendors": {}})
+        monkeypatch.setenv("VENDORED_VENDOR", "")
+        with pytest.raises(SystemExit):
+            self._run([])
+        assert "Invalid vendor argument ''" in capsys.readouterr().out
+
+    def test_list_unaffected_by_env(self, make_config, monkeypatch, capsys):
+        make_config({"vendors": {}})
+        monkeypatch.setenv("VENDORED_VENDOR", "bad target")
+        with patch("sys.argv", ["install", "--list"]):
+            inst.main()
+        assert "Invalid" not in capsys.readouterr().out
+
+    def test_unknown_vendor_lists_registered(self, make_config, capsys):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        with pytest.raises(SystemExit):
+            self._run([" nope "])
+        out = capsys.readouterr().out
+        assert "Unknown vendor: nope" in out
+        assert "Registered vendors: git-cicd" in out

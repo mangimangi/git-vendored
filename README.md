@@ -53,6 +53,8 @@ Use `--name` to override the vendor key:
 python3 .vendored/install owner/repo-name --name my-custom-name
 ```
 
+If `owner/repo-name` is already registered (a vendor's registry `repo` is that repository), the same command updates it instead of failing, and says which vendor it updates. If the name it would use is registered for a different repository, it fails naming both. Surrounding whitespace is trimmed from the arguments; an empty target, one with whitespace inside, or a malformed `owner/repo` is rejected with a message naming what is wrong, before any network call.
+
 ## How Updates Work
 
 The `install-vendored.yml` workflow runs weekly (Mondays 9am UTC) or on manual dispatch:
@@ -71,6 +73,18 @@ python3 .vendored/install all  # update all vendors
 
 # With automatic PR creation (used by CI):
 python3 .vendored/install all --pr
+```
+
+The vendor, the version and the private flag can also be given through the environment, so a job can pass its declared inputs without building a command line. Command-line arguments win over the environment:
+
+| Env var | Stands for | Used when |
+|---------|------------|-----------|
+| `VENDORED_VENDOR` | the target (`<vendor>`, `owner/repo` or `all`) | no positional target is given |
+| `VENDORED_VERSION` | `--version` (empty means `latest`) | `--version` is not given |
+| `VENDORED_PRIVATE` | `--private` for `true`/`1`/`yes`; nothing for `false`/`0`/`no`/empty | `--private` is not given |
+
+```bash
+VENDORED_VENDOR=git-cicd VENDORED_VERSION=latest python3 .vendored/install --pr
 ```
 
 ### Workflow files and `VENDOR_PAT`
