@@ -561,3 +561,11 @@ git-vendored.version" ]
     [[ "$output" == *$'\n\nDone! git-vendored v1.0.0 installed.' ]]
     [ "${lines[0]}" = "Installing git-vendored v1.0.0 from $DEFAULT_REPO" ]
 }
+
+@test "stubs_setup removes token variables the outer environment holds" {
+    export VENDOR_PAT=outer-fake-pat GH_TOKEN=outer-fake-gh GITHUB_TOKEN=outer-fake-gt
+    stubs_setup
+    [ -z "${VENDOR_PAT+set}" ]
+    [ -z "${GH_TOKEN+set}" ]
+    [ -z "${GITHUB_TOKEN+set}" ]
+}
