@@ -89,16 +89,25 @@ The vendor, the version and the private flag can also be given through the envir
 VENDORED_VENDOR=git-cicd VENDORED_VERSION=latest python3 .vendored/install --pr
 ```
 
+### Which token does what
+
+| Token | Reads a private vendor | Pushes the install branch | Opens the PR and requests auto-merge |
+|-------|------------------------|---------------------------|--------------------------------------|
+| `VENDOR_PAT` (when set) | yes (required for `private: true`) | when the branch carries workflow files | yes, so the PR's checks run |
+| `GITHUB_TOKEN` (the workflow's own) | no (public vendors only) | otherwise (the checkout's credentials) | only when `VENDOR_PAT` is not set |
+
+GitHub starts no workflows for a pull request opened with a workflow's own `GITHUB_TOKEN`, so such an install PR gets no checks (and cannot merge where a status such as `Verdict / git-cicd:verdict` is required); its description says so in one line. Set a `VENDOR_PAT` secret to have the PR opened with it. If the PR cannot be opened after the branch was pushed (for example where GitHub Actions may not create pull requests), the install names the branch, says how to open the PR by hand and exits non-zero; a PR that already exists for the branch is reused. No token value is printed.
+
 ### Workflow files and `VENDOR_PAT`
 
 An install can change files under `.github/workflows/` (a vendor's workflows). The workflow's own `GITHUB_TOKEN` may not push those, so in `--pr` mode:
 
-- **With `VENDOR_PAT` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with `VENDOR_PAT` (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). The PR itself is still opened with `GITHUB_TOKEN`. If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
+- **With `VENDOR_PAT` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with `VENDOR_PAT` (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
 - **Without `VENDOR_PAT`**, workflow files are left out as before.
 
 Whenever workflow files are left out, the PR description lists them and says what to run and commit on the branch: for git-cicd, `.vendored/pkg/git-cicd/git-cicd generate`; for other vendors, `python3 .vendored/install <vendor> --force` with a token that may write workflows.
 
-To carry workflow files, `VENDOR_PAT` needs, on the consuming repository: **Contents** read/write, **Pull requests** read/write and **Workflows** write (fine-grained token), or the `repo` and `workflow` scopes (classic token). No token value is printed in any log.
+To carry workflow files and open the PR, `VENDOR_PAT` needs, on the consuming repository: **Contents** read/write, **Pull requests** read/write and **Workflows** write (fine-grained token), or the `repo` and `workflow` scopes (classic token). No token value is printed in any log.
 
 ## Removing a Vendor
 

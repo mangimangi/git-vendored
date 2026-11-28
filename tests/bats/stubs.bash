@@ -27,6 +27,8 @@ stubs_setup() {
     export HOME="$BATS_TEST_TMPDIR/home"
     export XDG_CACHE_HOME="$BATS_TEST_TMPDIR/cache"
     mkdir -p "$HOME" "$XDG_CACHE_HOME"
+    # No test reads a token from the ambient environment (CI holds real
+    # secrets); a test that needs one passes a fake value.
     unset GH_TOKEN VENDOR_PAT VENDOR_REF VENDOR_REPO VENDOR_MANIFEST \
         VENDOR_INSTALL_DIR CURL_FAIL GH_FAIL GITHUB_TOKEN
 

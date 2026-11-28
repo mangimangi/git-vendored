@@ -19,6 +19,9 @@ ci_setup() {
     export XDG_CACHE_HOME="$BATS_TEST_TMPDIR/cache"
     export STUB_LOG REAL_PYTHON3
     unset CI GITHUB_HEAD_REF CICD_SOURCE_BRANCH CICD_BASE COVERAGE_PROCESS_START GIT_VENDORED_ROOT
+    # No test reads a token from the ambient environment (CI holds real
+    # secrets); a test that needs one passes a fake value.
+    unset VENDOR_PAT GH_TOKEN GITHUB_TOKEN
     local tool dir
     for tool in bash sh sed head mktemp rm mkdir cp chmod cat sha256sum tar gzip \
                 dirname basename env grep ln ls touch sort tr; do
