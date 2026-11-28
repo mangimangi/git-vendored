@@ -8,7 +8,7 @@ Subcommands:
     bump-all --since <commit> [opts] Check all components, bump all triggered
     tag [--push] [--subdir <name>]   Create version tags from VERSION files
 
-Config: .semver/config.json (see README for schema)
+Config: .vendored/configs/git-semver.json (see README for schema)
 """
 
 import argparse
@@ -593,7 +593,9 @@ def cmd_tag(args):
     """Create version tags from VERSION files.
 
     Reads the current version from each component's version_file and creates
-    annotated tags. Idempotent: if the tag already exists at HEAD, no error.
+    annotated tags. Idempotent: if the tag for a component's current version
+    already exists (at any commit), it is skipped — this is the expected case
+    in a monorepo where only the bumped component has a new version.
     """
     config = load_config(args.config)
     subdir = getattr(args, "subdir", None)
@@ -624,25 +626,14 @@ def cmd_tag(args):
 
     tags_created = []
     for comp_subdir, version, tag_name in components:
-        # Check if tag already exists at HEAD
+        # If a tag for this version already exists (at any commit), skip it.
+        # In a monorepo only the bumped component has a new version; untouched
+        # components still point at their prior tag, which is expected — not an error.
         result = git("tag", "-l", tag_name, check=False)
         if result.stdout.strip() == tag_name:
-            # Tag exists — check if it points at HEAD
-            tag_commit = git("rev-list", "-n1", tag_name, check=False)
-            head_commit = git("rev-parse", "HEAD", check=False)
-            if tag_commit.stdout.strip() == head_commit.stdout.strip():
-                label = comp_subdir or "root"
-                print(f"Tag {tag_name} already exists at HEAD ({label}), skipping")
-                tags_created.append(tag_name)
-                continue
-            # Tag exists at a different commit
             label = comp_subdir or "root"
-            existing = tag_commit.stdout.strip()[:8]
-            current = head_commit.stdout.strip()[:8]
-            raise SemverError(
-                f"Tag {tag_name} ({label}) already exists at commit {existing}, "
-                f"but HEAD is {current}. Delete it first with: git tag -d {tag_name}"
-            )
+            print(f"Tag {tag_name} already exists ({label}), skipping")
+            continue
         git("tag", "-a", tag_name, "-m", tag_name)
         label = comp_subdir or "root"
         print(f"Tagged {label}: {tag_name}")
