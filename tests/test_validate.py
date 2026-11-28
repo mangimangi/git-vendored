@@ -429,3 +429,207 @@ class TestMain:
             with pytest.raises(SystemExit) as exc_info:
                 val.main()
             assert exc_info.value.code == 1
+
+
+# ── Tests: decode failures, empty/large manifests ───────────────────────
+
+def _b64(text):
+    return base64.b64encode(text.encode() if isinstance(text, str) else text).decode()
+
+
+class TestDecodeFailures:
+    @patch("vendored_validate.subprocess.run")
+    def test_undecodable_version_file_fails(self, mock_run):
+        """Releases missing and VERSION content is not valid base64 -> fail."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout=""),
+            MagicMock(returncode=0, stdout="abc\n"),  # bad padding
+        ]
+        r = val.ValidationResult()
+        assert val.check_version_resolvable("owner/repo", "tok", "latest", r) is None
+        assert r.checks == [("FAIL", "  [FAIL] Version resolvable -- "
+                                     "no releases or VERSION file found")]
+
+    @patch("vendored_validate.subprocess.run")
+    def test_non_utf8_version_file_fails(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout=""),
+            MagicMock(returncode=0, stdout=_b64(b"\xff\xfe")),
+        ]
+        r = val.ValidationResult()
+        assert val.check_version_resolvable("owner/repo", "tok", "latest", r) is None
+        assert r.fail_count == 1
+
+    @patch("vendored_validate.subprocess.run")
+    def test_empty_version_file_fails(self, mock_run):
+        """A VERSION file holding only whitespace does not resolve a version."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stdout=""),
+            MagicMock(returncode=0, stdout=_b64("\n")),
+        ]
+        r = val.ValidationResult()
+        assert val.check_version_resolvable("owner/repo", "tok", "latest", r) is None
+        assert r.pass_count == 0
+        assert r.fail_count == 1
+
+    @patch("vendored_validate.subprocess.run")
+    def test_undecodable_install_sh_returns_none(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="abc\n")
+        assert val.download_install_sh("owner/repo", "1.0.0", "tok") is None
+        assert mock_run.call_count == 1  # first ref returned content; no retry
+
+    @patch("vendored_validate.subprocess.run")
+    def test_both_refs_tried_before_giving_up(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        assert val.download_install_sh("owner/repo", "1.0.0", "tok") is None
+        refs = [c[0][0][2] for c in mock_run.call_args_list]
+        assert refs == ["repos/owner/repo/contents/install.sh?ref=v1.0.0",
+                        "repos/owner/repo/contents/install.sh?ref=1.0.0"]
+
+
+class TestDryrunManifestEdgeCases:
+    def test_empty_manifest(self):
+        script = "#!/bin/bash\nprintf '\\n  \\n' > \"$VENDOR_MANIFEST\"\n"
+        r = val.ValidationResult()
+        val.run_dryrun_install("owner/repo", "1.0.0", script, "tok", r)
+        assert [m for _, m in r.checks] == [
+            "  [PASS] Dry-run install (exit code 0)",
+            "  [FAIL] Manifest written -- manifest file is empty",
+            "  [FAIL] Manifest files exist -- skipped (empty manifest)",
+        ]
+
+    def test_more_than_five_missing_truncated(self):
+        script = "#!/bin/bash\nfor i in 1 2 3 4 5 6 7; do echo \"m$i\"; done " \
+                 "> \"$VENDOR_MANIFEST\"\n"
+        r = val.ValidationResult()
+        val.run_dryrun_install("owner/repo", "1.0.0", script, "tok", r)
+        status, msg = r.checks[-1]
+        assert status == "FAIL"
+        assert msg == ("  [FAIL] Manifest files exist -- 7 missing: "
+                       "m1, m2, m3, m4, m5 (and 2 more)")
+
+    @patch("vendored_validate.subprocess.run")
+    def test_failure_detail_includes_stderr_and_env(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=3, stderr="boom\n", stdout="")
+        r = val.ValidationResult()
+        val.run_dryrun_install("owner/tool", "1.2.0", "#!/bin/bash\n", "tok", r)
+        assert r.checks[0] == ("FAIL", "  [FAIL] Dry-run install -- exit code 3: boom")
+        env = mock_run.call_args[1]["env"]
+        assert env["VENDOR_REPO"] == "owner/tool"
+        assert env["VENDOR_REF"] == "v1.2.0"
+        assert env["VENDOR_INSTALL_DIR"] == os.path.join(".vendored", "pkg", "tool")
+        assert env["GH_TOKEN"] == "tok"
+
+
+# ── Tests: end-to-end validate with subprocess.run faked at the boundary ─
+
+GOOD_SCRIPT = (
+    "#!/bin/bash\n"
+    "mkdir -p \"$VENDOR_INSTALL_DIR\"\n"
+    "touch \"$VENDOR_INSTALL_DIR/tool\"\n"
+    "echo \"$VENDOR_INSTALL_DIR/tool\" > \"$VENDOR_MANIFEST\"\n"
+)
+
+
+_REAL_RUN = _real_subprocess.run  # captured before any test patches it
+
+
+def _fake_run(script=GOOD_SCRIPT, repo_ok=True, tag="v1.2.0", calls=None):
+    """Answer gh api calls from canned data; run bash for real (local only)."""
+    def run(cmd, **kwargs):
+        if calls is not None:
+            calls.append((cmd, kwargs))
+        if cmd[0] == "bash":
+            return _REAL_RUN(cmd, **kwargs)
+        assert cmd[:2] == ["gh", "api"]
+        path = cmd[2]
+        if path == "repos/owner/tool":
+            return MagicMock(returncode=0 if repo_ok else 1, stdout="owner/tool\n")
+        if path == "repos/owner/tool/contents/install.sh":
+            return MagicMock(returncode=0, stdout="install.sh\n")
+        if path == "repos/owner/tool/releases/latest":
+            return MagicMock(returncode=0 if tag else 1, stdout=(tag or "") + "\n")
+        if path.startswith("repos/owner/tool/contents/install.sh?ref="):
+            return MagicMock(returncode=0, stdout=_b64(script) + "\n")
+        return MagicMock(returncode=1, stdout="")
+    return run
+
+
+class TestValidateEndToEnd:
+    def test_compliant_repo_passes_all_eight(self, monkeypatch, capsys):
+        monkeypatch.setenv("GH_TOKEN", "gh-tok")
+        with patch("vendored_validate.subprocess.run", side_effect=_fake_run()):
+            assert val.validate("owner/tool") == 0
+        out = capsys.readouterr().out
+        assert "Validating vendor contract: owner/tool" in out
+        assert "  [PASS] Version resolvable (1.2.0)" in out
+        assert "Result: PASS (8/8 checks passed)" in out
+
+    def test_broken_script_collects_failures(self, monkeypatch, capsys):
+        monkeypatch.setenv("GH_TOKEN", "gh-tok")
+        script = "#!/bin/sh\nif then\n"
+        with patch("vendored_validate.subprocess.run",
+                   side_effect=_fake_run(script=script)):
+            assert val.validate("owner/tool", "2.0.0") == 1
+        out = capsys.readouterr().out
+        assert "[FAIL] Valid shebang -- got: #!/bin/sh" in out
+        assert "[FAIL] Syntax valid" in out
+        assert "[FAIL] Dry-run install" in out
+        assert "[FAIL] Manifest written" in out
+        assert "Result: FAIL (5/8 checks failed)" in out
+
+    def test_inaccessible_repo_stops_early(self, monkeypatch, capsys):
+        calls = []
+        with patch("vendored_validate.subprocess.run",
+                   side_effect=_fake_run(repo_ok=False, calls=calls)):
+            assert val.validate("owner/tool") == 1
+        assert len(calls) == 1
+        out = capsys.readouterr().out
+        assert "[FAIL] Repo exists -- cannot access owner/tool" in out
+        assert "Result: FAIL (1/1 checks failed)" in out
+
+    def test_unresolvable_version_stops_early(self, capsys):
+        calls = []
+        with patch("vendored_validate.subprocess.run",
+                   side_effect=_fake_run(tag=None, calls=calls)):
+            assert val.validate("owner/tool") == 1
+        assert not any(c[0][0] == "bash" for c in calls)
+        assert "Result: FAIL (1/3 checks failed)" in capsys.readouterr().out
+
+
+class TestTokenSelection:
+    def _gh_envs(self, calls):
+        return [kw["env"] for cmd, kw in calls if cmd[0] == "gh"]
+
+    def test_gh_token_wins_over_github_token(self, monkeypatch):
+        monkeypatch.setenv("GH_TOKEN", "gh-tok")
+        monkeypatch.setenv("GITHUB_TOKEN", "github-tok")
+        calls = []
+        with patch("vendored_validate.subprocess.run",
+                   side_effect=_fake_run(calls=calls)):
+            val.validate("owner/tool")
+        envs = self._gh_envs(calls)
+        assert envs and all(e["GH_TOKEN"] == "gh-tok" for e in envs)
+
+    def test_github_token_exported_as_gh_token(self, monkeypatch):
+        """gh only reads GH_TOKEN, so GITHUB_TOKEN is passed through under that name."""
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN", "github-tok")
+        calls = []
+        with patch("vendored_validate.subprocess.run",
+                   side_effect=_fake_run(calls=calls)):
+            val.validate("owner/tool")
+        envs = self._gh_envs(calls)
+        assert envs and all(e["GH_TOKEN"] == "github-tok" for e in envs)
+        dryrun_env = [kw["env"] for cmd, kw in calls
+                      if cmd[0] == "bash" and cmd[1] != "-n"][0]
+        assert dryrun_env["GH_TOKEN"] == "github-tok"
+
+    def test_no_token_leaves_env_unset(self, monkeypatch):
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        calls = []
+        with patch("vendored_validate.subprocess.run",
+                   side_effect=_fake_run(calls=calls)):
+            val.validate("owner/tool")
+        assert all("GH_TOKEN" not in e for e in self._gh_envs(calls))

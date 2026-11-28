@@ -287,3 +287,67 @@ class TestMain:
         with pytest.raises(SystemExit) as exc_info:
             audit.main()
         assert exc_info.value.code == 1
+
+
+# ── Tests: non-config files, full-report output ──────────────────────────
+
+class TestLoadConfigsIgnoresOtherFiles:
+    def test_skips_non_json_files(self, make_config, tmp_repo):
+        make_config("tool", {"prefix": "gv"})
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        (configs_dir / "README.md").write_text("not a config\n")
+        (configs_dir / "tool.json.bak").write_text("{broken")
+        assert audit.load_configs() == {"tool": {"prefix": "gv"}}
+
+    def test_non_schema_manifests_ignored(self, make_schema, tmp_repo):
+        make_schema("tool", SAMPLE_SCHEMA)
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        (manifests_dir / "tool.files").write_text("x\n")
+        (manifests_dir / "tool.version").write_text("1.0.0\n")
+        assert list(audit.load_schemas()) == ["tool"]
+
+
+class TestMainReport:
+    def test_all_pass_summary(self, make_schema, make_config, capsys):
+        make_schema("tool", SAMPLE_SCHEMA)
+        make_config("tool", {"prefix": "gv", "debug": True})
+        with pytest.raises(SystemExit) as exc_info:
+            audit.main()
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "  tool.json\n" in out
+        assert "    [PASS] prefix: required field present" in out
+        assert "    [PASS] debug: valid optional field" in out
+        assert "Summary: all checks passed" in out
+
+    def test_errors_and_warnings_across_vendors(self, make_schema, make_config,
+                                                capsys):
+        make_schema("tool", SAMPLE_SCHEMA)
+        make_schema("other", {"fields": {
+            "port": {"required": True, "type": "number"},
+        }})
+        # tool: wrong type for debug, missing prefix, carries other's field
+        make_config("tool", {"debug": "yes", "port": 8080, "mystery": 1})
+        # other: port given as bool (not a number in JSON)
+        make_config("other", {"port": True})
+        with pytest.raises(SystemExit) as exc_info:
+            audit.main()
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "[FAIL] prefix: required field missing" in out
+        assert "[FAIL] debug: expected boolean, got str" in out
+        assert "[FAIL] port: expected number, got bool" in out
+        assert "[WARN] port: defined in other schema, not tool" in out
+        assert "[WARN] mystery: unknown field (not in tool schema)" in out
+        # vendors reported in sorted order
+        assert out.index("  other.json") < out.index("  tool.json")
+        assert "Summary: 2 warnings, 3 errors" in out
+
+    def test_no_results_prints_no_summary(self, make_schema, make_config, capsys):
+        """A schema with only absent optional fields produces no report lines."""
+        make_schema("tool", {"fields": {"debug": {"type": "boolean"}}})
+        make_config("tool", {"_vendor": {"repo": "owner/tool"}})
+        with pytest.raises(SystemExit) as exc_info:
+            audit.main()
+        assert exc_info.value.code == 0
+        assert capsys.readouterr().out == ""
