@@ -466,6 +466,20 @@ class TestLoadConfig:
         assert "git-vendored" in config["vendors"]
 
 
+    def test_skips_config_without_registry_or_repo(self, tmp_repo):
+        """A config with no registry and no repo is the repo's own, not a vendor."""
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        gv_config = SAMPLE_CONFIG["vendors"]["git-vendored"]
+        (configs_dir / "git-vendored.json").write_text(json.dumps(gv_config))
+        (configs_dir / "git-cicd.json").write_text(
+            json.dumps({"jobs": {"test": {"steps": ["ci/test.sh"]}}}))
+        config = check.load_config()
+        assert list(config["vendors"]) == ["git-vendored"]
+
+    def test_only_own_config_means_no_vendors(self, tmp_repo):
+        assert check._extract_vendor_registry({"jobs": {}}, "git-cicd") is None
+
 # ── Tests: get_branch_name ─────────────────────────────────────────────────
 
 class TestGetBranchName:
@@ -523,6 +537,10 @@ class TestDoubleStarSuffixPatterns:
     def test_suffix_matches_file_directly_under_prefix(self):
         """'docs/**/*.md' covers docs/a.md: ** may stand for no directory."""
         assert check.matches_any_pattern("docs/a.md", ["docs/**/*.md"])
+
+    def test_suffix_matches_nested_basename(self):
+        """'docs/**/x*.md' covers docs/a/xb.md through the basename."""
+        assert check.matches_any_pattern("docs/a/xb.md", ["docs/**/x*.md"])
 
     def test_suffix_rejects_other_extension_nested(self):
         assert not check.matches_any_pattern("docs/a/b.txt", ["docs/**/*.md"])

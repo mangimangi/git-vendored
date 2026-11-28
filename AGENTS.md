@@ -56,7 +56,7 @@ named input fields:
 
 ```
 release          (no inputs: tags the branch's current commit)
-update-vendored  vendor=git-cicd version=latest   # defaults: all, latest; private: false|true
+update-vendored  vendor=git-cicd version=latest   # defaults: all, latest; private: false|true (only for a new vendor)
 validate         repo=owner/repo                  # version defaults to latest
 ```
 

@@ -39,8 +39,11 @@ def _read_registry(vendor_name):
 def _extract_vendor_registry(raw, vendor_name=None):
     """Extract registry fields from a per-vendor config file's contents.
 
-    Prefers .registry file in manifests/ (new path). Falls back to _vendor
-    key in config, then treats all top-level keys as registry fields.
+    A file under .vendored/configs/ is a vendor only when a registry says
+    so: a .vendored/manifests/<vendor>.registry file, a _vendor block in
+    the file, or (the pre-_vendor form) top-level registry fields that
+    include `repo`. Returns None for any other file: it is the repository's
+    own configuration (for example a tool's job config in its own repo).
     """
     if vendor_name:
         registry = _read_registry(vendor_name)
@@ -48,7 +51,9 @@ def _extract_vendor_registry(raw, vendor_name=None):
             return registry
     if "_vendor" in raw:
         return dict(raw["_vendor"])
-    return dict(raw)
+    if "repo" in raw:
+        return dict(raw)
+    return None
 
 
 def load_config(config_path=CONFIG_PATH):
@@ -71,7 +76,9 @@ def load_config(config_path=CONFIG_PATH):
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
                     raw = json.load(f)
-                vendors[vendor_name] = _extract_vendor_registry(raw, vendor_name)
+                registry = _extract_vendor_registry(raw, vendor_name)
+                if registry is not None:
+                    vendors[vendor_name] = registry
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json
@@ -89,23 +96,20 @@ def delete_vendor_config(vendor_name):
         os.remove(filepath)
 
 
-def save_config(config):
+def save_config(config, removed=()):
     """Write config back to disk.
 
-    If per-vendor configs/ is in use, deletes removed vendors' config
-    files (remaining vendors are left as-is on disk to preserve their
-    _vendor structure and project config). Otherwise writes monolithic
-    config.json.
+    If per-vendor configs/ is in use, deletes the config files of the
+    vendors in `removed` (remaining vendors are left as-is on disk to
+    preserve their _vendor structure and project config). Any other file
+    under configs/ (the repository's own config, with no registry) is never
+    touched. Otherwise writes monolithic config.json.
     """
     if os.path.isdir(CONFIGS_DIR):
         json_files = [f for f in os.listdir(CONFIGS_DIR) if f.endswith(".json")]
         if json_files:
-            vendors = config.get("vendors", {})
-            # Delete configs for vendors that were removed
-            for filename in json_files:
-                vendor_name = filename[:-5]
-                if vendor_name not in vendors:
-                    os.remove(os.path.join(CONFIGS_DIR, filename))
+            for vendor_name in removed:
+                delete_vendor_config(vendor_name)
             return
 
     with open(CONFIG_PATH, "w") as f:
@@ -210,6 +214,12 @@ def main():
     config = load_config()
     vendors = config.get("vendors", {})
 
+    if (args.vendor not in vendors
+            and os.path.isfile(os.path.join(CONFIGS_DIR, f"{args.vendor}.json"))):
+        # The repository's own config (no registry): not a vendor
+        print(f"::error::'{args.vendor}' is not a registered vendor: "
+              f"{CONFIGS_DIR}/{args.vendor}.json has no registry")
+        sys.exit(1)
     if args.vendor not in vendors:
         print(f"::error::Unknown vendor: {args.vendor}")
         print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
@@ -252,7 +262,7 @@ def main():
     # Remove config entry
     del vendors[args.vendor]
     config["vendors"] = vendors
-    save_config(config)
+    save_config(config, removed=[args.vendor])
 
     print(f"\nRemoved vendor: {args.vendor} ({removed} files deleted)")
 

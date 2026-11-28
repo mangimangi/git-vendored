@@ -4440,3 +4440,95 @@ class TestRequireWriteTokenInCI:
         with patch("sys.argv", ["install", "tool"]):
             inst.main()
         mock_install.assert_called_once()
+
+
+# ── Tests: a config that is not a vendor's (gv-2668) ──────────────────────
+
+JOB_CONFIG_TEXT = ('{\n  "jobs": {"test": {"steps": ["ci/test.sh"]}},\n'
+                   '  "inputs": {"vendor": "all"}\n}\n')
+
+
+def _repo_with_own_config(tmp_repo):
+    """configs/ with one registered vendor (tool) and the repo's own config."""
+    configs = tmp_repo / ".vendored" / "configs"
+    configs.mkdir(parents=True, exist_ok=True)
+    (configs / "tool.json").write_text('{"prefix": "t"}\n')
+    (configs / "git-cicd.json").write_text(JOB_CONFIG_TEXT)
+    manifests = tmp_repo / ".vendored" / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    (manifests / "tool.registry").write_text(json.dumps(SAMPLE_VENDOR) + "\n")
+    (manifests / "tool.version").write_text("1.0.0\n")
+    return configs / "git-cicd.json"
+
+
+class TestUnregisteredConfig:
+    def test_extract_returns_none_without_registry_or_repo(self, tmp_repo):
+        assert inst._extract_vendor_registry({"jobs": {}}, "git-cicd") is None
+
+    def test_extract_keeps_vendor_block_and_flat_repo(self, tmp_repo):
+        assert inst._extract_vendor_registry(
+            {"_vendor": {"repo": "o/r"}}, "x") == {"repo": "o/r"}
+        assert inst._extract_vendor_registry({"repo": "o/r"}, "x") == {"repo": "o/r"}
+
+    def test_load_config_skips_own_config(self, tmp_repo):
+        _repo_with_own_config(tmp_repo)
+        assert list(inst.load_config()["vendors"]) == ["tool"]
+
+    def test_all_updates_vendor_and_leaves_own_config(self, tmp_repo, capsys):
+        own = _repo_with_own_config(tmp_repo)
+        before = own.read_bytes()
+
+        def _run(*args, **kwargs):
+            p = tmp_repo / ".tool" / "bin"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("# v2\n")
+            return [".tool/bin"]
+
+        with patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_schema", return_value=None), \
+             patch("vendored_install.resolve_version", return_value=res("2.0.0")), \
+             patch("vendored_install.get_auth_token", return_value=None), \
+             patch("vendored_install._maybe_reexec"), \
+             patch("vendored_install.download_and_run_install",
+                   side_effect=_run) as mock_run, \
+             patch("sys.argv", ["install", "all"]):
+            inst.main()  # no SystemExit: exits 0
+
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == "owner/tool"
+        manifests = tmp_repo / ".vendored" / "manifests"
+        assert (manifests / "tool.version").read_text().strip() == "2.0.0"
+        assert own.read_bytes() == before
+        assert not (manifests / "git-cicd.registry").exists()
+        out = capsys.readouterr().out
+        assert "vendor=tool" in out and "new_version=2.0.0" in out
+        assert "git-cicd" not in out
+
+    def test_naming_own_config_is_not_a_vendor(self, tmp_repo, capsys):
+        own = _repo_with_own_config(tmp_repo)
+        before = own.read_bytes()
+        with patch("sys.argv", ["install", "git-cicd"]):
+            with pytest.raises(SystemExit) as exc_info:
+                inst.main()
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert out.splitlines() == [
+            "::error::'git-cicd' is not a registered vendor: "
+            ".vendored/configs/git-cicd.json has no registry"]
+        assert own.read_bytes() == before
+
+    def test_legacy_project_config_not_merged_into_own_config(self, tmp_repo):
+        own = _repo_with_own_config(tmp_repo)
+        before = own.read_bytes()
+        (tmp_repo / ".git-cicd").mkdir()
+        (tmp_repo / ".git-cicd" / "config.json").write_text('{"a": 1}')
+        inst.migrate_project_configs()
+        assert own.read_bytes() == before
+        assert (tmp_repo / ".git-cicd" / "config.json").exists()
+
+    def test_registry_without_repo_is_an_error(self, tmp_repo, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            inst.install_existing_vendor("tool", {"protected": []}, "latest")
+        assert exc_info.value.code == 1
+        assert ("::error::Vendor 'tool' has no repo in its registry"
+                in capsys.readouterr().out)
