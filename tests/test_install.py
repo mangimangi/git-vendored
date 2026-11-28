@@ -4166,7 +4166,7 @@ class TestRequireWriteTokenInCI:
     def test_ci_without_write_token_fails_with_message(self, monkeypatch,
                                                       capsys):
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
-        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        monkeypatch.setenv("GITHUB_TOKEN", "fake-gt-value-789")
         monkeypatch.setenv("CICD_READ_TOKEN", "fake-read-token")
         with pytest.raises(SystemExit) as exc:
             inst.require_write_token_in_ci()
@@ -4176,7 +4176,7 @@ class TestRequireWriteTokenInCI:
         assert "declare it in the git-cicd job" in out
         assert "--allow-workflow-token" in out
         assert "VENDOR_PAT" not in out
-        assert "workflow-token" not in out and "fake-read-token" not in out
+        assert "fake-gt-value-789" not in out and "fake-read-token" not in out
 
     @pytest.mark.parametrize("name", ["CICD_WRITE_TOKEN", "VENDOR_PAT"])
     def test_ci_with_write_token_passes(self, monkeypatch, name):
