@@ -105,6 +105,9 @@ install_workflow() {
     if fetch_file "templates/github/workflows/$workflow" ".github/workflows/$workflow" 2>/dev/null; then
         echo "Installed .github/workflows/$workflow"
         INSTALLED_FILES+=(".github/workflows/$workflow")
+    else
+        # gh path's redirect leaves an empty file behind on failure
+        rm -f ".github/workflows/$workflow"
     fi
 }
 

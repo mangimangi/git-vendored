@@ -38,7 +38,8 @@ python3 .vendored/install --list              # list installed vendors
 
 Pull request checks run through git-cicd (`.vendored/configs/git-cicd.json`):
 the `test` job (`ci/setup.sh` installs the Python floor from `requires-python`
-in `pyproject.toml` plus pytest and pyyaml; `ci/test.sh` runs the suite) and
+in `pyproject.toml` plus pytest, pyyaml, coverage and bats; `ci/test.sh` runs
+the pytest suite under coverage, enforces 99%, then runs the bats tests) and
 the `vendor-check` job (`ci/vendor-check.sh` runs `.vendored/check`). Run them
 locally the same way:
 
@@ -48,6 +49,21 @@ locally the same way:
 ```
 
 Or just the suite: `pip install pytest pyyaml && python3 -m pytest tests/ -v`.
+
+### Shell tests (bats)
+
+`install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts have
+bats tests under `tests/bats/` (`install.bats`, `vendor-helpers.bats`,
+`ci-setup.bats`, `ci-test.bats`, `ci-vendor-check.bats`). `ci/test.sh` runs
+them after pytest, and a failing bats test fails the `test` job. They stub
+`curl`, `gh`, `uv`, the Python interpreters and `bats` on a temporary `PATH`
+and run in temp dirs: no network, nothing installed. `ci/setup.sh` provides
+bats (the one on `PATH`, or a pinned bats-core it downloads into the cache).
+There is no coverage figure for shell. Run them alone:
+
+```bash
+bats tests/bats/        # or ~/.cache/git-vendored-ci/bats-<version>/bin/bats tests/bats/
+```
 
 ### Coverage
 

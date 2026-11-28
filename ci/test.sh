@@ -3,6 +3,8 @@
 # coverage, print the per-file line coverage of the shipped Python scripts,
 # and fail when the total or any one file is below 99% (fail_under in
 # pyproject.toml; the per-file check is below, coverage has no setting for it).
+# Then runs the bats tests for the shell scripts (tests/bats/); the step fails
+# when either suite fails.
 #
 # Uses the virtualenv ci/setup.sh creates for the Python floor. When setup was
 # skipped (a local `git-cicd check` without --setup), falls back to a python3
@@ -16,6 +18,8 @@ set -euo pipefail
 FLOOR="$(sed -n 's/^requires-python *= *">= *\([0-9][0-9.]*\)".*/\1/p' pyproject.toml | head -n1)"
 VENV="${XDG_CACHE_HOME:-$HOME/.cache}/git-vendored-ci/venv-$FLOOR"
 SETUP_HINT="run: .vendored/pkg/git-cicd/git-cicd check --setup"
+BATS_VERSION="$(sed -n 's/^BATS_VERSION="\(.*\)"$/\1/p' ci/setup.sh | head -n1)"
+BATS_CACHED="${XDG_CACHE_HOME:-$HOME/.cache}/git-vendored-ci/bats-$BATS_VERSION/bin/bats"
 
 if [ -x "$VENV/bin/python" ]; then
     PYTHON="$VENV/bin/python"
@@ -23,6 +27,15 @@ elif python3 -c "import pytest, yaml, coverage" 2>/dev/null; then
     PYTHON=python3
 else
     echo "ci/test.sh: pytest, pyyaml or coverage is not installed; $SETUP_HINT" >&2
+    exit 1
+fi
+
+if command -v bats >/dev/null 2>&1; then
+    BATS="$(command -v bats)"
+elif [ -x "$BATS_CACHED" ]; then
+    BATS="$BATS_CACHED"
+else
+    echo "ci/test.sh: bats is not installed; $SETUP_HINT" >&2
     exit 1
 fi
 
@@ -79,4 +92,7 @@ if low:
           "(see Coverage in AGENTS.md)", file=sys.stderr)
 sys.exit(1 if low else 0)
 PY
+
+"$BATS" --version
+"$BATS" tests/bats/ || status=$?
 exit "$status"
