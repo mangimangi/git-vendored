@@ -4,8 +4,10 @@
 # Reads the Python floor from requires-python in pyproject.toml, uses that
 # Python if present (python3.X, the runner tool cache) or installs it with uv
 # (itself installed into a small venv when missing), and installs what the
-# test suite needs (pytest, pyyaml) into a virtualenv ci/test.sh finds on
-# disk. No Python version is written in the workflow or the config: this
+# test suite needs (pytest, pyyaml, coverage) into a virtualenv ci/test.sh
+# finds on disk, with a .pth startup hook so Python processes the tests start
+# as subprocesses are measured too. When no `bats` is on PATH it also puts a
+# pinned bats-core in the cache for the shell tests (tests/bats/). No Python version is written in the workflow or the config: this
 # script is the only place that decides it.
 set -euo pipefail
 
@@ -50,5 +52,37 @@ fi
 
 "$PYTHON" -m venv --clear "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet pytest pyyaml
+# coverage 7.6 is the last line that supports Python 3.8 (the floor); [toml]
+# pulls tomli there so the [tool.coverage] settings in pyproject.toml are read.
+"$VENV/bin/python" -m pip install --quiet pytest pyyaml "coverage[toml]>=7.2,<7.7"
+# Subprocess measurement: every interpreter started from this venv runs this
+# hook, which starts coverage only when COVERAGE_PROCESS_START is set (as
+# ci/test.sh does). coverage 7.10's patch = ["subprocess"] would replace it,
+# but does not support Python 3.8.
+SITE="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+echo "import coverage; coverage.process_startup()" > "$SITE/git-vendored-coverage.pth"
 "$VENV/bin/python" --version
+
+# bats-core for the shell tests: the one on PATH if there is one, otherwise a
+# pinned release (the npm registry tarball, checked against its sha256) in
+# the cache, where ci/test.sh looks for it.
+BATS_VERSION="1.11.1"
+BATS_SHA256="1d8a88fc70bc5a518c7cf17e5201b80b24e9475be95abe6508b3197a64b73365"
+BATS_DIR="$CACHE/bats-$BATS_VERSION"
+if command -v bats >/dev/null 2>&1; then
+    echo "ci/setup.sh: using $(bats --version) at $(command -v bats)"
+elif [ -x "$BATS_DIR/bin/bats" ]; then
+    echo "ci/setup.sh: using bats $BATS_VERSION at $BATS_DIR/bin/bats"
+else
+    TARBALL="$CACHE/bats-$BATS_VERSION.tgz"
+    curl -fsSL "https://registry.npmjs.org/bats/-/bats-$BATS_VERSION.tgz" -o "$TARBALL"
+    if ! echo "$BATS_SHA256  $TARBALL" | sha256sum -c --status; then
+        echo "ci/setup.sh: bats $BATS_VERSION download does not match its sha256" >&2
+        rm -f "$TARBALL"
+        exit 1
+    fi
+    rm -rf "$BATS_DIR" && mkdir -p "$BATS_DIR"
+    tar xzf "$TARBALL" -C "$BATS_DIR" --strip-components=1
+    rm -f "$TARBALL"
+    echo "ci/setup.sh: installed bats $BATS_VERSION at $BATS_DIR/bin/bats"
+fi

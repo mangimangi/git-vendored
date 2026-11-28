@@ -2711,3 +2711,397 @@ class TestListVendors:
         """Outputs nothing when manifests dir doesn't exist."""
         inst.list_vendors()
         assert capsys.readouterr().out == ""
+
+
+# ── Tests: gh API decoding edge cases ────────────────────────────────────
+
+import base64 as _b64
+import subprocess as _real_subprocess
+
+_REAL_RUN = _real_subprocess.run
+
+
+def _b64s(data):
+    if isinstance(data, str):
+        data = data.encode()
+    return _b64.b64encode(data).decode() + "\n"
+
+
+class TestGhContentDecoding:
+    @patch("vendored_install.subprocess.run")
+    def test_undecodable_version_file_is_unresolvable(self, mock_run, capsys):
+        """A VERSION file that isn't valid UTF-8 can't resolve 'latest'."""
+        def side_effect(cmd, **kwargs):
+            if "contents/VERSION" in cmd[2]:
+                return MagicMock(returncode=0, stdout=_b64s(b"\xff\xfe\xfa"))
+            return MagicMock(returncode=1, stdout="")
+        mock_run.side_effect = side_effect
+
+        assert inst._resolve_from_version_file("owner/tool", "token") is None
+        with pytest.raises(SystemExit) as exc_info:
+            inst.resolve_version("tool", "owner/tool", "latest", "token")
+        assert exc_info.value.code == 1
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_deps_invalid_json_returns_none(self, mock_run):
+        """A deps.json that isn't valid JSON is treated as no deps."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=_b64s("{not json"))
+        assert inst.download_deps("owner/tool", "v1.0.0", "token") is None
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_schema_invalid_json_returns_none(self, mock_run):
+        """A config.schema that isn't valid JSON is treated as no schema."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=_b64s("nope{"))
+        assert inst.download_schema("owner/tool", "v1.0.0", "token") is None
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_schema_requests_ref_with_token(self, mock_run):
+        """Schema is fetched from templates/config.schema at the given ref."""
+        mock_run.return_value = MagicMock(returncode=0, stdout=_b64s('{"a": 1}'))
+        assert inst.download_schema("owner/tool", "v2.0.0", "tok") == {"a": 1}
+        cmd = mock_run.call_args[0][0]
+        assert cmd[2] == "repos/owner/tool/contents/templates/config.schema?ref=v2.0.0"
+        assert mock_run.call_args[1]["env"]["GH_TOKEN"] == "tok"
+
+
+# ── Tests: dependency mode and missing-repo deps ─────────────────────────
+
+class TestDepModeAndMissingRepo:
+    def test_dep_mode_defaults_to_error_without_config(self):
+        assert inst._get_dep_mode(None, None) == "error"
+        assert inst._get_dep_mode(None, {}) == "error"
+
+    def test_install_mode_dep_without_repo_exits(self, tmp_repo, capsys):
+        """deps.json entry with no repo can't be auto-installed."""
+        with patch("vendored_install.install_new_vendor") as mock_new:
+            with pytest.raises(SystemExit) as exc_info:
+                inst.resolve_deps({"broken": {}}, "token", "install")
+        assert exc_info.value.code == 1
+        mock_new.assert_not_called()
+        assert "Dependency 'broken' has no repo field" in capsys.readouterr().out
+
+
+# ── Tests: get_current_version without any config ────────────────────────
+
+class TestGetCurrentVersionNoConfig:
+    def test_no_manifest_and_no_config_returns_none(self, tmp_repo):
+        assert inst.get_current_version("ghost", None) is None
+
+
+# ── Tests: download_and_run_install contract ─────────────────────────────
+
+def _install_sh_runner(script, first_ref_ok=True, second_ref_ok=True):
+    """subprocess.run fake: serve install.sh via 'gh api', run bash for real."""
+    def side_effect(cmd, **kwargs):
+        if cmd[0] == "gh":
+            path = cmd[2]
+            if path.endswith("?ref=v1.0.0"):
+                ok = first_ref_ok
+            else:
+                ok = second_ref_ok
+            if ok:
+                return MagicMock(returncode=0, stdout=_b64s(script), stderr="")
+            return MagicMock(returncode=1, stdout="", stderr="Not Found")
+        return _REAL_RUN(cmd, **kwargs)
+    return side_effect
+
+
+class TestDownloadAndRunInstall:
+    @patch("vendored_install.subprocess.run")
+    def test_falls_back_to_unprefixed_ref(self, mock_run, tmp_repo):
+        """If v<version> tag has no install.sh, the bare version ref is tried."""
+        mock_run.side_effect = _install_sh_runner(
+            "#!/bin/bash\ntrue\n", first_ref_ok=False, second_ref_ok=True)
+        inst.download_and_run_install("owner/tool", "1.0.0", "token",
+                                      vendor_name="tool")
+        gh_paths = [c[0][0][2] for c in mock_run.call_args_list
+                    if c[0][0][0] == "gh"]
+        assert gh_paths == [
+            "repos/owner/tool/contents/install.sh?ref=v1.0.0",
+            "repos/owner/tool/contents/install.sh?ref=1.0.0",
+        ]
+
+    @patch("vendored_install.subprocess.run")
+    def test_download_failure_exits(self, mock_run, tmp_repo, capsys):
+        mock_run.side_effect = _install_sh_runner(
+            "", first_ref_ok=False, second_ref_ok=False)
+        with pytest.raises(SystemExit) as exc_info:
+            inst.download_and_run_install("owner/tool", "1.0.0", "token",
+                                          vendor_name="tool")
+        assert exc_info.value.code == 1
+        assert ("Failed to download install.sh from owner/tool at v1.0.0"
+                in capsys.readouterr().out)
+        assert not any(c[0][0][0] == "bash" for c in mock_run.call_args_list)
+
+    @patch("vendored_install.subprocess.run")
+    def test_reads_manifest_written_by_install_sh(self, mock_run, tmp_repo):
+        """install.sh writing to $VENDOR_MANIFEST yields the manifest list."""
+        script = (
+            '#!/bin/bash\n'
+            'printf "%s\\n" ".vendored/pkg/tool/a.sh" "" '
+            '"  .vendored/pkg/tool/b.sh  " > "$VENDOR_MANIFEST"\n'
+        )
+        mock_run.side_effect = _install_sh_runner(script)
+        files = inst.download_and_run_install("owner/tool", "1.0.0", "token",
+                                              vendor_name="tool")
+        assert files == [".vendored/pkg/tool/a.sh", ".vendored/pkg/tool/b.sh"]
+
+    @patch("vendored_install.subprocess.run")
+    def test_v2_env_contract(self, mock_run, tmp_repo):
+        """install.sh sees VENDOR_REPO/REF/INSTALL_DIR/LIB, GH_TOKEN and version arg."""
+        lib = tmp_repo / ".vendored" / "lib"
+        lib.mkdir()
+        (lib / "vendor-helpers.sh").write_text("# helpers\n")
+        out = tmp_repo / "env.txt"
+        script = (
+            '#!/bin/bash\n'
+            'echo "$1|$VENDOR_REPO|$VENDOR_REF|$VENDOR_INSTALL_DIR|'
+            '$VENDOR_LIB|$GH_TOKEN" > ' + str(out) + '\n'
+        )
+        mock_run.side_effect = _install_sh_runner(script)
+        inst.download_and_run_install("owner/tool", "1.0.0", "tok-1",
+                                      vendor_name="tool")
+        parts = out.read_text().strip().split("|")
+        assert parts == ["1.0.0", "owner/tool", "v1.0.0", ".vendored/pkg/tool",
+                         str(lib / "vendor-helpers.sh"), "tok-1"]
+
+    @patch("vendored_install.subprocess.run")
+    def test_install_sh_failure_exits_and_relays_stderr(self, mock_run,
+                                                        tmp_repo, capsys):
+        script = '#!/bin/bash\necho progress\necho boom >&2\nexit 3\n'
+        mock_run.side_effect = _install_sh_runner(script)
+        with pytest.raises(SystemExit) as exc_info:
+            inst.download_and_run_install("owner/tool", "1.0.0", "token",
+                                          vendor_name="tool")
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "progress" in captured.out
+        assert "boom" in captured.err
+        assert "install.sh failed for owner/tool (exit 3)" in captured.out
+
+
+class TestPostInstallHookStderr:
+    def test_hook_stderr_relayed(self, tmp_repo, capsys):
+        install_dir = str(tmp_repo / ".vendored" / "pkg" / "tool")
+        hooks_dir = tmp_repo / ".vendored" / "pkg" / "tool" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        (hooks_dir / "post-install.sh").write_text(
+            "#!/bin/bash\necho hook-warning >&2\n")
+        (tmp_repo / ".git").mkdir()
+
+        inst.run_post_install_hook("tool", install_dir, "1.0.0")
+        assert "hook-warning" in capsys.readouterr().err
+        stamp = tmp_repo / ".vendored" / "manifests" / "tool.post-installed"
+        assert stamp.read_text().strip() == "1.0.0"
+
+
+# ── Tests: install_new_vendor auto-registration ──────────────────────────
+
+class TestInstallNewVendorAutoRegister:
+    def _run(self, tmp_repo, manifest_files, schema=None, config_entry=None,
+             name=None):
+        (tmp_repo / ".vendored" / "config.json").write_text('{"vendors": {}}\n')
+
+        def fake_install(repo, version, token, **kwargs):
+            if config_entry is not None:
+                inst.save_config({"vendors": {"tool": config_entry}})
+            return manifest_files
+
+        with patch("vendored_install.check_repo_exists"), \
+             patch("vendored_install.check_install_sh"), \
+             patch("vendored_install.resolve_version", return_value="1.2.0"), \
+             patch("vendored_install.download_deps", return_value=None), \
+             patch("vendored_install.download_and_run_install",
+                   side_effect=fake_install), \
+             patch("vendored_install.download_schema",
+                   return_value=schema) as mock_schema:
+            result = inst.install_new_vendor("owner/tool", "latest", "token",
+                                             name=name)
+        return result, mock_schema
+
+    def test_registers_vendor_when_install_sh_writes_no_config(self, tmp_repo,
+                                                                capsys):
+        files = [".vendored/pkg/tool/bin/tool", "TOOL.md"]
+        for f in files:
+            p = tmp_repo / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x\n")
+        result, _ = self._run(tmp_repo, files)
+
+        assert result == {"vendor": "tool", "old_version": "none",
+                          "new_version": "1.2.0", "changed": True}
+        manifests = tmp_repo / ".vendored" / "manifests"
+        registry = json.loads((manifests / "tool.registry").read_text())
+        assert registry == {
+            "repo": "owner/tool",
+            "install_branch": "chore/install-tool",
+            "protected": [".vendored/**", "TOOL.md"],
+        }
+        assert (tmp_repo / ".vendored" / "configs" / "tool.json").is_file()
+        assert (manifests / "tool.files").read_text().split() == sorted(files)
+        assert (manifests / "tool.version").read_text().strip() == "1.2.0"
+        out = capsys.readouterr().out
+        assert "manifest: 2 files" in out
+
+    def test_no_manifest_defaults_protection_to_pkg_dir(self, tmp_repo):
+        self._run(tmp_repo, None, name="mytool")
+        registry = json.loads(
+            (tmp_repo / ".vendored" / "manifests" / "mytool.registry").read_text())
+        assert registry["protected"] == [".vendored/pkg/mytool/**"]
+        assert registry["install_branch"] == "chore/install-mytool"
+        assert registry["repo"] == "owner/tool"
+
+    def test_schema_written_and_allowed_reported(self, tmp_repo, capsys):
+        schema = {"vendor": "tool", "fields": {}}
+        entry = {"repo": "owner/tool", "install_branch": "chore/install-tool",
+                 "protected": [".tool/**"], "allowed": [".tool/config.json"]}
+        _, mock_schema = self._run(tmp_repo, None, schema=schema,
+                                   config_entry=entry)
+        mock_schema.assert_called_once_with("owner/tool", "v1.2.0", "token")
+        written = json.loads(
+            (tmp_repo / ".vendored" / "manifests" / "tool.schema").read_text())
+        assert written == schema
+        assert "allowed: .tool/config.json" in capsys.readouterr().out
+
+    @patch("vendored_install.download_deps", return_value=None)
+    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.check_install_sh")
+    @patch("vendored_install.check_repo_exists")
+    def test_name_already_registered_exits(self, mock_exists, mock_sh,
+                                           mock_ver, mock_deps,
+                                           make_config, capsys):
+        make_config({"vendors": {"tool": {"repo": "other/tool"}}})
+        with patch("vendored_install.download_and_run_install") as mock_dl:
+            with pytest.raises(SystemExit) as exc_info:
+                inst.install_new_vendor("owner/tool", "latest", "token")
+        assert exc_info.value.code == 1
+        mock_dl.assert_not_called()
+        assert "Vendor 'tool' is already registered." in capsys.readouterr().out
+
+
+class TestInstallExistingVendorCycle:
+    def test_repo_already_in_chain_exits(self, tmp_repo, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest",
+                                         installing_set=["owner/app", "owner/tool"])
+        assert exc_info.value.code == 1
+        assert ("Circular dependency detected: owner/app -> owner/tool -> owner/tool"
+                in capsys.readouterr().out)
+
+
+# ── Tests: PR push failure ───────────────────────────────────────────────
+
+class TestCreatePullRequestPushFailure:
+    @patch("vendored_install.subprocess.run")
+    def test_push_failure_exits_without_creating_pr(self, mock_run, make_config,
+                                                    monkeypatch, capsys):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        def side_effect(cmd, **kwargs):
+            if cmd[:2] == ["git", "diff"]:
+                return MagicMock(returncode=1)
+            if cmd[:2] == ["git", "push"]:
+                return MagicMock(returncode=128, stdout="out\n",
+                                 stderr="rejected\n")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        mock_run.side_effect = side_effect
+
+        results = [{"vendor": "tool", "old_version": "1.0.0",
+                    "new_version": "2.0.0", "changed": True}]
+        with pytest.raises(SystemExit) as exc_info:
+            inst.create_pull_request(results)
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "git push failed (exit 128):" in out
+        assert "stderr: rejected" in out
+        assert not any(c[0][0][:2] == ["gh", "pr"] for c in mock_run.call_args_list)
+
+
+# ── Tests: migration no-op and bad legacy config ─────────────────────────
+
+class TestMigrationEdgeCases:
+    def test_migrate_config_empty_vendors_is_noop(self, tmp_repo, make_config):
+        make_config({"vendors": {}, "other": 1})
+        raw = {"vendors": {}, "other": 1}
+        inst.migrate_config(raw)
+        assert raw == {"vendors": {}, "other": 1}
+        assert not (tmp_repo / ".vendored" / "configs").exists()
+
+    def test_migrate_project_configs_without_configs_dir(self, tmp_repo):
+        inst.migrate_project_configs()  # no configs/ — nothing to do
+        assert not (tmp_repo / ".vendored" / "configs").exists()
+
+    def test_migrate_project_configs_with_empty_configs_dir(self, tmp_repo):
+        (tmp_repo / ".vendored" / "configs").mkdir()
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text('{"a": 1}')
+        inst.migrate_project_configs()
+        assert (tmp_repo / ".tool" / "config.json").is_file()
+
+    def test_unparseable_legacy_config_skipped(self, tmp_repo, capsys):
+        configs = tmp_repo / ".vendored" / "configs"
+        configs.mkdir()
+        (configs / "tool.json").write_text('{"keep": true}\n')
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text("{broken")
+
+        inst.migrate_project_configs()
+        assert json.loads((configs / "tool.json").read_text()) == {"keep": True}
+        assert (tmp_repo / ".tool" / "config.json").read_text() == "{broken"
+        assert "could not parse .tool/config.json, skipping" in capsys.readouterr().err
+
+
+# ── Tests: main() CLI paths ──────────────────────────────────────────────
+
+class TestMainCLIPaths:
+    def test_list_flag_lists_without_target(self, tmp_repo, capsys):
+        manifests = tmp_repo / ".vendored" / "manifests"
+        manifests.mkdir()
+        (manifests / "tool.version").write_text("1.0.0\n")
+        with patch("sys.argv", ["install", "--list"]):
+            inst.main()
+        assert capsys.readouterr().out.strip() == "tool"
+
+    def test_missing_target_is_usage_error(self, tmp_repo, capsys):
+        with patch("sys.argv", ["install"]):
+            with pytest.raises(SystemExit) as exc_info:
+                inst.main()
+        assert exc_info.value.code == 2
+        assert "target is required (unless using --list)" in capsys.readouterr().err
+
+    def test_all_with_no_vendors_exits_cleanly(self, make_config, capsys):
+        make_config({"vendors": {}})
+        with patch("sys.argv", ["install", "all"]):
+            with pytest.raises(SystemExit) as exc_info:
+                inst.main()
+        assert exc_info.value.code == 0
+        assert "No vendors configured" in capsys.readouterr().out
+
+    @patch("vendored_install.create_pull_request")
+    @patch("vendored_install.install_existing_vendor")
+    def test_all_with_pr_opens_pr_for_results(self, mock_update, mock_pr,
+                                              make_config, capsys):
+        r = {"vendor": "tool", "old_version": "1.0.0",
+             "new_version": "2.0.0", "changed": True}
+        mock_update.return_value = r
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["install", "all", "--pr"]):
+            inst.main()
+        mock_pr.assert_called_once_with([r])
+
+    @patch("vendored_install.install_existing_vendor")
+    def test_main_merges_legacy_project_config(self, mock_update, tmp_repo,
+                                               capsys):
+        configs = tmp_repo / ".vendored" / "configs"
+        configs.mkdir()
+        (configs / "tool.json").write_text(json.dumps(SAMPLE_VENDOR))
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "config.json").write_text('{"prefix": "t"}')
+        mock_update.return_value = {"vendor": "tool", "old_version": "1.0.0",
+                                    "new_version": "1.0.0", "changed": False}
+        with patch("sys.argv", ["install", "tool"]):
+            inst.main()
+        assert json.loads((configs / "tool.json").read_text())["prefix"] == "t"
+        assert not (tmp_repo / ".tool").exists()
+        mock_update.assert_called_once()

@@ -38,7 +38,8 @@ python3 .vendored/install --list              # list installed vendors
 
 Pull request checks run through git-cicd (`.vendored/configs/git-cicd.json`):
 the `test` job (`ci/setup.sh` installs the Python floor from `requires-python`
-in `pyproject.toml` plus pytest and pyyaml; `ci/test.sh` runs the suite) and
+in `pyproject.toml` plus pytest, pyyaml, coverage and bats; `ci/test.sh` runs
+the pytest suite under coverage, enforces 99%, then runs the bats tests) and
 the `vendor-check` job (`ci/vendor-check.sh` runs `.vendored/check`). Run them
 locally the same way:
 
@@ -48,12 +49,61 @@ locally the same way:
 ```
 
 Or just the suite: `pip install pytest pyyaml && python3 -m pytest tests/ -v`.
+
+### Shell tests (bats)
+
+`install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts have
+bats tests under `tests/bats/` (`install.bats`, `vendor-helpers.bats`,
+`ci-setup.bats`, `ci-test.bats`, `ci-vendor-check.bats`). `ci/test.sh` runs
+them after pytest, and a failing bats test fails the `test` job. They stub
+`curl`, `gh`, `uv`, the Python interpreters and `bats` on a temporary `PATH`
+and run in temp dirs: no network, nothing installed. `ci/setup.sh` provides
+bats (the one on `PATH`, or a pinned bats-core it downloads into the cache).
+There is no coverage figure for shell. Run them alone:
+
+```bash
+bats tests/bats/        # or ~/.cache/git-vendored-ci/bats-<version>/bin/bats tests/bats/
+```
+
+### Coverage
+
+The `test` job measures line coverage of the six Python scripts the repo
+ships, and nothing else: `templates/install`, `templates/check`,
+`templates/remove`, `templates/audit`, `templates/feedback` and `validate`
+(named by path in `[tool.coverage.run]` in `pyproject.toml`, since they have
+no `.py` extension; `tests/` and `.vendored/` are not measured). `ci/test.sh`
+runs `coverage run -m pytest tests/ -v`, then `coverage combine` and
+`coverage report`.
+
+Subprocess runs count: `ci/setup.sh` puts a `.pth` startup hook
+(`coverage.process_startup()`) in the floor venv, and `ci/test.sh` exports
+`COVERAGE_PROCESS_START` and `GIT_VENDORED_ROOT`, so a script a test starts as
+a program is measured too (`tests/test_entrypoints.py` does this for the
+`__main__` lines). `tests/conftest.py` keeps those variables in any `env=` a
+test passes to subprocess. Use the venv (`git-cicd check --setup` once) for
+the same figures as CI; without the hook `ci/test.sh` warns that subprocess
+runs are not counted.
+
+Reading the report: `Stmts` is the executable lines in the file, `Miss` how
+many of them no test ran, `Cover` the percentage run, and `Missing` the line
+numbers (ranges like `100-113`) still untested. To see one file after a run:
+`<venv>/bin/python -m coverage report --include=templates/check`.
+
+The rule: each of the six scripts, and their total, must stay at 99% line
+coverage or more. `ci/test.sh` fails the `test` job (and so
+`Verdict / git-cicd:verdict`) when the total is below `fail_under = 99`
+(`pyproject.toml`) or when any one file is, naming the file, its figure and
+its missing lines. The `Cover` column rounds, so trust the `ci/test.sh:` line.
+A change that lowers coverage below 99% adds its tests in the same pull
+request. A line is excluded with `# pragma: no cover` only when no test can
+reach it, with the reason in a comment on that line.
 After changing the git-cicd config, run `.vendored/pkg/git-cicd/git-cicd generate`
 and commit `.github/workflows/git-cicd-open.yml`.
 
 ## Contributing
 
 - Commits: `<type>: <description>` (e.g., `feat:`, `fix:`, `chore:`)
+- Keep every shipped Python script at >= 99% line coverage: a change that lowers it fails the `test` job, so add its tests in the same PR (`# pragma: no cover` only for lines no test can reach, reason on the line)
 - PRs run `tests/` and `.vendored/check` as git-cicd jobs (`Open / ... / git-vendored:<job>` rows, `Verdict / git-cicd:verdict` status)
 - Vendor configs live in `.vendored/configs/<vendor>.json`, not the legacy `config.json`
 - All vendor-installed files go under `.vendored/pkg/<vendor>/`
