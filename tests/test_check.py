@@ -18,7 +18,7 @@ ROOT = Path(__file__).parent.parent
 def _import_check():
     filepath = str(ROOT / "templates" / "check")
     loader = importlib.machinery.SourceFileLoader("vendored_check", filepath)
-    spec = importlib.util.spec_from_loader("vendored_check", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_check", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["vendored_check"] = module
     spec.loader.exec_module(module)
@@ -364,6 +364,14 @@ class TestGetProtectedFiles:
         # Config patterns should NOT be in the result
         assert ".tool/**" not in result
 
+    def test_protects_commit_file(self, tmp_repo):
+        """The recorded commit of the installed version is protected."""
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        result = check.get_protected_files("tool", {"protected": []})
+        assert ".vendored/manifests/tool.commit" in result
+
     def test_protects_schema_file_when_present(self, tmp_repo):
         """Schema file is protected when it exists alongside manifest."""
         manifests_dir = tmp_repo / ".vendored" / "manifests"
@@ -646,6 +654,13 @@ class TestMain:
         _git(git_repo, "commit", "-q", "-am", "bump version by hand")
         assert _run_main(monkeypatch, "--base", "main") == 1
         assert "- .vendored/manifests/tool.version" in capsys.readouterr().out
+
+    def test_commit_file_is_protected(self, git_repo, monkeypatch, capsys):
+        (git_repo / ".vendored/manifests/tool.commit").write_text("a" * 40 + "\n")
+        _git(git_repo, "add", "-A")
+        _git(git_repo, "commit", "-q", "-m", "record a commit by hand")
+        assert _run_main(monkeypatch, "--base", "main") == 1
+        assert "- .vendored/manifests/tool.commit" in capsys.readouterr().out
 
     def test_allowed_and_unprotected_changes_pass(self, git_repo, monkeypatch, capsys):
         (git_repo / ".vendored/pkg/tool/settings.json").write_text('{"a": 1}\n')

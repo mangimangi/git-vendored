@@ -355,6 +355,14 @@ class TestWorkflowTemplate:
         install_step = self._step("Run vendored install")
         assert "VENDOR_PAT" in install_step["env"]
 
+    def test_install_step_provides_new_token_names(self):
+        """CICD_WRITE_TOKEN opens the PR; CICD_READ_TOKEN reads private repos."""
+        env = self._step("Run vendored install")["env"]
+        assert "secrets.CICD_WRITE_TOKEN" in env["CICD_WRITE_TOKEN"]
+        assert "secrets.CICD_READ_TOKEN" in env["CICD_READ_TOKEN"]
+        assert env["GH_TOKEN"].index("CICD_WRITE_TOKEN") < \
+            env["GH_TOKEN"].index("VENDOR_PAT")
+
     def test_install_step_provides_github_token(self):
         """Install step should expose GITHUB_TOKEN for PR creation."""
         install_step = self._step("Run vendored install")

@@ -1,5 +1,6 @@
 """Tests for the unified templates/install script."""
 
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -18,7 +19,7 @@ ROOT = Path(__file__).parent.parent
 def _import_install():
     filepath = str(ROOT / "templates" / "install")
     loader = importlib.machinery.SourceFileLoader("vendored_install", filepath)
-    spec = importlib.util.spec_from_loader("vendored_install", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_install", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     module.__file__ = filepath
     sys.modules["vendored_install"] = module
@@ -30,6 +31,33 @@ inst = _import_install()
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
+
+def _fetched_repo(checkout):
+    """The repo the fake fetch_vendor fetched into `checkout`."""
+    return (Path(checkout) / ".fake-repo").read_text()
+
+
+@pytest.fixture(autouse=True)
+def fake_fetch(tmp_path_factory, monkeypatch):
+    """Stand in for fetch_vendor: yields an empty checkout with an install.sh.
+
+    Tests that stub resolve_version and the readers need no git; the real
+    fetch is tested against local repositories in tests/test_git_install.py.
+    Returns the list of (repo, tag, commit) fetched.
+    """
+    calls = []
+
+    @contextlib.contextmanager
+    def _fetch(repo, tag, token, commit=None):
+        calls.append((repo, tag, commit))
+        checkout = tmp_path_factory.mktemp("checkout")
+        (checkout / "install.sh").write_text("#!/bin/bash\n")
+        (checkout / ".fake-repo").write_text(repo)
+        yield str(checkout)
+
+    monkeypatch.setattr(inst, "fetch_vendor", _fetch)
+    return calls
+
 
 @pytest.fixture
 def tmp_repo(tmp_path, monkeypatch):
@@ -266,58 +294,6 @@ class TestGetAuthToken:
         assert exc_info.value.code == 1
 
 
-# ── Tests: Pre-validation (add path) ──────────────────────────────────────
-
-class TestPreValidate:
-    @patch("vendored_install.subprocess.run")
-    def test_repo_with_install_sh_passes(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="install.sh\n")
-        inst.check_install_sh("owner/tool", "token")
-
-    @patch("vendored_install.subprocess.run")
-    def test_repo_without_install_sh_fails(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
-        with pytest.raises(SystemExit) as exc_info:
-            inst.check_install_sh("owner/tool", "token")
-        assert exc_info.value.code == 1
-
-    @patch("vendored_install.subprocess.run")
-    def test_repo_not_found_fails(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
-        with pytest.raises(SystemExit) as exc_info:
-            inst.check_repo_exists("owner/nonexistent", "token")
-        assert exc_info.value.code == 1
-
-    @patch("vendored_install.subprocess.run")
-    def test_version_resolvable_from_releases(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="v1.2.3\n")
-        version = inst.resolve_version("tool", "owner/tool", "latest", "token")
-        assert version == "1.2.3"
-
-    @patch("vendored_install.subprocess.run")
-    def test_version_resolvable_from_version_file(self, mock_run):
-        import base64
-        encoded = base64.b64encode(b"2.0.0\n").decode()
-
-        def side_effect(cmd, **kwargs):
-            if "releases/latest" in cmd[2]:
-                return MagicMock(returncode=1, stdout="")
-            if "contents/VERSION" in cmd[2]:
-                return MagicMock(returncode=0, stdout=encoded + "\n")
-            return MagicMock(returncode=1, stdout="")
-
-        mock_run.side_effect = side_effect
-        version = inst.resolve_version("tool", "owner/tool", "latest", "token")
-        assert version == "2.0.0"
-
-    @patch("vendored_install.subprocess.run")
-    def test_version_not_resolvable_fails(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=1, stdout="")
-        with pytest.raises(SystemExit) as exc_info:
-            inst.resolve_version("tool", "owner/tool", "latest", "token")
-        assert exc_info.value.code == 1
-
-
 # ── Tests: get_current_version ────────────────────────────────────────────
 
 class TestGetCurrentVersion:
@@ -439,35 +415,220 @@ class TestPostValidate:
         assert exc_info.value.code == 1
 
 
-# ── Tests: resolve_version ────────────────────────────────────────────────
+# ── Tests: resolve_version (git tags) ────────────────────────────────────
+
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+
+
+def res(version, tag=None, commit=SHA_A):
+    """A resolve_version result, for tests that stub it."""
+    return inst.Resolved(version, tag or f"v{version}", commit)
+
+
+class TestVendorGitUrl:
+    def test_owner_repo_means_github(self):
+        assert inst.vendor_git_url("owner/tool") == \
+            "https://github.com/owner/tool.git"
+
+    @pytest.mark.parametrize("url", [
+        "https://git.example.com/team/tool.git",
+        "ssh://git@example.com/team/tool.git",
+        "git@example.com:team/tool.git",
+        "file:///srv/git/tool",
+        "/srv/git/tool",
+    ])
+    def test_urls_pass_through(self, url):
+        assert inst.vendor_git_url(url) == url
+
+
+class TestGitEnv:
+    @pytest.fixture(autouse=True)
+    def _no_ambient_git_config(self, monkeypatch):
+        for key in list(os.environ):
+            if key.startswith("GIT_CONFIG_"):
+                monkeypatch.delenv(key)
+
+    def test_token_only_in_git_config_env(self, capsys):
+        env = inst._git_env("s3cret")
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+        value = env["GIT_CONFIG_VALUE_0"]
+        assert value.startswith("Authorization: Basic ")
+        import base64
+        decoded = base64.b64decode(value.split()[-1]).decode()
+        assert decoded == "x-access-token:s3cret"
+        assert "s3cret" not in value
+        assert capsys.readouterr().out == ""
+
+    def test_appends_after_ambient_git_config(self, monkeypatch):
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "a.b")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "1")
+        env = inst._git_env("tok")
+        assert env["GIT_CONFIG_COUNT"] == "3"
+        assert env["GIT_CONFIG_KEY_0"] == "a.b"
+        assert env["GIT_CONFIG_KEY_2"] == "http.extraHeader"
+
+    def test_bad_ambient_count_starts_at_zero(self, monkeypatch):
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "x")
+        env = inst._git_env("tok")
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+
+    def test_no_token_no_header(self):
+        env = inst._git_env("")
+        assert "GIT_CONFIG_COUNT" not in env
+        assert "GIT_CONFIG_VALUE_0" not in env
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    @patch("vendored_install.subprocess.run")
+    def test_ls_remote_token_not_in_argv(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        inst.ls_remote_tags("owner/tool", "s3cret")
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["git", "ls-remote", "--tags",
+                       "https://github.com/owner/tool.git"]
+        assert not any("s3cret" in part for part in cmd)
+        assert "Authorization: Basic" in \
+            mock_run.call_args[1]["env"]["GIT_CONFIG_VALUE_0"]
+
+    @patch("vendored_install.subprocess.run")
+    def test_ls_remote_skips_unexpected_lines(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=f"garbage\n{SHA_A}\trefs/heads/main\n{SHA_B}\trefs/tags/v1.0.0\n")
+        assert inst.ls_remote_tags("owner/tool", "") == {"v1.0.0": SHA_B}
+
+
+class TestPickVersion:
+    def test_latest_is_numeric_max(self):
+        tags = {"v0.0.9": SHA_A, "v0.0.10": SHA_B}
+        resolved, reason = inst.pick_version(tags, "latest")
+        assert resolved == inst.Resolved("0.0.10", "v0.0.10", SHA_B)
+        assert reason is None
+
+    def test_empty_request_means_latest(self):
+        resolved, _ = inst.pick_version({"1.0.0": SHA_A}, "")
+        assert resolved == inst.Resolved("1.0.0", "1.0.0", SHA_A)
+
+    def test_non_version_tags_ignored(self):
+        tags = {"latest": SHA_B, "v2.0": SHA_A, "nightly-3": SHA_B,
+                "v9.x": SHA_B, "v": SHA_B}
+        resolved, _ = inst.pick_version(tags, "latest")
+        assert resolved.tag == "v2.0"
+
+    def test_component_series_separate(self):
+        tags = {"v1.0.0": SHA_A, "sub/v9.9.9": SHA_B}
+        root, _ = inst.pick_version(tags, "latest")
+        assert root.version == "1.0.0"
+        sub, _ = inst.pick_version(tags, "latest", prefix="sub/")
+        assert sub == inst.Resolved("9.9.9", "sub/v9.9.9", SHA_B)
+        explicit, _ = inst.pick_version(tags, "9.9.9", prefix="sub/")
+        assert explicit.tag == "sub/v9.9.9"
+
+    def test_v_tag_preferred_over_bare(self):
+        tags = {"1.0.0": SHA_B, "v1.0.0": SHA_A}
+        latest, _ = inst.pick_version(tags, "latest")
+        assert latest.tag == "v1.0.0"
+        explicit, _ = inst.pick_version(tags, "1.0.0")
+        assert explicit == inst.Resolved("1.0.0", "v1.0.0", SHA_A)
+
+    def test_v_tag_preferred_in_either_order(self):
+        tags = {"v1.0.0": SHA_A, "1.0.0": SHA_B}
+        latest, _ = inst.pick_version(tags, "latest")
+        assert latest == inst.Resolved("1.0.0", "v1.0.0", SHA_A)
+
+    def test_explicit_bare_tag(self):
+        resolved, _ = inst.pick_version({"1.2.3": SHA_A}, "1.2.3")
+        assert resolved == inst.Resolved("1.2.3", "1.2.3", SHA_A)
+
+    def test_explicit_missing(self):
+        assert inst.pick_version({"v1.0.0": SHA_A}, "2.0.0") == \
+            (None, "no tag for 2.0.0")
+
+    def test_no_version_tags(self):
+        assert inst.pick_version({"latest": SHA_A}, "latest") == \
+            (None, "no version tags found")
+
 
 class TestResolveVersion:
-    def test_specific_version_returned(self):
-        version = inst.resolve_version("tool", "owner/tool", "1.5.0", "token")
-        assert version == "1.5.0"
+    """resolve_version against a local git repository (file:// URL)."""
 
-    @patch("vendored_install._resolve_from_releases")
-    def test_latest_uses_releases(self, mock_releases):
-        mock_releases.return_value = "2.0.0"
-        version = inst.resolve_version("tool", "owner/tool", "latest", "token")
-        assert version == "2.0.0"
+    def test_latest_from_tags(self, vendor_repo):
+        repo = vendor_repo()
+        repo.write("install.sh", "#!/bin/bash\n")
+        repo.commit("one")
+        repo.tag("v0.0.9")
+        repo.commit("two")
+        c10 = repo.tag("v0.0.10")
+        repo.commit("three")
+        repo.tag("latest")
+        repo.tag("sub/v9.9.9")
+        resolved = inst.resolve_version("tool", repo.url, "latest", "")
+        assert resolved == inst.Resolved("0.0.10", "v0.0.10", c10)
 
-    @patch("vendored_install._resolve_from_releases")
-    @patch("vendored_install._resolve_from_version_file")
-    def test_fallback_to_version_file(self, mock_vf, mock_releases):
-        mock_releases.return_value = None
-        mock_vf.return_value = "1.0.0"
-        version = inst.resolve_version("tool", "owner/tool", "latest", "token")
-        assert version == "1.0.0"
+    def test_component_prefix(self, vendor_repo):
+        repo = vendor_repo()
+        repo.commit("one")
+        repo.tag("v1.0.0")
+        c = repo.tag("sub/v9.9.9")
+        resolved = inst.resolve_version("tool", repo.url, "latest", "",
+                                        prefix="sub/")
+        assert resolved == inst.Resolved("9.9.9", "sub/v9.9.9", c)
 
-    @patch("vendored_install._resolve_from_releases")
-    @patch("vendored_install._resolve_from_version_file")
-    def test_exits_if_cannot_resolve(self, mock_vf, mock_releases):
-        mock_releases.return_value = None
-        mock_vf.return_value = None
+    def test_explicit_v_and_bare(self, vendor_repo):
+        repo = vendor_repo()
+        c1 = repo.commit("one")
+        repo.tag("v1.0.0")
+        c2 = repo.commit("two")
+        repo.tag("2.0.0")
+        assert inst.resolve_version("tool", repo.url, "1.0.0", "") == \
+            inst.Resolved("1.0.0", "v1.0.0", c1)
+        assert inst.resolve_version("tool", repo.url, "2.0.0", "") == \
+            inst.Resolved("2.0.0", "2.0.0", c2)
+
+    def test_annotated_tag_records_peeled_commit(self, vendor_repo):
+        repo = vendor_repo()
+        c = repo.commit("one")
+        repo.tag("v1.0.0", annotated=True)
+        tag_object = repo.rev("v1.0.0")
+        assert tag_object != c
+        resolved = inst.resolve_version("tool", repo.url, "latest", "")
+        assert resolved.commit == c
+
+    def test_missing_version_has_no_tag(self, vendor_repo, capsys):
+        repo = vendor_repo()
+        repo.commit("one")
+        repo.tag("v1.0.0")
         with pytest.raises(SystemExit) as exc_info:
-            inst.resolve_version("tool", "owner/tool", "latest", "token")
+            inst.resolve_version("tool", repo.url, "3.0.0", "")
         assert exc_info.value.code == 1
+        assert (f"::error::Version 3.0.0 of tool has no tag in {repo.url}"
+                in capsys.readouterr().out)
+
+    def test_no_version_tags(self, vendor_repo, capsys):
+        repo = vendor_repo()
+        repo.commit("one")
+        repo.tag("latest")
+        with pytest.raises(SystemExit) as exc_info:
+            inst.resolve_version("tool", repo.url, "latest", "")
+        assert exc_info.value.code == 1
+        assert f"::error::{repo.url} has no version tags" in \
+            capsys.readouterr().out
+
+    def test_nonexistent_repo(self, vendor_repo, tmp_path, capsys):
+        vendor_repo  # isolate git config
+        url = (tmp_path / "missing").as_uri()
+        with pytest.raises(SystemExit) as exc_info:
+            inst.resolve_version("tool", url, "latest", "s3cret")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert f"::error::Cannot access repo: {url}" in out
+        assert "CICD_READ_TOKEN" in out
+        assert "GH_TOKEN" not in out
+        assert "s3cret" not in out
 
 
 # ── Tests: install_existing_vendor (update path) ─────────────────────────
@@ -478,7 +639,7 @@ class TestInstallExistingVendor:
     @patch("vendored_install.get_auth_token")
     def test_skip_when_current(self, mock_token, mock_resolve, mock_download, tmp_repo):
         mock_token.return_value = "token"
-        mock_resolve.return_value = "1.0.0"
+        mock_resolve.return_value = res("1.0.0")
         (tmp_repo / ".tool").mkdir()
         (tmp_repo / ".tool" / ".version").write_text("1.0.0")
 
@@ -494,7 +655,7 @@ class TestInstallExistingVendor:
     def test_installs_new_version(self, mock_token, mock_resolve, mock_download,
                                    mock_deps, tmp_repo):
         mock_token.return_value = "token"
-        mock_resolve.return_value = "2.0.0"
+        mock_resolve.return_value = res("2.0.0")
         mock_download.return_value = None  # v1 compat: no manifest
         (tmp_repo / ".tool").mkdir()
         (tmp_repo / ".tool" / ".version").write_text("1.0.0")
@@ -512,7 +673,7 @@ class TestInstallExistingVendor:
     def test_fresh_install(self, mock_token, mock_resolve, mock_download,
                             mock_deps, tmp_repo):
         mock_token.return_value = "token"
-        mock_resolve.return_value = "1.0.0"
+        mock_resolve.return_value = res("1.0.0")
         mock_download.return_value = None
 
         result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
@@ -528,7 +689,7 @@ class TestInstallExistingVendor:
                               mock_deps, tmp_repo):
         """--force should reinstall even when at target version."""
         mock_token.return_value = "token"
-        mock_resolve.return_value = "1.0.0"
+        mock_resolve.return_value = res("1.0.0")
         mock_download.return_value = None
         (tmp_repo / ".tool").mkdir()
         (tmp_repo / ".tool" / ".version").write_text("1.0.0")
@@ -545,7 +706,7 @@ class TestInstallExistingVendor:
                                         mock_deps, tmp_repo):
         """When install.sh emits a manifest, it should be stored."""
         mock_token.return_value = "token"
-        mock_resolve.return_value = "2.0.0"
+        mock_resolve.return_value = res("2.0.0")
         (tmp_repo / ".tool").mkdir()
         (tmp_repo / ".tool" / "script.sh").write_text("#!/bin/bash")
         mock_download.return_value = [".tool/script.sh"]
@@ -564,7 +725,7 @@ class TestInstallExistingVendor:
     def test_skip_when_current_via_manifest(self, mock_token, mock_resolve, mock_download, tmp_repo):
         """Version from manifest storage used for skip check."""
         mock_token.return_value = "token"
-        mock_resolve.return_value = "1.0.0"
+        mock_resolve.return_value = res("1.0.0")
         inst.write_manifest_version("tool", "1.0.0")
 
         result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
@@ -579,13 +740,100 @@ class TestInstallExistingVendor:
                                                         mock_download, mock_deps, tmp_repo):
         """install_existing_vendor passes vendor_name and vendor_config to download."""
         mock_token.return_value = "token"
-        mock_resolve.return_value = "2.0.0"
+        mock_resolve.return_value = res("2.0.0")
         mock_download.return_value = None
 
         inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
         _, kwargs = mock_download.call_args
         assert kwargs["vendor_name"] == "tool"
         assert kwargs["vendor_config"] == SAMPLE_VENDOR
+
+
+# ── Tests: recorded commit (.vendored/manifests/<vendor>.commit) ──────────
+
+class TestRecordedCommit:
+    def test_read_write_commit(self, tmp_repo):
+        assert inst.read_manifest_commit("tool") is None
+        inst.write_manifest_commit("tool", SHA_A)
+        assert (tmp_repo / ".vendored/manifests/tool.commit").read_text() == \
+            SHA_A + "\n"
+        assert inst.read_manifest_commit("tool") == SHA_A
+
+    @patch("vendored_install.download_schema", return_value=None)
+    @patch("vendored_install.download_deps", return_value=None)
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token", return_value="")
+    def test_commit_written_on_upgrade(self, mock_token, mock_resolve,
+                                       mock_download, mock_deps, mock_schema,
+                                       tmp_repo):
+        mock_resolve.return_value = res("2.0.0", commit=SHA_B)
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("x")
+        mock_download.return_value = [".tool/script.sh"]
+        inst.write_manifest_version("tool", "1.0.0")
+        inst.write_manifest_commit("tool", SHA_A)
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        assert inst.read_manifest_commit("tool") == SHA_B
+        assert inst.read_manifest_version("tool") == "2.0.0"
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token", return_value="")
+    def test_moved_tag_warns_and_skips(self, mock_token, mock_resolve,
+                                       mock_download, tmp_repo, capsys):
+        mock_resolve.return_value = res("1.0.0", commit=SHA_B)
+        inst.write_manifest_version("tool", "1.0.0")
+        inst.write_manifest_commit("tool", SHA_A)
+        result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        assert result["changed"] is False
+        mock_download.assert_not_called()
+        assert (f"::warning::tool: tag v1.0.0 now points at {SHA_B}, "
+                f"recorded {SHA_A}") in capsys.readouterr().out
+        assert inst.read_manifest_commit("tool") == SHA_A
+
+    @patch("vendored_install.download_schema", return_value=None)
+    @patch("vendored_install.download_deps", return_value=None)
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token", return_value="")
+    def test_moved_tag_forced_records_new_commit(
+            self, mock_token, mock_resolve, mock_download, mock_deps,
+            mock_schema, tmp_repo, capsys):
+        mock_resolve.return_value = res("1.0.0", commit=SHA_B)
+        (tmp_repo / ".tool").mkdir()
+        (tmp_repo / ".tool" / "script.sh").write_text("x")
+        mock_download.return_value = [".tool/script.sh"]
+        inst.write_manifest_version("tool", "1.0.0")
+        inst.write_manifest_commit("tool", SHA_A)
+        result = inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest",
+                                              force=True)
+        assert result["changed"] is True
+        assert "::warning::tool: tag v1.0.0 now points at" in \
+            capsys.readouterr().out
+        assert inst.read_manifest_commit("tool") == SHA_B
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token", return_value="")
+    def test_no_warning_without_recorded_commit(self, mock_token, mock_resolve,
+                                                mock_download, tmp_repo,
+                                                capsys):
+        mock_resolve.return_value = res("1.0.0", commit=SHA_B)
+        inst.write_manifest_version("tool", "1.0.0")
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        assert "::warning::" not in capsys.readouterr().out
+
+    @patch("vendored_install.download_and_run_install")
+    @patch("vendored_install.resolve_version")
+    @patch("vendored_install.get_auth_token", return_value="")
+    def test_no_warning_when_commit_matches(self, mock_token, mock_resolve,
+                                            mock_download, tmp_repo, capsys):
+        mock_resolve.return_value = res("1.0.0", commit=SHA_A)
+        inst.write_manifest_version("tool", "1.0.0")
+        inst.write_manifest_commit("tool", SHA_A)
+        inst.install_existing_vendor("tool", SAMPLE_VENDOR, "latest")
+        assert "::warning::" not in capsys.readouterr().out
 
 
 # ── Tests: install_new_vendor (add path) ──────────────────────────────────
@@ -595,11 +843,10 @@ class TestInstallNewVendor:
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.check_repo_exists")
-    def test_add_new_vendor(self, mock_exists, mock_install_sh,
+    def test_add_new_vendor(self, mock_install_sh,
                             mock_version, mock_download, mock_deps,
                             make_config, tmp_repo, capsys):
-        mock_version.return_value = "1.0.0"
+        mock_version.return_value = res("1.0.0")
         make_config({"vendors": {}})
 
         def fake_download(repo, version, token, **kwargs):
@@ -625,10 +872,9 @@ class TestInstallNewVendor:
     @patch("vendored_install.download_deps", return_value=None)
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.check_repo_exists")
-    def test_add_already_registered_fails(self, mock_exists, mock_install_sh,
+    def test_add_already_registered_fails(self, mock_install_sh,
                                            mock_version, mock_deps, make_config):
-        mock_version.return_value = "1.0.0"
+        mock_version.return_value = res("1.0.0")
         make_config({"vendors": {"existing": {"repo": "owner/existing-tool"}}})
 
         with pytest.raises(SystemExit) as exc_info:
@@ -639,11 +885,10 @@ class TestInstallNewVendor:
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.check_repo_exists")
-    def test_add_with_custom_name(self, mock_exists, mock_install_sh,
+    def test_add_with_custom_name(self, mock_install_sh,
                                    mock_version, mock_download, mock_deps,
                                    make_config, tmp_repo, capsys):
-        mock_version.return_value = "1.0.0"
+        mock_version.return_value = res("1.0.0")
         make_config({"vendors": {}})
 
         def fake_download(repo, version, token, **kwargs):
@@ -666,12 +911,11 @@ class TestInstallNewVendor:
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.check_repo_exists")
     def test_add_new_vendor_with_per_vendor_configs_active(
-            self, mock_exists, mock_install_sh, mock_version, mock_download,
+            self, mock_install_sh, mock_version, mock_download,
             mock_deps, make_config, tmp_repo, capsys):
         """install.sh writes to config.json but per-vendor configs are active."""
-        mock_version.return_value = "1.0.0"
+        mock_version.return_value = res("1.0.0")
         # Existing vendor in per-vendor config (makes load_config read from configs/)
         configs_dir = tmp_repo / ".vendored" / "configs"
         configs_dir.mkdir(parents=True)
@@ -720,12 +964,11 @@ class TestInstallNewVendor:
     @patch("vendored_install.download_and_run_install")
     @patch("vendored_install.resolve_version")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.check_repo_exists")
-    def test_add_with_manifest(self, mock_exists, mock_install_sh,
+    def test_add_with_manifest(self, mock_install_sh,
                                 mock_version, mock_download, mock_deps,
                                 make_config, tmp_repo, capsys):
         """When install.sh emits a manifest, it should be stored on add."""
-        mock_version.return_value = "1.0.0"
+        mock_version.return_value = res("1.0.0")
         make_config({"vendors": {}})
 
         (tmp_repo / ".new-tool").mkdir()
@@ -749,6 +992,7 @@ class TestInstallNewVendor:
         manifest = inst.read_manifest("new-tool")
         assert manifest == [".new-tool/script.sh"]
         assert inst.read_manifest_version("new-tool") == "1.0.0"
+        assert inst.read_manifest_commit("new-tool") == SHA_A
 
         out = capsys.readouterr().out
         assert "manifest: 1 files" in out
@@ -768,13 +1012,12 @@ class TestVendorInstallDir:
     @patch("vendored_install.subprocess.run")
     def test_sets_vendor_install_dir(self, mock_run, tmp_repo, monkeypatch):
         """VENDOR_INSTALL_DIR is set for non-dogfood vendors."""
-        import base64 as b64
-        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
         inst.download_and_run_install(
             "owner/tool", "1.0.0", "token",
-            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR,
+            checkout=str(tmp_repo)
         )
         # Find the bash call (the one running install.sh)
         bash_calls = [c for c in mock_run.call_args_list
@@ -786,26 +1029,24 @@ class TestVendorInstallDir:
     @patch("vendored_install.subprocess.run")
     def test_creates_pkg_directory(self, mock_run, tmp_repo, monkeypatch):
         """Framework creates .vendored/pkg/<vendor>/ before running install.sh."""
-        import base64 as b64
-        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
         inst.download_and_run_install(
             "owner/tool", "1.0.0", "token",
-            vendor_name="tool", vendor_config=SAMPLE_VENDOR
+            vendor_name="tool", vendor_config=SAMPLE_VENDOR,
+            checkout=str(tmp_repo)
         )
         assert (tmp_repo / ".vendored" / "pkg" / "tool").is_dir()
 
     @patch("vendored_install.subprocess.run")
     def test_dogfood_no_install_dir(self, mock_run, tmp_repo, monkeypatch):
         """Dogfood vendors do NOT get VENDOR_INSTALL_DIR."""
-        import base64 as b64
-        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
         inst.download_and_run_install(
             "mangimangi/git-vendored", "1.0.0", "token",
-            vendor_name="git-vendored", vendor_config=DOGFOOD_VENDOR
+            vendor_name="git-vendored", vendor_config=DOGFOOD_VENDOR,
+            checkout=str(tmp_repo)
         )
         bash_calls = [c for c in mock_run.call_args_list
                       if c[0][0][0] == "bash"]
@@ -816,11 +1057,10 @@ class TestVendorInstallDir:
     @patch("vendored_install.subprocess.run")
     def test_no_vendor_name_no_install_dir(self, mock_run, tmp_repo, monkeypatch):
         """When vendor_name is None (legacy call), no VENDOR_INSTALL_DIR."""
-        import base64 as b64
-        script = b64.b64encode(b"#!/bin/bash\ntrue\n").decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=script + "\n", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
 
-        inst.download_and_run_install("owner/tool", "1.0.0", "token")
+        inst.download_and_run_install("owner/tool", "1.0.0", "token",
+                                      checkout=str(tmp_repo))
         bash_calls = [c for c in mock_run.call_args_list
                       if c[0][0][0] == "bash"]
         assert len(bash_calls) >= 1
@@ -1279,7 +1519,8 @@ class TestPullRequestToken:
         assert body.endswith(inst.NO_CHECKS_NOTE)
         note = inst.NO_CHECKS_NOTE.strip()
         assert "\n" not in note
-        assert "no checks will run" in note and "`VENDOR_PAT`" in note
+        assert "no checks will run" in note and "`CICD_WRITE_TOKEN`" in note
+        assert "VENDOR_PAT" not in note
 
     @patch("vendored_install.subprocess.run")
     def test_no_token_leaves_callers_gh_token(self, mock_run, monkeypatch):
@@ -1312,7 +1553,7 @@ class TestPullRequestToken:
             in out.out
         assert "gh pr create --head chore/install-tool-v2.0.0 --base main" \
             in out.out
-        assert "set a VENDOR_PAT" not in out.out
+        assert "set a CICD_WRITE_TOKEN" not in out.out
 
     @patch("vendored_install.subprocess.run")
     def test_failed_create_with_workflow_token_suggests_vendor_pat(
@@ -1327,7 +1568,8 @@ class TestPullRequestToken:
         assert exc.value.code == 1
         out = capsys.readouterr().out
         assert "chore/install-tool-v2.0.0" in out
-        assert "set a VENDOR_PAT secret" in out
+        assert "set a CICD_WRITE_TOKEN secret" in out
+        assert "VENDOR_PAT" not in out
 
     @patch("vendored_install.subprocess.run")
     def test_existing_pr_is_reused(self, mock_run, monkeypatch, capsys):
@@ -1757,24 +1999,15 @@ class TestCLIRouting:
 # ── Tests: Dependency Resolution ─────────────────────────────────────────
 
 class TestDependencyResolution:
-    @patch("vendored_install.subprocess.run")
-    def test_download_deps_returns_dict(self, mock_run):
-        """download_deps parses deps.json from vendor repo."""
-        import base64 as b64
+    def test_download_deps_returns_dict(self, tmp_path):
+        """download_deps parses deps.json from the vendor checkout."""
         deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
-        encoded = b64.b64encode(json.dumps(deps).encode()).decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=encoded + "\n", stderr="")
+        (tmp_path / "deps.json").write_text(json.dumps(deps))
+        assert inst.download_deps(str(tmp_path)) == deps
 
-        result = inst.download_deps("owner/tool", "v1.0.0", "token")
-        assert result == deps
-
-    @patch("vendored_install.subprocess.run")
-    def test_download_deps_returns_none_when_missing(self, mock_run):
-        """download_deps returns None when no deps.json exists (404)."""
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
-
-        result = inst.download_deps("owner/tool", "v1.0.0", "token")
-        assert result is None
+    def test_download_deps_returns_none_when_missing(self, tmp_path):
+        """download_deps returns None when no deps.json exists."""
+        assert inst.download_deps(str(tmp_path)) is None
 
     def test_check_deps_all_satisfied(self, tmp_repo):
         """check_deps returns all deps as satisfied when installed."""
@@ -1894,8 +2127,9 @@ class TestDependencyResolution:
             json.dumps({"_vendor": {"repo": "mangimangi/git-semver"}})
         )
 
-        # Mock version resolution
-        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        # Mock version resolution (git ls-remote --tags)
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout=f"{SHA_A}\trefs/tags/v2.0.0\n", stderr="")
 
         # Mock deps.json download
         deps = {"git-semver": {"repo": "mangimangi/git-semver"}}
@@ -1920,29 +2154,21 @@ class TestDependencyResolution:
 # ── Tests: Schema Handling ────────────────────────────────────────────────
 
 class TestSchemaHandling:
-    @patch("vendored_install.subprocess.run")
-    def test_download_schema_returns_dict(self, mock_run):
-        """download_schema parses templates/config.schema from vendor repo."""
-        import base64 as b64
+    def test_download_schema_returns_dict(self, tmp_path):
+        """download_schema parses templates/config.schema from the checkout."""
         schema = {
             "vendor": "my-tool",
             "fields": {
                 "prefix": {"required": True, "type": "string", "description": "Command prefix"}
             }
         }
-        encoded = b64.b64encode(json.dumps(schema).encode()).decode()
-        mock_run.return_value = MagicMock(returncode=0, stdout=encoded + "\n", stderr="")
+        (tmp_path / "templates").mkdir()
+        (tmp_path / "templates" / "config.schema").write_text(json.dumps(schema))
+        assert inst.download_schema(str(tmp_path)) == schema
 
-        result = inst.download_schema("owner/tool", "v1.0.0", "token")
-        assert result == schema
-
-    @patch("vendored_install.subprocess.run")
-    def test_download_schema_returns_none_when_missing(self, mock_run):
-        """download_schema returns None when no schema exists (404)."""
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Not Found")
-
-        result = inst.download_schema("owner/tool", "v1.0.0", "token")
-        assert result is None
+    def test_download_schema_returns_none_when_missing(self, tmp_path):
+        """download_schema returns None when no schema exists."""
+        assert inst.download_schema(str(tmp_path)) is None
 
     def test_write_schema(self, tmp_repo):
         """write_schema creates .schema file with JSON content."""
@@ -1998,7 +2224,8 @@ class TestSchemaHandling:
         manifests_dir.mkdir(parents=True)
         (manifests_dir / "tool.version").write_text("1.0.0\n")
 
-        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout=f"{SHA_A}\trefs/tags/v2.0.0\n", stderr="")
         mock_download_install.return_value = [".tool/script.sh"]
         mock_download_deps.return_value = None
 
@@ -2036,7 +2263,8 @@ class TestSchemaHandling:
         manifests_dir.mkdir(parents=True)
         (manifests_dir / "tool.version").write_text("1.0.0\n")
 
-        mock_run.return_value = MagicMock(returncode=0, stdout="2.0.0\n", stderr="")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout=f"{SHA_A}\trefs/tags/v2.0.0\n", stderr="")
         mock_download_install.return_value = [".tool/script.sh"]
         mock_download_deps.return_value = None
         mock_download_schema.return_value = None
@@ -2069,11 +2297,10 @@ class TestAutoInstallAndCycleDetection:
         assert call_args[0][1] == "latest"
         assert call_args[1]["name"] == "git-semver"
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_auto_install_recursive(self, mock_ver, mock_check_sh,
-                                    mock_check_repo, tmp_repo, capsys):
+                                    tmp_repo, capsys):
         """dep A depends on dep B: installing A auto-installs B first."""
         dep_graph = {
             "owner/dep-a": {"dep-b": "owner/dep-b"},
@@ -2093,11 +2320,10 @@ class TestAutoInstallAndCycleDetection:
             assert (manifests_dir / f"{name}.version").is_file(), \
                 f"{name} not installed"
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_circular_dependency_detected(self, mock_ver, mock_check_sh,
-                                          mock_check_repo, tmp_repo):
+                                          tmp_repo):
         """Circular dep A -> B -> A detected via real recursive path."""
         dep_graph = {
             "owner/vendor-a": {"vendor-b": "owner/vendor-b"},
@@ -2122,11 +2348,10 @@ class TestAutoInstallAndCycleDetection:
                                     installing_set=installing_set)
         assert exc_info.value.code == 1
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_installing_set_prevents_revisit(self, mock_ver, mock_check_sh,
-                                             mock_check_repo, tmp_repo):
+                                             tmp_repo):
         """Same dep required by two vendors is only installed once via installing_set."""
         # Diamond: A -> B, A -> C, B -> D, C -> D. D should be installed once.
         install_calls = []
@@ -2139,11 +2364,11 @@ class TestAutoInstallAndCycleDetection:
         fake_deps, orig_fake_install = _make_fake_install_env(tmp_repo, dep_graph)
 
         def tracking_install(repo, version, token, vendor_name=None,
-                             vendor_config=None):
+                             vendor_config=None, **kwargs):
             install_calls.append(repo)
             return orig_fake_install(repo, version, token,
                                      vendor_name=vendor_name,
-                                     vendor_config=vendor_config)
+                                     vendor_config=vendor_config, **kwargs)
 
         with patch("vendored_install.download_deps", side_effect=fake_deps), \
              patch("vendored_install.download_and_run_install", side_effect=tracking_install):
@@ -2228,14 +2453,14 @@ def _make_fake_install_env(tmp_repo, dep_graph):
     if not config_path.is_file():
         config_path.write_text(json.dumps({}, indent=2) + "\n")
 
-    def fake_download_deps(repo, ref, token):
-        deps = dep_graph.get(repo)
+    def fake_download_deps(checkout):
+        deps = dep_graph.get(_fetched_repo(checkout))
         if not deps:
             return None
         return {name: {"repo": r} for name, r in deps.items()}
 
     def fake_download_and_run_install(repo, version, token,
-                                       vendor_name=None, vendor_config=None):
+                                       vendor_name=None, vendor_config=None, **kwargs):
         """Simulate install.sh: write config file and return manifest."""
         name = vendor_name or repo.split("/")[-1]
         # install.sh self-registers by writing to config.json
@@ -2270,11 +2495,10 @@ class TestRecursiveAutoInstallIntegration:
     recursion is exercised.
     """
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_linear_chain_a_depends_on_b(
-        self, mock_ver, mock_check_sh, mock_check_repo, tmp_repo
+        self, mock_ver, mock_check_sh, tmp_repo
     ):
         """A depends on B: installing A auto-installs B first."""
         dep_graph = {
@@ -2302,11 +2526,10 @@ class TestRecursiveAutoInstallIntegration:
         assert deps_file.is_file()
         assert "b" in deps_file.read_text()
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_three_level_chain_a_b_c(
-        self, mock_ver, mock_check_sh, mock_check_repo, tmp_repo
+        self, mock_ver, mock_check_sh, tmp_repo
     ):
         """A depends on B, B depends on C: all three get installed."""
         dep_graph = {
@@ -2328,11 +2551,10 @@ class TestRecursiveAutoInstallIntegration:
             assert (manifests_dir / f"{name}.version").is_file(), \
                 f"{name} not installed"
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_diamond_deps_installed_once(
-        self, mock_ver, mock_check_sh, mock_check_repo, tmp_repo
+        self, mock_ver, mock_check_sh, tmp_repo
     ):
         """Diamond: A->B, A->C, B->D, C->D. D installed once, not twice."""
         install_calls = []
@@ -2345,11 +2567,11 @@ class TestRecursiveAutoInstallIntegration:
         fake_deps, orig_fake_install = _make_fake_install_env(tmp_repo, dep_graph)
 
         def tracking_install(repo, version, token, vendor_name=None,
-                             vendor_config=None):
+                             vendor_config=None, **kwargs):
             install_calls.append(repo)
             return orig_fake_install(repo, version, token,
                                      vendor_name=vendor_name,
-                                     vendor_config=vendor_config)
+                                     vendor_config=vendor_config, **kwargs)
 
         with patch("vendored_install.download_deps", side_effect=fake_deps), \
              patch("vendored_install.download_and_run_install", side_effect=tracking_install):
@@ -2363,11 +2585,10 @@ class TestRecursiveAutoInstallIntegration:
         d_count = install_calls.count("owner/d")
         assert d_count == 1, f"owner/d installed {d_count} times: {install_calls}"
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_circular_chain_detected_in_real_recursion(
-        self, mock_ver, mock_check_sh, mock_check_repo, tmp_repo
+        self, mock_ver, mock_check_sh, tmp_repo
     ):
         """Circular A->B->A detected via installing_set in real recursion."""
         dep_graph = {
@@ -2384,11 +2605,10 @@ class TestRecursiveAutoInstallIntegration:
                 )
             assert exc_info.value.code == 1
 
-    @patch("vendored_install.check_repo_exists")
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     def test_installing_set_threaded_through_chain(
-        self, mock_ver, mock_check_sh, mock_check_repo, tmp_repo
+        self, mock_ver, mock_check_sh, tmp_repo
     ):
         """installing_set accumulates repos across the recursive chain."""
         captured_sets = []
@@ -2696,7 +2916,7 @@ class TestInstallExistingVendorBootstrap:
                                                mock_dl, tmp_repo, make_config):
         """install_existing_vendor calls _maybe_reexec after download_and_run_install."""
         mock_auth.return_value = "token"
-        mock_resolve.return_value = "2.0.0"
+        mock_resolve.return_value = res("2.0.0")
         mock_dl.return_value = None
         mock_deps.return_value = None
         make_config({"vendors": {"tool": SAMPLE_VENDOR}})
@@ -2714,7 +2934,7 @@ class TestInstallExistingVendorBootstrap:
                                                    mock_dl, tmp_repo, make_config):
         """install_existing_vendor skips _maybe_reexec when post_install_only=True."""
         mock_auth.return_value = "token"
-        mock_resolve.return_value = "2.0.0"
+        mock_resolve.return_value = res("2.0.0")
         mock_dl.return_value = None
         mock_deps.return_value = None
         make_config({"vendors": {"tool": SAMPLE_VENDOR}})
@@ -2855,53 +3075,39 @@ class TestListVendors:
 
 # ── Tests: gh API decoding edge cases ────────────────────────────────────
 
-import base64 as _b64
-import subprocess as _real_subprocess
-
-_REAL_RUN = _real_subprocess.run
-
-
-def _b64s(data):
-    if isinstance(data, str):
-        data = data.encode()
-    return _b64.b64encode(data).decode() + "\n"
-
-
-class TestGhContentDecoding:
-    @patch("vendored_install.subprocess.run")
-    def test_undecodable_version_file_is_unresolvable(self, mock_run, capsys):
-        """A VERSION file that isn't valid UTF-8 can't resolve 'latest'."""
-        def side_effect(cmd, **kwargs):
-            if "contents/VERSION" in cmd[2]:
-                return MagicMock(returncode=0, stdout=_b64s(b"\xff\xfe\xfa"))
-            return MagicMock(returncode=1, stdout="")
-        mock_run.side_effect = side_effect
-
-        assert inst._resolve_from_version_file("owner/tool", "token") is None
-        with pytest.raises(SystemExit) as exc_info:
-            inst.resolve_version("tool", "owner/tool", "latest", "token")
-        assert exc_info.value.code == 1
-
-    @patch("vendored_install.subprocess.run")
-    def test_download_deps_invalid_json_returns_none(self, mock_run):
+class TestCheckoutReaders:
+    def test_download_deps_invalid_json_returns_none(self, tmp_path):
         """A deps.json that isn't valid JSON is treated as no deps."""
-        mock_run.return_value = MagicMock(returncode=0, stdout=_b64s("{not json"))
-        assert inst.download_deps("owner/tool", "v1.0.0", "token") is None
+        (tmp_path / "deps.json").write_text("{not json")
+        assert inst.download_deps(str(tmp_path)) is None
 
-    @patch("vendored_install.subprocess.run")
-    def test_download_schema_invalid_json_returns_none(self, mock_run):
+    def test_download_deps_missing_returns_none(self, tmp_path):
+        assert inst.download_deps(str(tmp_path)) is None
+
+    def test_download_deps_reads_checkout(self, tmp_path):
+        (tmp_path / "deps.json").write_text('{"a": {"repo": "o/a"}}')
+        assert inst.download_deps(str(tmp_path)) == {"a": {"repo": "o/a"}}
+
+    def test_download_schema_invalid_json_returns_none(self, tmp_path):
         """A config.schema that isn't valid JSON is treated as no schema."""
-        mock_run.return_value = MagicMock(returncode=0, stdout=_b64s("nope{"))
-        assert inst.download_schema("owner/tool", "v1.0.0", "token") is None
+        (tmp_path / "templates").mkdir()
+        (tmp_path / "templates" / "config.schema").write_text("nope{")
+        assert inst.download_schema(str(tmp_path)) is None
 
-    @patch("vendored_install.subprocess.run")
-    def test_download_schema_requests_ref_with_token(self, mock_run):
-        """Schema is fetched from templates/config.schema at the given ref."""
-        mock_run.return_value = MagicMock(returncode=0, stdout=_b64s('{"a": 1}'))
-        assert inst.download_schema("owner/tool", "v2.0.0", "tok") == {"a": 1}
-        cmd = mock_run.call_args[0][0]
-        assert cmd[2] == "repos/owner/tool/contents/templates/config.schema?ref=v2.0.0"
-        assert mock_run.call_args[1]["env"]["GH_TOKEN"] == "tok"
+    def test_download_schema_reads_checkout(self, tmp_path):
+        (tmp_path / "templates").mkdir()
+        (tmp_path / "templates" / "config.schema").write_text('{"a": 1}')
+        assert inst.download_schema(str(tmp_path)) == {"a": 1}
+
+    def test_check_install_sh(self, tmp_path, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            inst.check_install_sh(str(tmp_path), "owner/tool")
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "::error::Repo does not implement git-vendored: owner/tool" in out
+        assert "Expected install.sh at repository root." in out
+        (tmp_path / "install.sh").write_text("#!/bin/bash\n")
+        inst.check_install_sh(str(tmp_path), "owner/tool")
 
 
 # ── Tests: dependency mode and missing-repo deps ─────────────────────────
@@ -2930,65 +3136,38 @@ class TestGetCurrentVersionNoConfig:
 
 # ── Tests: download_and_run_install contract ─────────────────────────────
 
-def _install_sh_runner(script, first_ref_ok=True, second_ref_ok=True):
-    """subprocess.run fake: serve install.sh via 'gh api', run bash for real."""
-    def side_effect(cmd, **kwargs):
-        if cmd[0] == "gh":
-            path = cmd[2]
-            if path.endswith("?ref=v1.0.0"):
-                ok = first_ref_ok
-            else:
-                ok = second_ref_ok
-            if ok:
-                return MagicMock(returncode=0, stdout=_b64s(script), stderr="")
-            return MagicMock(returncode=1, stdout="", stderr="Not Found")
-        return _REAL_RUN(cmd, **kwargs)
-    return side_effect
+def _checkout_with(tmp_path, script):
+    """A vendor checkout directory holding `script` as install.sh."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "install.sh").write_text(script)
+    return str(checkout)
 
 
 class TestDownloadAndRunInstall:
-    @patch("vendored_install.subprocess.run")
-    def test_falls_back_to_unprefixed_ref(self, mock_run, tmp_repo):
-        """If v<version> tag has no install.sh, the bare version ref is tried."""
-        mock_run.side_effect = _install_sh_runner(
-            "#!/bin/bash\ntrue\n", first_ref_ok=False, second_ref_ok=True)
+    def test_runs_install_sh_from_checkout_in_repo(self, tmp_repo, tmp_path):
+        """install.sh runs from the checkout, with cwd the adopting repo."""
+        checkout = _checkout_with(tmp_path, '#!/bin/bash\npwd > where.txt\n')
         inst.download_and_run_install("owner/tool", "1.0.0", "token",
-                                      vendor_name="tool")
-        gh_paths = [c[0][0][2] for c in mock_run.call_args_list
-                    if c[0][0][0] == "gh"]
-        assert gh_paths == [
-            "repos/owner/tool/contents/install.sh?ref=v1.0.0",
-            "repos/owner/tool/contents/install.sh?ref=1.0.0",
-        ]
+                                      vendor_name="tool", checkout=checkout,
+                                      ref="v1.0.0")
+        assert (tmp_repo / "where.txt").read_text().strip() == str(tmp_repo)
+        assert sorted(os.listdir(checkout)) == ["install.sh"]
 
-    @patch("vendored_install.subprocess.run")
-    def test_download_failure_exits(self, mock_run, tmp_repo, capsys):
-        mock_run.side_effect = _install_sh_runner(
-            "", first_ref_ok=False, second_ref_ok=False)
-        with pytest.raises(SystemExit) as exc_info:
-            inst.download_and_run_install("owner/tool", "1.0.0", "token",
-                                          vendor_name="tool")
-        assert exc_info.value.code == 1
-        assert ("Failed to download install.sh from owner/tool at v1.0.0"
-                in capsys.readouterr().out)
-        assert not any(c[0][0][0] == "bash" for c in mock_run.call_args_list)
-
-    @patch("vendored_install.subprocess.run")
-    def test_reads_manifest_written_by_install_sh(self, mock_run, tmp_repo):
+    def test_reads_manifest_written_by_install_sh(self, tmp_repo, tmp_path):
         """install.sh writing to $VENDOR_MANIFEST yields the manifest list."""
         script = (
             '#!/bin/bash\n'
             'printf "%s\\n" ".vendored/pkg/tool/a.sh" "" '
             '"  .vendored/pkg/tool/b.sh  " > "$VENDOR_MANIFEST"\n'
         )
-        mock_run.side_effect = _install_sh_runner(script)
-        files = inst.download_and_run_install("owner/tool", "1.0.0", "token",
-                                              vendor_name="tool")
+        files = inst.download_and_run_install(
+            "owner/tool", "1.0.0", "token", vendor_name="tool",
+            checkout=_checkout_with(tmp_path, script))
         assert files == [".vendored/pkg/tool/a.sh", ".vendored/pkg/tool/b.sh"]
 
-    @patch("vendored_install.subprocess.run")
-    def test_v2_env_contract(self, mock_run, tmp_repo):
-        """install.sh sees VENDOR_REPO/REF/INSTALL_DIR/LIB, GH_TOKEN and version arg."""
+    def test_v2_env_contract(self, tmp_repo, tmp_path):
+        """install.sh sees VENDOR_REPO/REF/INSTALL_DIR/LIB/CHECKOUT, GH_TOKEN and version arg."""
         lib = tmp_repo / ".vendored" / "lib"
         lib.mkdir()
         (lib / "vendor-helpers.sh").write_text("# helpers\n")
@@ -2996,23 +3175,33 @@ class TestDownloadAndRunInstall:
         script = (
             '#!/bin/bash\n'
             'echo "$1|$VENDOR_REPO|$VENDOR_REF|$VENDOR_INSTALL_DIR|'
-            '$VENDOR_LIB|$GH_TOKEN" > ' + str(out) + '\n'
+            '$VENDOR_LIB|$GH_TOKEN|$VENDOR_CHECKOUT" > ' + str(out) + '\n'
         )
-        mock_run.side_effect = _install_sh_runner(script)
+        checkout = _checkout_with(tmp_path, script)
         inst.download_and_run_install("owner/tool", "1.0.0", "tok-1",
-                                      vendor_name="tool")
+                                      vendor_name="tool", checkout=checkout,
+                                      ref="1.0.0")
         parts = out.read_text().strip().split("|")
-        assert parts == ["1.0.0", "owner/tool", "v1.0.0", ".vendored/pkg/tool",
-                         str(lib / "vendor-helpers.sh"), "tok-1"]
+        assert parts == ["1.0.0", "owner/tool", "1.0.0", ".vendored/pkg/tool",
+                         str(lib / "vendor-helpers.sh"), "tok-1",
+                         os.path.abspath(checkout)]
+        assert os.path.isabs(parts[-1])
 
-    @patch("vendored_install.subprocess.run")
-    def test_install_sh_failure_exits_and_relays_stderr(self, mock_run,
-                                                        tmp_repo, capsys):
+    def test_ref_defaults_to_v_version(self, tmp_repo, tmp_path):
+        out = tmp_repo / "ref.txt"
+        checkout = _checkout_with(
+            tmp_path, '#!/bin/bash\necho "$VENDOR_REF" > ' + str(out) + '\n')
+        inst.download_and_run_install("owner/tool", "1.0.0", "",
+                                      checkout=checkout)
+        assert out.read_text().strip() == "v1.0.0"
+
+    def test_install_sh_failure_exits_and_relays_stderr(self, tmp_repo,
+                                                        tmp_path, capsys):
         script = '#!/bin/bash\necho progress\necho boom >&2\nexit 3\n'
-        mock_run.side_effect = _install_sh_runner(script)
         with pytest.raises(SystemExit) as exc_info:
-            inst.download_and_run_install("owner/tool", "1.0.0", "token",
-                                          vendor_name="tool")
+            inst.download_and_run_install(
+                "owner/tool", "1.0.0", "token", vendor_name="tool",
+                checkout=_checkout_with(tmp_path, script))
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "progress" in captured.out
@@ -3047,9 +3236,8 @@ class TestInstallNewVendorAutoRegister:
                 inst.save_config({"vendors": {"tool": config_entry}})
             return manifest_files
 
-        with patch("vendored_install.check_repo_exists"), \
-             patch("vendored_install.check_install_sh"), \
-             patch("vendored_install.resolve_version", return_value="1.2.0"), \
+        with patch("vendored_install.check_install_sh"), \
+             patch("vendored_install.resolve_version", return_value=res("1.2.0")), \
              patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_and_run_install",
                    side_effect=fake_install), \
@@ -3097,17 +3285,16 @@ class TestInstallNewVendorAutoRegister:
                  "protected": [".tool/**"], "allowed": [".tool/config.json"]}
         _, mock_schema = self._run(tmp_repo, None, schema=schema,
                                    config_entry=entry)
-        mock_schema.assert_called_once_with("owner/tool", "v1.2.0", "token")
+        mock_schema.assert_called_once()
         written = json.loads(
             (tmp_repo / ".vendored" / "manifests" / "tool.schema").read_text())
         assert written == schema
         assert "allowed: .tool/config.json" in capsys.readouterr().out
 
     @patch("vendored_install.download_deps", return_value=None)
-    @patch("vendored_install.resolve_version", return_value="1.0.0")
+    @patch("vendored_install.resolve_version", return_value=res("1.0.0"))
     @patch("vendored_install.check_install_sh")
-    @patch("vendored_install.check_repo_exists")
-    def test_name_already_registered_exits(self, mock_exists, mock_sh,
+    def test_name_already_registered_exits(self, mock_sh,
                                            mock_ver, mock_deps,
                                            make_config, capsys):
         make_config({"vendors": {"tool": {"repo": "other/tool"}}})
@@ -3316,7 +3503,7 @@ def _fake_install_sh(tmp_repo, vendor_block=NEW_CICD_VENDOR, files=NEW_CICD_FILE
 def _upgrade(tmp_repo, registry, **fake_kwargs):
     with patch("vendored_install.download_deps", return_value=None), \
          patch("vendored_install.download_schema", return_value=None), \
-         patch("vendored_install.resolve_version", return_value="0.0.4"), \
+         patch("vendored_install.resolve_version", return_value=res("0.0.4")), \
          patch("vendored_install.get_auth_token", return_value="token"), \
          patch("vendored_install.download_and_run_install",
                side_effect=_fake_install_sh(tmp_repo, **fake_kwargs)):
@@ -3433,7 +3620,7 @@ class TestRegistryRefresh:
             return None
         with patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_schema", return_value=None), \
-             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.resolve_version", return_value=res("0.0.4")), \
              patch("vendored_install.get_auth_token", return_value="t"), \
              patch("vendored_install.download_and_run_install", side_effect=_run):
             inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
@@ -3459,7 +3646,7 @@ class TestRegistryRefresh:
             return None
         with patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_schema", return_value=None), \
-             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.resolve_version", return_value=res("0.0.4")), \
              patch("vendored_install.get_auth_token", return_value="t"), \
              patch("vendored_install.download_and_run_install", side_effect=_run):
             inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
@@ -3478,7 +3665,7 @@ class TestRegistryRefresh:
             return None
         with patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_schema", return_value=None), \
-             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.resolve_version", return_value=res("0.0.4")), \
              patch("vendored_install.get_auth_token", return_value="t"), \
              patch("vendored_install.download_and_run_install", side_effect=_run):
             inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
@@ -3504,7 +3691,7 @@ class TestRegistryRefresh:
             return None
         with patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_schema", return_value=None), \
-             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.resolve_version", return_value=res("0.0.4")), \
              patch("vendored_install.get_auth_token", return_value="t"), \
              patch("vendored_install.download_and_run_install", side_effect=_run):
             inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
@@ -3531,7 +3718,7 @@ class TestRegistryRefresh:
             return None
         with patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_schema", return_value=None), \
-             patch("vendored_install.resolve_version", return_value="0.0.5"), \
+             patch("vendored_install.resolve_version", return_value=res("0.0.5")), \
              patch("vendored_install.get_auth_token", return_value="t"), \
              patch("vendored_install.download_and_run_install", side_effect=_run):
             inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
@@ -3548,7 +3735,7 @@ class TestRegistryRefresh:
             return None
         with patch("vendored_install.download_deps", return_value=None), \
              patch("vendored_install.download_schema", return_value=None), \
-             patch("vendored_install.resolve_version", return_value="0.0.4"), \
+             patch("vendored_install.resolve_version", return_value=res("0.0.4")), \
              patch("vendored_install.get_auth_token", return_value="t"), \
              patch("vendored_install.download_and_run_install", side_effect=_run):
             inst.install_existing_vendor("git-cicd", dict(OLD_CICD_REGISTRY),
@@ -4032,3 +4219,224 @@ class TestVendorArgument:
         out = capsys.readouterr().out
         assert "Unknown vendor: nope" in out
         assert "Registered vendors: git-cicd" in out
+
+
+# ── Tests: write and read tokens (gv-274f) ────────────────────────────────
+
+class TestTokenNames:
+    """CICD_WRITE_TOKEN proposes changes, CICD_READ_TOKEN reads private
+    vendors; the deprecated VENDOR_PAT is read when the new names are unset."""
+
+    @pytest.mark.parametrize("env, expected", [
+        ({"CICD_READ_TOKEN": "r", "CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "r"),
+        ({"CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "w"),
+        ({"CICD_READ_TOKEN": "", "CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "w"),
+        ({"VENDOR_PAT": "o"}, "o"),
+        ({"CICD_READ_TOKEN": "", "CICD_WRITE_TOKEN": "", "VENDOR_PAT": "o"}, "o"),
+        ({"CICD_READ_TOKEN": "r"}, "r"),
+    ], ids=["read-first", "write-second", "empty-read", "old-last",
+            "empty-new", "read-alone"])
+    def test_private_vendor_read_order(self, monkeypatch, env, expected):
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        assert inst.read_token() == expected
+        assert inst.get_auth_token(PRIVATE_VENDOR) == expected
+        assert inst.get_auth_token(private=True) == expected
+
+    def test_read_token_is_not_a_write_token(self, monkeypatch):
+        monkeypatch.setenv("CICD_READ_TOKEN", "r")
+        assert inst.write_token() == ""
+
+    @pytest.mark.parametrize("env, expected", [
+        ({"CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "w"),
+        ({"VENDOR_PAT": "o"}, "o"),
+        ({"CICD_WRITE_TOKEN": "", "VENDOR_PAT": "o"}, "o"),
+        ({}, ""),
+    ], ids=["new-name", "old-name", "empty-new", "none"])
+    def test_write_token_order(self, monkeypatch, env, expected):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        assert inst.write_token() == expected
+
+    def test_missing_private_token_names_new_secrets(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            inst.get_auth_token(PRIVATE_VENDOR)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "CICD_READ_TOKEN" in out and "CICD_WRITE_TOKEN" in out
+        assert "VENDOR_PAT" not in out
+
+
+class TestPullRequestWriteToken:
+    """The push (with workflow files), the PR and auto-merge use
+    CICD_WRITE_TOKEN, and VENDOR_PAT when only it is set."""
+
+    WRITE = "fake-cicd-write-token-123"
+    OLD = "fake-old-vendor-pat-456"
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch, make_config):
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        monkeypatch.setenv("GH_TOKEN", "caller-token")
+        make_config({"vendors": {
+            "git-cicd": dict(NEW_CICD_VENDOR, automerge=True)}})
+
+    @staticmethod
+    def _mock(cmd, **kwargs):
+        if cmd[:2] == ["git", "diff"] and "--name-only" in cmd:
+            return MagicMock(returncode=0, stdout="\n".join(WF_FILES) + "\n")
+        if cmd[:2] == ["git", "diff"]:
+            return MagicMock(returncode=1)
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return MagicMock(returncode=0,
+                             stdout="https://github.com/o/r/pull/5\n",
+                             stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def _run(self, mock_run, capsys):
+        mock_run.side_effect = self._mock
+        results = [{"vendor": "git-cicd", "old_version": "0.0.2",
+                    "new_version": "0.0.4", "changed": True}]
+        assert inst.create_pull_request(results) == \
+            "https://github.com/o/r/pull/5"
+        calls = mock_run.call_args_list
+        push = [c[0][0] for c in calls if "push" in c[0][0]]
+        create = [c for c in calls if c[0][0][:3] == ["gh", "pr", "create"]]
+        merge = [c for c in calls if c[0][0][:3] == ["gh", "pr", "merge"]]
+        assert len(push) == 1 and len(create) == 1 and len(merge) == 1
+        out = capsys.readouterr()
+        return push[0], create[0], merge[0], out.out + out.err
+
+    @pytest.mark.parametrize("env, expected", [
+        ({"CICD_WRITE_TOKEN": WRITE}, WRITE),
+        ({"CICD_WRITE_TOKEN": WRITE, "VENDOR_PAT": OLD}, WRITE),
+        ({"VENDOR_PAT": OLD}, OLD),
+        ({"CICD_WRITE_TOKEN": "", "VENDOR_PAT": OLD}, OLD),
+    ], ids=["write-token", "write-over-old", "old-alone", "empty-write"])
+    @patch("vendored_install.subprocess.run")
+    def test_push_pr_and_automerge_use_write_token(
+            self, mock_run, monkeypatch, capsys, env, expected):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        push, create, merge, out = self._run(mock_run, capsys)
+        header = inst._auth_header(expected)
+        assert f"http.https://github.com/.extraheader={header}" in push
+        assert create[1]["env"]["GH_TOKEN"] == expected
+        assert merge[1]["env"]["GH_TOKEN"] == expected
+        cmd = create[0][0]
+        assert "no checks will run" not in cmd[cmd.index("--body") + 1]
+        assert self.WRITE not in out and self.OLD not in out
+
+    @patch("vendored_install.subprocess.run")
+    def test_read_token_does_not_open_the_pr(self, mock_run, monkeypatch,
+                                             capsys):
+        monkeypatch.setenv("CICD_READ_TOKEN", "fake-read-token")
+        push, create, merge, out = self._run(mock_run, capsys)
+        assert push[:2] == ["git", "push"]
+        assert create[1]["env"]["GH_TOKEN"] == "workflow-token"
+        assert merge[1]["env"]["GH_TOKEN"] == "workflow-token"
+        assert "fake-read-token" not in out
+
+    def test_workflow_files_note_names_write_token(self):
+        note = inst.workflow_files_note(
+            [{"vendor": "git-cicd", "changed": True}], WF_FILES)
+        assert "`CICD_WRITE_TOKEN`" in note
+        assert "VENDOR_PAT" not in note
+
+
+class TestRequireWriteTokenInCI:
+    """--pr under CI without a write token fails before anything changes."""
+
+    def test_ci_without_write_token_fails_with_message(self, monkeypatch,
+                                                      capsys):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_TOKEN", "fake-gt-value-789")
+        monkeypatch.setenv("CICD_READ_TOKEN", "fake-read-token")
+        with pytest.raises(SystemExit) as exc:
+            inst.require_write_token_in_ci()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "CICD_WRITE_TOKEN" in out
+        assert "declare it in the git-cicd job" in out
+        assert "--allow-workflow-token" in out
+        assert "VENDOR_PAT" not in out
+        assert "fake-gt-value-789" not in out and "fake-read-token" not in out
+
+    @pytest.mark.parametrize("name", ["CICD_WRITE_TOKEN", "VENDOR_PAT"])
+    def test_ci_with_write_token_passes(self, monkeypatch, name):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv(name, "fake-token")
+        inst.require_write_token_in_ci()
+
+    def test_ci_with_flag_passes(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        inst.require_write_token_in_ci(allow_workflow_token=True)
+
+    def test_outside_ci_passes(self, monkeypatch):
+        inst.require_write_token_in_ci()
+        monkeypatch.setenv("GITHUB_ACTIONS", "")
+        inst.require_write_token_in_ci()
+
+    @patch("vendored_install.subprocess.run")
+    @patch("vendored_install.install_existing_vendor")
+    def test_main_pr_in_ci_fails_before_changing_anything(
+            self, mock_install, mock_run, tmp_repo, monkeypatch, capsys):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        # A monolithic config.json would be migrated (files written) by main.
+        config = {"vendors": {"tool": SAMPLE_VENDOR}}
+        config_path = tmp_repo / ".vendored" / "config.json"
+        config_path.write_text(json.dumps(config, indent=2) + "\n")
+        before = sorted(p.relative_to(tmp_repo).as_posix()
+                        for p in tmp_repo.rglob("*"))
+
+        with patch("sys.argv", ["install", "tool", "--pr"]):
+            with pytest.raises(SystemExit) as exc:
+                inst.main()
+        assert exc.value.code == 1
+        mock_install.assert_not_called()
+        mock_run.assert_not_called()
+        after = sorted(p.relative_to(tmp_repo).as_posix()
+                       for p in tmp_repo.rglob("*"))
+        assert after == before
+        assert json.loads(config_path.read_text()) == config
+        assert "CICD_WRITE_TOKEN" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("argv, env", [
+        (["install", "tool", "--pr", "--allow-workflow-token"],
+         {"GITHUB_ACTIONS": "true"}),
+        (["install", "tool", "--pr"], {}),
+        (["install", "tool", "--pr"],
+         {"GITHUB_ACTIONS": "true", "CICD_WRITE_TOKEN": "fake-write"}),
+    ], ids=["ci-with-flag", "outside-ci", "ci-with-write-token"])
+    @patch("vendored_install.create_pull_request")
+    @patch("vendored_install.output_result")
+    @patch("vendored_install.install_existing_vendor")
+    def test_main_pr_proceeds_as_before(self, mock_install, mock_output,
+                                        mock_pr, make_config, monkeypatch,
+                                        argv, env):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        result = {"vendor": "tool", "old_version": "1.0.0",
+                  "new_version": "2.0.0", "changed": True}
+        mock_install.return_value = result
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        with patch("sys.argv", argv):
+            inst.main()
+        mock_install.assert_called_once()
+        mock_pr.assert_called_once_with([result])
+
+    @patch("vendored_install.install_existing_vendor")
+    @patch("vendored_install.output_result")
+    def test_main_without_pr_in_ci_is_unchanged(self, mock_output,
+                                                mock_install, make_config,
+                                                monkeypatch):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        mock_install.return_value = {"vendor": "tool", "old_version": "1.0.0",
+                                     "new_version": "2.0.0", "changed": True}
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["install", "tool"]):
+            inst.main()
+        mock_install.assert_called_once()

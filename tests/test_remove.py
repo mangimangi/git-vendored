@@ -20,7 +20,7 @@ ROOT = Path(__file__).parent.parent
 def _import_remove():
     filepath = str(ROOT / "templates" / "remove")
     loader = importlib.machinery.SourceFileLoader("vendored_remove", filepath)
-    spec = importlib.util.spec_from_loader("vendored_remove", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_remove", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules["vendored_remove"] = module
     spec.loader.exec_module(module)
@@ -126,6 +126,15 @@ class TestGetFilesToRemove:
         assert ".vendored/manifests/tool.files" in files
         assert ".vendored/manifests/tool.version" in files
 
+    def test_includes_commit_file(self, tmp_repo):
+        manifests_dir = tmp_repo / ".vendored" / "manifests"
+        manifests_dir.mkdir(parents=True)
+        (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
+        (manifests_dir / "tool.commit").write_text("a" * 40 + "\n")
+
+        files = rem.get_files_to_remove("tool")
+        assert ".vendored/manifests/tool.commit" in files
+
     def test_includes_schema_file(self, tmp_repo):
         """get_files_to_remove includes .schema file when it exists."""
         manifests_dir = tmp_repo / ".vendored" / "manifests"
@@ -216,6 +225,7 @@ class TestMain:
         manifests_dir.mkdir(parents=True)
         (manifests_dir / "tool.files").write_text(".tool/script.sh\n")
         (manifests_dir / "tool.version").write_text("1.0.0\n")
+        (manifests_dir / "tool.commit").write_text("a" * 40 + "\n")
 
         with patch("sys.argv", ["remove", "tool", "--force"]):
             rem.main()
@@ -224,6 +234,7 @@ class TestMain:
         assert not (tmp_repo / ".tool" / "script.sh").exists()
         assert not (manifests_dir / "tool.files").exists()
         assert not (manifests_dir / "tool.version").exists()
+        assert not (manifests_dir / "tool.commit").exists()
 
         # Verify config updated
         config = json.loads((tmp_repo / ".vendored" / "config.json").read_text())

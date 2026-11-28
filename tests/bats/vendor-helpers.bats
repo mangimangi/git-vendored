@@ -23,6 +23,36 @@ run_lib() {
 
 # ── _vendor_auth_header ─────────────────────────────────────────────────
 
+@test "auth header: CICD_READ_TOKEN first, over the write and old tokens" {
+    export CICD_READ_TOKEN=read CICD_WRITE_TOKEN=write VENDOR_PAT=pat GH_TOKEN=tok
+    run_lib '_vendor_auth_header'
+    [ "$status" -eq 0 ]
+    [ "$output" = "Authorization: token read" ]
+}
+
+@test "auth header: CICD_WRITE_TOKEN when CICD_READ_TOKEN is unset or empty" {
+    export CICD_WRITE_TOKEN=write VENDOR_PAT=pat GH_TOKEN=tok
+    run_lib '_vendor_auth_header'
+    [ "$output" = "Authorization: token write" ]
+    export CICD_READ_TOKEN=""
+    run_lib '_vendor_auth_header'
+    [ "$output" = "Authorization: token write" ]
+}
+
+@test "auth header: VENDOR_PAT when both new names are unset or empty" {
+    export CICD_READ_TOKEN="" CICD_WRITE_TOKEN="" VENDOR_PAT=pat GH_TOKEN=tok
+    run_lib '_vendor_auth_header'
+    [ "$output" = "Authorization: token pat" ]
+}
+
+@test "download: CICD_READ_TOKEN alone selects the gh path" {
+    export CICD_READ_TOKEN=read
+    run_lib '_vendor_download src/a.txt a.txt'
+    [ "$status" -eq 0 ]
+    [ "$(stub_calls gh)" -eq 1 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+}
+
 @test "auth header: VENDOR_PAT overrides GH_TOKEN" {
     export VENDOR_PAT=pat GH_TOKEN=tok
     run_lib '_vendor_auth_header'
@@ -371,4 +401,240 @@ out/z.sh" ]
     [ ! -e out/bad.txt ]
     [ ! -e out/later.txt ]
     [ "$(cat "$VENDOR_MANIFEST")" = "out/ok.txt" ]
+}
+
+# ── checkout mode (VENDOR_CHECKOUT) ─────────────────────────────────────
+
+# make_checkout: a vendor checkout at $CO with a nested tree, an executable
+# source file, a binary file, a symlink, a .git dir and a submodule stand-in.
+make_checkout() {
+    CO="$BATS_TEST_TMPDIR/checkout"
+    mkdir -p "$CO/tpl/hooks/sub/deeper" "$CO/.git" "$CO/tpl/hooks/.git" \
+        "$CO/tpl/hooks/module" "$CO/tpl/hooks/inited/.git"
+    printf 'line one\nline two\n' > "$CO/tpl/hooks/a.sh"
+    chmod +x "$CO/tpl/hooks/a.sh"
+    printf '\x00\x01\xff\xfe binary\n\x00' > "$CO/tpl/hooks/sub/blob.bin"
+    echo c > "$CO/tpl/hooks/sub/deeper/c.sh"
+    echo z > "$CO/tpl/hooks/z.sh"
+    echo hidden > "$CO/tpl/hooks/.hidden"
+    echo in-submodule > "$CO/tpl/hooks/inited/x"
+    echo git > "$CO/tpl/hooks/.git/HEAD"
+    ln -s a.sh "$CO/tpl/hooks/link"
+    echo top > "$CO/prl.py"
+    chmod +x "$CO/prl.py"
+    export VENDOR_CHECKOUT="$CO"
+}
+
+@test "checkout: fetch_file copies bytes exactly, no gh or curl even with a token" {
+    make_checkout
+    export GH_TOKEN=tok CICD_READ_TOKEN=read VENDOR_MANIFEST="$BATS_TEST_TMPDIR/m.files"
+    run_lib 'fetch_file tpl/hooks/sub/blob.bin out/blob.bin; fetch_file tpl/hooks/a.sh out/a.sh'
+    [ "$status" -eq 0 ]
+    cmp "$CO/tpl/hooks/sub/blob.bin" out/blob.bin
+    cmp "$CO/tpl/hooks/a.sh" out/a.sh
+    [ "$(stub_calls gh)" -eq 0 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+    [ "$(cat "$VENDOR_MANIFEST")" = "out/blob.bin
+out/a.sh" ]
+}
+
+@test "checkout: without +x the umask mode is kept even if the source is executable" {
+    make_checkout
+    run_lib 'umask 022; fetch_file prl.py out/prl.py; fetch_file prl.py out/prl-x +x'
+    [ "$status" -eq 0 ]
+    [ ! -x out/prl.py ]
+    [ "$(stat -c %a out/prl.py)" = "644" ]
+    [ -x out/prl-x ]
+}
+
+@test "checkout: VENDOR_REPO and VENDOR_REF are not needed" {
+    make_checkout
+    unset VENDOR_REPO VENDOR_REF
+    run_lib 'fetch_file prl.py prl.py && fetch_dir tpl/hooks/sub out'
+    [ "$status" -eq 0 ]
+    [ -f prl.py ] && [ -f out/deeper/c.sh ]
+}
+
+@test "checkout: a missing source returns nonzero, names the path, writes nothing" {
+    make_checkout
+    export VENDOR_MANIFEST="$BATS_TEST_TMPDIR/m.files"
+    run_lib 'fetch_file nope.txt out/nope.txt || echo "rc=$?"'
+    [[ "$output" == *"Error: nope.txt not found in the vendor checkout"* ]]
+    [[ "$output" == *"rc=1"* ]]
+    [ ! -e out/nope.txt ]
+    [ ! -e "$VENDOR_MANIFEST" ]
+    run_lib 'fetch_file tpl/hooks/link link || echo "rc=$?"'
+    [[ "$output" == *"rc=1"* ]]
+    [ "$(stub_calls curl)" -eq 0 ]
+}
+
+@test "checkout: fetch_dir copies the tree, skipping .git, symlinks and submodules" {
+    make_checkout
+    export VENDOR_MANIFEST="$BATS_TEST_TMPDIR/m.files"
+    run_lib 'fetch_dir tpl/hooks out'
+    [ "$status" -eq 0 ]
+    cmp "$CO/tpl/hooks/a.sh" out/a.sh
+    cmp "$CO/tpl/hooks/sub/blob.bin" out/sub/blob.bin
+    [ "$(cat out/sub/deeper/c.sh)" = "c" ]
+    [ "$(cat out/.hidden)" = "hidden" ]
+    [ ! -e out/.git ] && [ ! -e out/link ] && [ ! -e out/module ] && [ ! -e out/inited ]
+    [ ! -x out/a.sh ]
+    [ "$(stub_calls gh)" -eq 0 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+    [ "$(cat "$VENDOR_MANIFEST")" = "out/.hidden
+out/a.sh
+out/sub/blob.bin
+out/sub/deeper/c.sh
+out/z.sh" ]
+}
+
+@test "checkout: fetch_dir manifest lines match the API mode for the same tree" {
+    make_checkout
+    export VENDOR_MANIFEST="$BATS_TEST_TMPDIR/checkout.files"
+    run_lib 'fetch_dir tpl/hooks out-co/'
+    [ "$status" -eq 0 ]
+    unset VENDOR_CHECKOUT
+    listing tpl/hooks \
+        $'file\ttpl/hooks/.hidden\t.hidden' $'file\ttpl/hooks/a.sh\ta.sh' \
+        $'symlink\ttpl/hooks/link\tlink' $'submodule\ttpl/hooks/module\tmodule' \
+        $'dir\ttpl/hooks/sub\tsub' $'file\ttpl/hooks/z.sh\tz.sh'
+    listing tpl/hooks/sub $'file\ttpl/hooks/sub/blob.bin\tblob.bin' \
+        $'dir\ttpl/hooks/sub/deeper\tdeeper'
+    listing tpl/hooks/sub/deeper $'file\ttpl/hooks/sub/deeper/c.sh\tc.sh'
+    export VENDOR_MANIFEST="$BATS_TEST_TMPDIR/api.files"
+    run_lib 'fetch_dir tpl/hooks out-co/'
+    [ "$status" -eq 0 ]
+    [ "$(sort "$BATS_TEST_TMPDIR/checkout.files")" = "$(sort "$BATS_TEST_TMPDIR/api.files")" ]
+}
+
+@test "checkout: fetch_dir of a missing dir returns 1 with the listing error" {
+    make_checkout
+    run_lib 'fetch_dir nope out || echo "rc=$?"'
+    [[ "$output" == *"Error: failed to list directory nope from o/r"* ]]
+    [[ "$output" == *"rc=1"* ]]
+    [ ! -e out ]
+    run_lib 'fetch_dir prl.py out || echo "rc=$?"'
+    [[ "$output" == *"rc=1"* ]]
+    [ "$(stub_calls gh)" -eq 0 ]
+}
+
+@test "checkout: a failing file inside fetch_dir stops it with nonzero" {
+    make_checkout
+    chmod 000 "$CO/tpl/hooks/sub/deeper/c.sh"
+    if cat "$CO/tpl/hooks/sub/deeper/c.sh" >/dev/null 2>&1; then
+        skip "running as a user that reads mode-000 files"
+    fi
+    run_lib 'fetch_dir tpl/hooks out; echo after'
+    [ "$status" -ne 0 ]
+    [[ "$output" != *after* ]]
+}
+
+@test "checkout: no gh on PATH is fine" {
+    make_checkout
+    use_no_gh
+    run_lib 'fetch_dir tpl/hooks/sub out && fetch_file prl.py prl.py +x'
+    [ "$status" -eq 0 ]
+    [ -f out/blob.bin ] && [ -x prl.py ]
+}
+
+@test "fallback: VENDOR_CHECKOUT empty uses the download path" {
+    export VENDOR_CHECKOUT=""
+    run_lib 'fetch_file prl.py prl.py'
+    [ "$status" -eq 0 ]
+    [ "$(cat prl.py)" = "curl:$RAW/o/r/v1.0.0/prl.py" ]
+}
+
+@test "fallback: VENDOR_CHECKOUT naming no directory uses the download path" {
+    export VENDOR_CHECKOUT="$BATS_TEST_TMPDIR/does-not-exist"
+    run_lib 'fetch_file prl.py prl.py'
+    [ "$status" -eq 0 ]
+    [ "$(cat prl.py)" = "curl:$RAW/o/r/v1.0.0/prl.py" ]
+}
+
+# ── the same vendor through both modes lands byte- and mode-identical ───
+
+# A vendor whose install.sh uses the helpers the way git-cicd's and
+# git-semver's do: nested dirs, a +x file, a workflow outside
+# VENDOR_INSTALL_DIR. It is a local git repo, checked out with git.
+VENDOR_SH='source "$VENDOR_LIB"
+fetch_file tool "$VENDOR_INSTALL_DIR/tool" +x
+fetch_file README.md "$VENDOR_INSTALL_DIR/README.md"
+fetch_dir templates "$VENDOR_INSTALL_DIR/templates"
+fetch_file workflows/tool.yml .github/workflows/tool.yml'
+
+make_git_vendor() {
+    local src="$BATS_TEST_TMPDIR/vendor-src"
+    mkdir -p "$src/templates/hooks/deep" "$src/workflows"
+    printf '#!/bin/bash\necho tool\n' > "$src/tool"
+    chmod +x "$src/tool"
+    printf '# readme\n' > "$src/README.md"
+    printf 'hook\n' > "$src/templates/hooks/pre.sh"
+    chmod +x "$src/templates/hooks/pre.sh"   # exec bit in git, never set by a download
+    printf '\x00\x01binary\xff' > "$src/templates/hooks/deep/data.bin"
+    printf 'a: 1\n' > "$src/templates/config.yml"
+    printf 'on: push\n' > "$src/workflows/tool.yml"
+    printf '%s\n' "$VENDOR_SH" > "$src/install.sh"
+    local g=(git -c user.name=t -c user.email=t@t -c commit.gpgsign=false -C "$src")
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "${g[@]}" init -q -b main
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "${g[@]}" add -A
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "${g[@]}" commit -q -m v1
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "${g[@]}" tag v1.0.0
+    CO="$BATS_TEST_TMPDIR/vendor-checkout"
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=file \
+        git clone -q --depth 1 --branch v1.0.0 -c advice.detachedHead=false \
+        "file://$src" "$CO"
+}
+
+# serve_tree_with_gh <dir>: make the gh stub serve <dir> (contents and
+# directory listings), as GitHub would for the same tree.
+serve_tree_with_gh() {
+    local root="$1" d rel e name
+    cp -R "$root/." "$GH_CONTENT/"
+    rm -rf "$GH_CONTENT/.git"
+    while IFS= read -r d; do
+        rel="${d#$root}"; rel="${rel#/}"
+        [ -z "$rel" ] && continue
+        mkdir -p "$(dirname "$GH_LISTINGS/$rel")"
+        : > "$GH_LISTINGS/$rel.tsv"
+        for e in "$d"/*; do
+            name="${e##*/}"
+            if [ -d "$e" ]; then
+                printf 'dir\t%s\t%s\n' "$rel/$name" "$name" >> "$GH_LISTINGS/$rel.tsv"
+            else
+                printf 'file\t%s\t%s\n' "$rel/$name" "$name" >> "$GH_LISTINGS/$rel.tsv"
+            fi
+        done
+    done < <(find "$root" -type d -not -path '*/.git*')
+}
+
+install_into() {
+    # install_into <dir> [VAR=value...]: run the vendor install.sh there
+    local dir="$1"; shift
+    mkdir -p "$dir"
+    (cd "$dir" && env PATH="$RUN_PATH" VENDOR_LIB="$LIB" \
+        VENDOR_INSTALL_DIR=.vendored/pkg/tool VENDOR_MANIFEST="$dir.files" "$@" \
+        bash -c 'umask 022; source "$1"' _ "$CO/install.sh")
+}
+
+tree_state() {
+    # Every file with its mode and checksum, relative to $1
+    (cd "$1" && find . -type f -printf '%m %p\n' | sort && find . -type f -print0 | sort -z | xargs -0 cksum)
+}
+
+@test "both modes: same files, bytes, modes and manifest for a vendor using the helpers" {
+    make_git_vendor
+    serve_tree_with_gh "$CO"
+    install_into "$BATS_TEST_TMPDIR/via-checkout" VENDOR_CHECKOUT="$CO"
+    [ "$(stub_calls gh)" -eq 0 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+    install_into "$BATS_TEST_TMPDIR/via-api" GH_TOKEN=tok
+    [ "$(stub_calls gh)" -gt 0 ]
+    a="$(tree_state "$BATS_TEST_TMPDIR/via-checkout")"
+    b="$(tree_state "$BATS_TEST_TMPDIR/via-api")"
+    [ "$a" = "$b" ]
+    [[ "$a" == *"755 ./.vendored/pkg/tool/tool"* ]]
+    [[ "$a" == *"644 ./.vendored/pkg/tool/templates/hooks/pre.sh"* ]]
+    [[ "$a" == *"644 ./.github/workflows/tool.yml"* ]]
+    [ "$(sort "$BATS_TEST_TMPDIR/via-checkout.files")" = "$(sort "$BATS_TEST_TMPDIR/via-api.files")" ]
+    [ ! -e "$BATS_TEST_TMPDIR/via-checkout/.vendored/pkg/tool/.git" ]
 }

@@ -4,11 +4,21 @@
 # Usage:
 #   install.sh <version> [<repo>]
 #
+# Bootstrap with git (any host), from the target repo's root:
+#   git clone --depth 1 --branch v<X.Y.Z> <git-vendored URL> <tmpdir>
+#   VENDOR_CHECKOUT=<tmpdir> bash <tmpdir>/install.sh <X.Y.Z>
+#
 # Environment (v2 contract — preferred):
 #   VENDOR_REF       - Git ref (version) to install at. Falls back to $1.
-#   VENDOR_REPO      - owner/repo for API calls. Falls back to $2 / default.
-#   GH_TOKEN         - Used for gh api downloads (required for private repos).
-#                      Falls back to curl for public repos when not set.
+#   VENDOR_CHECKOUT  - git-vendored checked out at that version: files are
+#                      copied from it (content only; no gh, no curl). Set by
+#                      the framework on an upgrade; set it by hand to
+#                      bootstrap with git.
+#   VENDOR_REPO      - owner/repo to download from when no VENDOR_CHECKOUT
+#                      is given. Falls back to $2 / default.
+#   GH_TOKEN         - Without VENDOR_CHECKOUT: used for gh api downloads
+#                      (required for private repos). Falls back to curl
+#                      for public repos when not set.
 #   VENDOR_MANIFEST  - Path to write manifest of installed files (v2 contract).
 #
 # Behavior:
@@ -31,13 +41,22 @@ VENDORED_REPO="${VENDOR_REPO:-${2:-mangimangi/git-vendored}}"
 # Track installed files for manifest
 INSTALLED_FILES=()
 
-# File download helper - uses gh api when GH_TOKEN is set, curl otherwise
+# File download helper - copies from $VENDOR_CHECKOUT when given (content
+# only, so modes are what a download gives); otherwise gh api when GH_TOKEN
+# is set, curl otherwise
 fetch_file() {
     local repo_path="$1"
     local dest="$2"
     local ref="${3:-v$VERSION}"
 
-    if [ -n "${GH_TOKEN:-}" ] && command -v gh &>/dev/null; then
+    if [ -n "${VENDOR_CHECKOUT:-}" ] && [ -d "$VENDOR_CHECKOUT" ]; then
+        local src="$VENDOR_CHECKOUT/$repo_path"
+        if [ -L "$src" ] || [ ! -f "$src" ]; then
+            echo "Error: $repo_path not found in the git-vendored checkout" >&2
+            return 1
+        fi
+        cat "$src" > "$dest"
+    elif [ -n "${GH_TOKEN:-}" ] && command -v gh &>/dev/null; then
         gh api "repos/$VENDORED_REPO/contents/$repo_path?ref=$ref" --jq '.content' | base64 -d > "$dest"
     else
         local base="https://raw.githubusercontent.com/$VENDORED_REPO"

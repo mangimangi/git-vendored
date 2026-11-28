@@ -54,7 +54,7 @@
           "default": "latest"
         },
         "private": {
-          "description": "Vendor repo is private (use VENDOR_PAT)",
+          "description": "Vendor repo is private (read with CICD_READ_TOKEN)",
           "choices": ["false", "true"],
           "default": "false"
         }

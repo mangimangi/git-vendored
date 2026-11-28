@@ -27,9 +27,11 @@ stubs_setup() {
     export HOME="$BATS_TEST_TMPDIR/home"
     export XDG_CACHE_HOME="$BATS_TEST_TMPDIR/cache"
     mkdir -p "$HOME" "$XDG_CACHE_HOME"
+    # No git config of the machine (system or global) reaches a test.
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
     # No test reads a token from the ambient environment (CI holds real
     # secrets); a test that needs one passes a fake value.
-    unset GH_TOKEN VENDOR_PAT VENDOR_REF VENDOR_REPO VENDOR_MANIFEST \
+    unset GH_TOKEN VENDOR_PAT CICD_WRITE_TOKEN CICD_READ_TOKEN VENDOR_REF VENDOR_REPO VENDOR_MANIFEST VENDOR_CHECKOUT \
         VENDOR_INSTALL_DIR CURL_FAIL GH_FAIL GITHUB_TOKEN
 
     STUB_BIN="$BATS_TEST_TMPDIR/stubs"
@@ -92,6 +94,14 @@ STUB
 # system PATH with a bin dir holding only the tools the scripts need.
 use_no_gh() {
     rm -f "$STUB_BIN/gh"
+    use_system_tools
+    run env PATH="$RUN_PATH" bash -c 'command -v gh'
+    [ "$status" -ne 0 ]
+}
+
+# Replace the system PATH with a bin dir holding only the basic tools the
+# scripts need (no python3, no gh, no git), after the stubs.
+use_system_tools() {
     local sysbin="$BATS_TEST_TMPDIR/sysbin" tool src
     mkdir -p "$sysbin"
     for tool in bash base64 cat chmod mkdir rm sort dirname env; do
@@ -100,8 +110,14 @@ use_no_gh() {
         ln -sf "$src" "$sysbin/$tool"
     done
     RUN_PATH="$STUB_BIN:$sysbin"
-    run env PATH="$RUN_PATH" bash -c 'command -v gh'
-    [ "$status" -ne 0 ]
+}
+
+# Put the machine's python3 in the stub dir, ahead of the rest of PATH, so a
+# test that needs one says so and fails clearly when there is none.
+use_real_python3() {
+    local py
+    py="$(command -v python3)" || { echo "this test needs a python3" >&2; return 1; }
+    ln -sf "$py" "$STUB_BIN/python3"
 }
 
 # Number of logged calls to the given stub.

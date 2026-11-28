@@ -6,11 +6,14 @@ registered, pre-validates the repo and post-validates the config entry. If
 already registered, resolves the target version and skips if already current.
 
 Usage:
-    python3 .vendored/install <owner/repo|vendor|all> [--version <version>]
+    python3 .vendored/install <url|owner/repo|vendor|all> [--version <version>]
                               [--force] [--pr] [--name <name>]
 
-    owner/repo of a vendor that is already registered updates it. Surrounding
-    whitespace is trimmed from the arguments.
+    A vendor is named by a URL git can fetch (https://, ssh://,
+    git@host:path, file://) or the owner/repo shorthand for github.com. It is
+    fetched once with git at its version's tag. A repository that is already
+    registered updates it. Surrounding whitespace is trimmed from the
+    arguments.
 
 Output (key=value lines for workflow consumption):
     vendor=<name>
@@ -19,13 +22,21 @@ Output (key=value lines for workflow consumption):
     changed=true|false
 
 Environment:
-    GITHUB_TOKEN - Auth for public repos; opens the PR in --pr mode when
-                   VENDOR_PAT is not set (such a PR gets no checks)
-    VENDOR_PAT   - Auth for private repos (vendor.private: true). In --pr
-                   mode, also pushes the install branch when it carries
-                   workflow files (needs workflow write permission), and
-                   opens the PR and requests auto-merge, so checks run
-    GH_TOKEN     - Fallback auth token
+    CICD_WRITE_TOKEN - In --pr mode, pushes the install branch when it
+                       carries workflow files (needs workflow write
+                       permission), opens the PR and requests auto-merge,
+                       so the PR's checks run. Also reads private vendors
+                       when CICD_READ_TOKEN is not set. Under CI
+                       (GITHUB_ACTIONS set), --pr fails before changing
+                       anything when it is missing, unless
+                       --allow-workflow-token is given.
+    CICD_READ_TOKEN  - Reads private vendor repos (vendor.private: true);
+                       needs no write permission
+    VENDOR_PAT       - Deprecated: still read when CICD_WRITE_TOKEN (for
+                       writing) or both new names (for reading) are unset
+    GITHUB_TOKEN     - Auth for public repos; opens the PR in --pr mode when
+                       no write token is set (such a PR gets no checks)
+    GH_TOKEN         - Fallback auth token
 
     The arguments can also be given through the environment (command-line
     arguments win):
@@ -36,9 +47,12 @@ Environment:
 
 import argparse
 import base64
+import collections
+import contextlib
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -204,104 +218,269 @@ def save_config(config):
 
 # ── Auth helpers ──────────────────────────────────────────────────────────
 
+WRITE_TOKEN_ENV = "CICD_WRITE_TOKEN"
+READ_TOKEN_ENV = "CICD_READ_TOKEN"
+LEGACY_TOKEN_ENV = "VENDOR_PAT"  # deprecated; still read
+ALLOW_WORKFLOW_TOKEN_FLAG = "--allow-workflow-token"
+
+
+def write_token():
+    """Token that may propose changes: CICD_WRITE_TOKEN, else VENDOR_PAT."""
+    return (os.environ.get(WRITE_TOKEN_ENV, "")
+            or os.environ.get(LEGACY_TOKEN_ENV, ""))
+
+
+def read_token():
+    """Token that may read private vendors: read, then write, then old."""
+    return os.environ.get(READ_TOKEN_ENV, "") or write_token()
+
+
 def get_auth_token(vendor_config=None, private=False):
     """Get the appropriate auth token for a vendor."""
     if private or (vendor_config and vendor_config.get("private")):
-        token = os.environ.get("VENDOR_PAT", "")
+        token = read_token()
         if not token:
-            print("::error::VENDOR_PAT required for private vendor repos")
+            print(f"::error::{READ_TOKEN_ENV} (or {WRITE_TOKEN_ENV}) required "
+                  "for private vendor repos")
             sys.exit(1)
         return token
     return os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
 
 
-def _gh_env(token):
-    """Build environment dict with GH_TOKEN set."""
+# ── Git access ────────────────────────────────────────────────────────────
+
+GITHUB_URL = "https://github.com/{}.git"
+
+
+def _is_url(repo):
+    """True if `repo` is a git URL rather than the owner/repo shorthand."""
+    return "://" in repo or ":" in repo
+
+
+def vendor_git_url(repo):
+    """Return a URL git can fetch for a configured vendor `repo`.
+
+    The owner/repo shorthand (exactly one '/', no ':', no scheme) means that
+    repository on github.com. Anything else (https://, ssh://, git@host:path,
+    file://) is passed to git unchanged.
+    """
+    if not _is_url(repo) and repo.count("/") == 1:
+        return GITHUB_URL.format(repo)
+    return repo
+
+
+def vendor_name_for(repo):
+    """Default vendor name: the last path component, `.git` stripped.
+
+    owner/tool, https://host/team/tool.git, git@host:team/tool.git and
+    file:///srv/git/tool all give `tool`.
+    """
+    name = repo.rstrip("/").split("/")[-1].split(":")[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+
+def _git_env(token, url=None):
+    """Environment that hands `token` to git for one command only.
+
+    The token goes in as an http.extraHeader through GIT_CONFIG_COUNT /
+    GIT_CONFIG_KEY_<n> / GIT_CONFIG_VALUE_<n>: never in argv or a URL, never
+    written to a git config file. With `url`, the header is scoped to that
+    URL (`http.<url>.extraHeader`), so it is sent to the vendor's host and
+    nowhere else. With no token, git reads anonymously.
+    GIT_TERMINAL_PROMPT=0 makes a missing credential fail instead of hang.
+    """
     env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
     if token:
-        env["GH_TOKEN"] = token
+        # Appended after any GIT_CONFIG_* entries already in the environment.
+        try:
+            n = int(env.get("GIT_CONFIG_COUNT", "0"))
+        except ValueError:
+            n = 0
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        key = f"http.{url}.extraHeader" if url else "http.extraHeader"
+        env["GIT_CONFIG_COUNT"] = str(n + 1)
+        env[f"GIT_CONFIG_KEY_{n}"] = key
+        env[f"GIT_CONFIG_VALUE_{n}"] = f"Authorization: Basic {basic}"
     return env
 
 
-# ── Pre-validation (add path) ────────────────────────────────────────────
+def ls_remote_tags(repo, token):
+    """List a vendor's tags with `git ls-remote --tags`.
 
-def check_repo_exists(repo, token):
-    """Check that the GitHub repo exists and is accessible."""
-    env = _gh_env(token)
+    Returns a dict tag -> commit, or None when the repo cannot be read. For
+    an annotated tag the peeled `refs/tags/X^{}` line gives the commit; a
+    lightweight tag's own sha is its commit.
+    """
+    url = vendor_git_url(repo)
     result = subprocess.run(
-        ["gh", "api", f"repos/{repo}", "--jq", ".full_name"],
-        capture_output=True, text=True, env=env
+        ["git", "ls-remote", "--tags", url],
+        capture_output=True, text=True, env=_git_env(token, url),
     )
     if result.returncode != 0:
+        return None
+    tags = {}
+    peeled = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2 or not parts[1].startswith("refs/tags/"):
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()[len("refs/tags/"):]
+        if ref.endswith("^{}"):
+            peeled[ref[:-3]] = sha
+        else:
+            tags[ref] = sha
+    tags.update(peeled)
+    return tags
+
+
+def list_tags(repo, token):
+    """Tag -> commit for a vendor, or exit when the repo cannot be read."""
+    tags = ls_remote_tags(repo, token)
+    if tags is None:
         print(f"::error::Cannot access repo: {repo}")
-        print("Ensure the repo exists and your GH_TOKEN has access.")
+        print(f"Ensure the repo exists; a private vendor needs "
+              f"{READ_TOKEN_ENV} (or {WRITE_TOKEN_ENV}).")
         sys.exit(1)
+    return tags
 
 
-def check_install_sh(repo, token):
-    """Verify the repo has an install.sh at its root."""
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/install.sh", "--jq", ".name"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode != 0 or not result.stdout.strip():
+# ── Vendor checkout ───────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def fetch_vendor(repo, tag, token, commit=None):
+    """Fetch a vendor once with git at `tag`; yield the checkout's path.
+
+    A shallow clone of that one ref into a temporary directory outside the
+    repository, removed afterwards (also when the install exits with an
+    error). The token is handed to git for this one command only. With
+    `commit`, the checkout's HEAD must be that commit (the tag did not move
+    between listing and fetching), so the recorded commit is the installed one.
+    """
+    checkout = tempfile.mkdtemp(prefix="gv-vendor-")
+    try:
+        url = vendor_git_url(repo)
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", tag, "--quiet",
+             "-c", "advice.detachedHead=false", url, checkout],
+            capture_output=True, text=True, env=_git_env(token, url),
+        )
+        if result.returncode != 0:
+            print(f"::error::Failed to fetch {repo} at {tag}")
+            detail = _scrub(result.stderr, token)
+            if detail:
+                print(detail)
+            sys.exit(1)
+        if commit:
+            head = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if head != commit:
+                print(f"::error::{repo}: tag {tag} moved while fetching: "
+                      f"listed at {commit}, fetched {head}")
+                sys.exit(1)
+        yield checkout
+    finally:
+        shutil.rmtree(checkout, ignore_errors=True)
+
+
+def check_install_sh(checkout, repo):
+    """Verify the vendor has an install.sh at its root at the fetched tag."""
+    if not os.path.isfile(os.path.join(checkout, "install.sh")):
         print(f"::error::Repo does not implement git-vendored: {repo}")
         print("Expected install.sh at repository root.")
         sys.exit(1)
 
 
+def _read_json(path):
+    """Parse a JSON file, or None when it is missing or not valid JSON."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 # ── Version resolution ────────────────────────────────────────────────────
 
-def resolve_version(vendor_name, repo, requested_version, token):
-    """Resolve the target version for a vendor.
+Resolved = collections.namedtuple("Resolved", "version tag commit")
 
-    Strategy:
-    1. If a specific version is given (not 'latest'), use it
-    2. Try GitHub releases API for latest release tag
-    3. Fall back to reading VERSION file from default branch
+
+def _parse_version(text):
+    """Return a version's numeric parts as a tuple, or None if not a version."""
+    parts = text.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def version_tags(tags, prefix=""):
+    """Version tags of one series: {version: (tag, commit)}.
+
+    A version tag is `<prefix>vX.Y.Z` or `<prefix>X.Y.Z` with numeric parts.
+    With no prefix (the vendor's root series), tags containing '/' are a
+    component's series (`<subdir>/vX.Y.Z`) and are left out. Tags that are
+    not versions (such as `latest`) are ignored. When both `vX` and `X`
+    exist, `vX` wins.
+    """
+    found = {}
+    for tag, commit in tags.items():
+        if not tag.startswith(prefix):
+            continue
+        rest = tag[len(prefix):]
+        if "/" in rest:
+            continue
+        bare = rest[1:] if rest.startswith("v") else rest
+        if _parse_version(bare) is None:
+            continue
+        if bare in found and not rest.startswith("v"):
+            continue
+        found[bare] = (tag, commit)
+    return found
+
+
+def pick_version(tags, requested_version, prefix=""):
+    """Resolve a requested version against tag -> commit.
+
+    Returns (Resolved, None) or (None, reason). `latest` (or empty) is the
+    highest version tag by numeric order; an explicit version X is tag
+    `<prefix>vX` if it exists, else `<prefix>X`.
     """
     if requested_version and requested_version != "latest":
-        return requested_version
-
-    version = _resolve_from_releases(repo, token)
-    if version:
-        return version
-
-    version = _resolve_from_version_file(repo, token)
-    if version:
-        return version
-
-    print(f"::error::Could not resolve version for {vendor_name} from {repo}")
-    sys.exit(1)
-
-
-def _resolve_from_releases(repo, token):
-    """Try to get latest version from GitHub releases."""
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/releases/latest", "--jq", ".tag_name"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip().lstrip("v")
-    return None
+        for tag in (f"{prefix}v{requested_version}",
+                    f"{prefix}{requested_version}"):
+            if tag in tags:
+                return Resolved(requested_version, tag, tags[tag]), None
+        return None, f"no tag for {requested_version}"
+    versions = version_tags(tags, prefix)
+    if not versions:
+        return None, "no version tags found"
+    best = max(versions, key=_parse_version)
+    tag, commit = versions[best]
+    return Resolved(best, tag, commit), None
 
 
-def _resolve_from_version_file(repo, token):
-    """Fallback: read VERSION file from repo default branch."""
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/VERSION", "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        try:
-            content = base64.b64decode(result.stdout.strip()).decode().strip()
-            return content
-        except Exception:
-            pass
-    return None
+def resolve_version(vendor_name, repo, requested_version, token, prefix=""):
+    """Resolve the version, tag and commit to install for a vendor.
+
+    The single place a requested version becomes a tag and a commit: the
+    versions are the vendor's version tags as `git ls-remote --tags` lists
+    them, and `latest` is the highest of them.
+    """
+    tags = list_tags(repo, token)
+    resolved, reason = pick_version(tags, requested_version, prefix)
+    if resolved is None:
+        if reason.startswith("no tag"):
+            print(f"::error::Version {requested_version} of {vendor_name} "
+                  f"has no tag in {repo}")
+        else:
+            print(f"::error::{repo} has no version tags "
+                  f"(expected tags like v1.0.0)")
+        sys.exit(1)
+    return resolved
 
 
 # ── Manifest helpers ──────────────────────────────────────────────────────
@@ -340,6 +519,22 @@ def write_manifest_version(vendor_name, version):
         f.write(f"{version}\n")
 
 
+def read_manifest_commit(vendor_name):
+    """Read the commit recorded for a vendor's installed version, or None."""
+    commit_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.commit")
+    if os.path.isfile(commit_path):
+        return open(commit_path).read().strip() or None
+    return None
+
+
+def write_manifest_commit(vendor_name, commit):
+    """Record the commit of a vendor's installed version tag."""
+    os.makedirs(MANIFESTS_DIR, exist_ok=True)
+    commit_path = os.path.join(MANIFESTS_DIR, f"{vendor_name}.commit")
+    with open(commit_path, "w") as f:
+        f.write(f"{commit}\n")
+
+
 def validate_manifest(files):
     """Validate that all files listed in manifest exist on disk."""
     missing = [f for f in files if not os.path.isfile(f)]
@@ -370,44 +565,20 @@ def read_deps(vendor_name):
         return [line.strip() for line in f if line.strip()]
 
 
-def download_deps(repo, ref, token):
-    """Download deps.json from a vendor repo at the given ref.
+def download_deps(checkout):
+    """Read deps.json from a vendor checkout.
 
-    Returns parsed dict or None if no deps.json exists.
+    Returns parsed dict or None if no (valid) deps.json exists.
     """
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/deps.json?ref={ref}",
-         "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        content = base64.b64decode(result.stdout.strip()).decode()
-        return json.loads(content)
-    except Exception:
-        return None
+    return _read_json(os.path.join(checkout, "deps.json"))
 
 
-def download_schema(repo, ref, token):
-    """Download templates/config.schema from a vendor repo at the given ref.
+def download_schema(checkout):
+    """Read templates/config.schema from a vendor checkout.
 
-    Returns parsed dict or None if no schema exists (404 is expected).
+    Returns parsed dict or None if no (valid) schema exists.
     """
-    env = _gh_env(token)
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/templates/config.schema?ref={ref}",
-         "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        content = base64.b64decode(result.stdout.strip()).decode()
-        return json.loads(content)
-    except Exception:
-        return None
+    return _read_json(os.path.join(checkout, "templates", "config.schema"))
 
 
 def write_schema(vendor_name, schema):
@@ -592,43 +763,23 @@ def get_current_version(vendor_name, vendor_config=None):
 
 # ── Install execution ─────────────────────────────────────────────────────
 
-def download_and_run_install(repo, version, token, vendor_name=None, vendor_config=None):
-    """Download the vendor's install.sh and run it.
+def download_and_run_install(repo, version, token, vendor_name=None,
+                             vendor_config=None, checkout=None, ref=None):
+    """Run the vendor's install.sh from its checkout.
 
-    Sets VENDOR_REPO, VENDOR_REF, VENDOR_MANIFEST, and VENDOR_INSTALL_DIR
-    env vars for v2 contract. Still passes version as positional arg for
-    v1 backwards compat.
+    Runs `bash <checkout>/install.sh <version>` in the adopting repository.
+    Sets VENDOR_REPO (the repo as configured), VENDOR_REF (the tag),
+    VENDOR_MANIFEST, VENDOR_INSTALL_DIR, VENDOR_LIB and VENDOR_CHECKOUT (the
+    checkout's absolute path) for the v2 contract. Still passes version as
+    positional arg for v1 backwards compat.
 
     VENDOR_INSTALL_DIR is set to .vendored/pkg/<vendor>/ unless the vendor
     has dogfood: true (dogfood vendors install into framework paths).
 
     Returns: list of manifest files if install.sh wrote a manifest, else None.
     """
-    env = _gh_env(token)
-
-    ref = f"v{version}"
-    result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/install.sh?ref={ref}",
-         "--jq", ".content"],
-        capture_output=True, text=True, env=env
-    )
-
-    if result.returncode != 0 or not result.stdout.strip():
-        result = subprocess.run(
-            ["gh", "api", f"repos/{repo}/contents/install.sh?ref={version}",
-             "--jq", ".content"],
-            capture_output=True, text=True, env=env
-        )
-
-    if result.returncode != 0 or not result.stdout.strip():
-        print(f"::error::Failed to download install.sh from {repo} at {ref}")
-        sys.exit(1)
-
-    install_script = base64.b64decode(result.stdout.strip()).decode()
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-        f.write(install_script)
-        script_path = f.name
+    ref = ref or f"v{version}"
+    script_path = os.path.join(checkout, "install.sh")
 
     # Create a temp file for the manifest
     manifest_fd, manifest_path = tempfile.mkstemp(suffix=".manifest")
@@ -642,12 +793,13 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
         os.makedirs(install_dir, exist_ok=True)
 
     try:
-        run_env = env.copy()
+        run_env = os.environ.copy()
         run_env["GH_TOKEN"] = token if token else run_env.get("GH_TOKEN", "")
         # v2 contract env vars
         run_env["VENDOR_REPO"] = repo
         run_env["VENDOR_REF"] = ref
         run_env["VENDOR_MANIFEST"] = manifest_path
+        run_env["VENDOR_CHECKOUT"] = os.path.abspath(checkout)
         if install_dir:
             run_env["VENDOR_INSTALL_DIR"] = install_dir
         # Provide vendor helper library path
@@ -675,7 +827,6 @@ def download_and_run_install(repo, version, token, vendor_name=None, vendor_conf
 
         return manifest_files
     finally:
-        os.unlink(script_path)
         if os.path.isfile(manifest_path):
             os.unlink(manifest_path)
 
@@ -912,7 +1063,7 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
                        installing_set=None, private=False):
     """First-time add: pre-validate, run install.sh, post-validate."""
     if not name:
-        name = repo.split("/")[-1]
+        name = vendor_name_for(repo)
     if installing_set is None:
         installing_set = []
     if repo in installing_set:
@@ -921,14 +1072,22 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
         sys.exit(1)
     installing_set.append(repo)
 
-    # Pre-validate
-    check_repo_exists(repo, token)
-    check_install_sh(repo, token)
-    resolved_version = resolve_version(repo, repo, version, token)
+    # Pre-validate: the version's tag, then that tag has an installer
+    resolved = resolve_version(repo, repo, version, token)
+    with fetch_vendor(repo, resolved.tag, token, resolved.commit) as checkout:
+        check_install_sh(checkout, repo)
+        return _add_from_checkout(repo, resolved, token, name, deps_mode,
+                                  installing_set, private, checkout)
+
+
+def _add_from_checkout(repo, resolved, token, name, deps_mode,
+                       installing_set, private, checkout):
+    """The add path once the vendor is fetched at the resolved tag."""
+    resolved_version = resolved.version
+    ref = resolved.tag
 
     # Check dependencies
-    ref = f"v{resolved_version}"
-    deps = download_deps(repo, ref, token)
+    deps = download_deps(checkout)
     if deps:
         mode = deps_mode if deps_mode is not None else "error"
         resolve_deps(deps, token, mode, installing_set, private=private)
@@ -954,7 +1113,8 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     # Run install.sh (no vendor_config for new vendors — they don't have one yet)
     print(f"Adding {repo} v{resolved_version}...")
     manifest_files = download_and_run_install(repo, resolved_version, token,
-                                              vendor_name=name)
+                                              vendor_name=name,
+                                              checkout=checkout, ref=ref)
 
     # Post-validate: reload config and find new entry
     after_config = load_config()
@@ -985,7 +1145,7 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
     # already knows (repo, manifest files, vendor name).
     if new_key is None:
         # install.sh wrote no config — derive vendor name from repo
-        new_key = name if name else repo.split("/")[-1]
+        new_key = name if name else vendor_name_for(repo)
         new_entry = {}
 
     # Fill in missing registry fields
@@ -1015,13 +1175,14 @@ def install_new_vendor(repo, version, token, name=None, deps_mode=None,
         validate_manifest(manifest_files)
         write_manifest(new_key, manifest_files)
         write_manifest_version(new_key, resolved_version)
+        write_manifest_commit(new_key, resolved.commit)
 
     # Cache resolved deps
     if deps:
         write_deps(new_key, list(deps.keys()))
 
-    # Download and install schema if vendor provides one
-    schema = download_schema(repo, ref, token)
+    # Install the schema if the vendor provides one
+    schema = download_schema(checkout)
     if schema:
         write_schema(new_key, schema)
 
@@ -1060,8 +1221,15 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     installing_set.append(repo)
 
     token = get_auth_token(vendor_config)
-    target_version = resolve_version(vendor_name, repo, requested_version, token)
+    resolved = resolve_version(vendor_name, repo, requested_version, token)
+    target_version = resolved.version
     current_version = get_current_version(vendor_name, vendor_config)
+
+    if current_version == target_version:
+        recorded = read_manifest_commit(vendor_name)
+        if recorded and recorded != resolved.commit:
+            print(f"::warning::{vendor_name}: tag {resolved.tag} now points "
+                  f"at {resolved.commit}, recorded {recorded}")
 
     if current_version == target_version and not force:
         print(f"{vendor_name}: already at v{target_version}, skipping")
@@ -1072,18 +1240,24 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
             "changed": False,
         }
 
-    # Check dependencies for the target version
-    ref = f"v{target_version}"
-    deps = download_deps(repo, ref, token)
-    if deps:
-        mode = _get_dep_mode(deps_mode, vendor_config)
-        resolve_deps(deps, token, mode, installing_set)
+    ref = resolved.tag
+    with fetch_vendor(repo, ref, token, resolved.commit) as checkout:
+        check_install_sh(checkout, repo)
 
-    print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
-    snapshot = snapshot_vendor_state(vendor_name)
-    manifest_files = download_and_run_install(repo, target_version, token,
-                                              vendor_name=vendor_name,
-                                              vendor_config=vendor_config)
+        # Check dependencies for the target version
+        deps = download_deps(checkout)
+        if deps:
+            mode = _get_dep_mode(deps_mode, vendor_config)
+            resolve_deps(deps, token, mode, installing_set)
+
+        print(f"{vendor_name}: {current_version or 'none'} -> {target_version}")
+        snapshot = snapshot_vendor_state(vendor_name)
+        manifest_files = download_and_run_install(repo, target_version, token,
+                                                  vendor_name=vendor_name,
+                                                  vendor_config=vendor_config,
+                                                  checkout=checkout, ref=ref)
+        # Read now: the checkout is removed before a re-exec below.
+        schema = download_schema(checkout)
 
     # The registry and manifest become those of the installed version.
     # Done before a re-exec so the new coordinator sees them.
@@ -1094,6 +1268,7 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
         validate_manifest(manifest_files)
         write_manifest(vendor_name, manifest_files)
         write_manifest_version(vendor_name, target_version)
+        write_manifest_commit(vendor_name, resolved.commit)
 
     print(f"  protected: {', '.join(registry.get('protected', []))}")
     if registry.get("allowed"):
@@ -1108,8 +1283,7 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     if deps:
         write_deps(vendor_name, list(deps.keys()))
 
-    # Download and install schema if vendor provides one
-    schema = download_schema(repo, ref, token)
+    # Install the schema if the vendor provides one
     if schema:
         write_schema(vendor_name, schema)
 
@@ -1255,7 +1429,7 @@ def push_branch(branch, token=None):
     --force-with-lease: these install branches are ephemeral automation
     artifacts; a stale remote ref from a prior run must not block the push.
 
-    With a token (VENDOR_PAT), it is passed as an http.extraheader for
+    With a token (the write token), it is passed as an http.extraheader for
     github.com in the command's own -c options: never printed, never written
     to .git/config. actions/checkout persists its own GITHUB_TOKEN header
     under the same key, so an empty value is given first, which resets the
@@ -1298,14 +1472,41 @@ def workflow_files_note(results, paths):
             lines.append(f"- {vendor}: run `python3 .vendored/install "
                          f"{vendor} --force` with a token that may write "
                          "workflow files and commit `.github/workflows/`")
-    lines += ["", "Set a `VENDOR_PAT` secret with workflow write permission "
-              "to carry them in future install PRs."]
+    lines += ["", f"Set a `{WRITE_TOKEN_ENV}` secret with workflow write "
+              "permission, declared by the job that runs the install, to "
+              "carry them in future install PRs."]
     return "\n".join(lines)
+
+
+def require_write_token_in_ci(allow_workflow_token=False):
+    """Fail --pr under CI when no write token is set, before anything changes.
+
+    Without CICD_WRITE_TOKEN (or the deprecated VENDOR_PAT) the pull request
+    would be opened with the workflow's own GITHUB_TOKEN: GitHub starts no
+    workflows for it, so it gets no checks and cannot merge where a verdict
+    is required, and where Actions may not open pull requests the run fails
+    after pushing its branch. Outside CI (GITHUB_ACTIONS unset), or with
+    --allow-workflow-token, nothing is checked.
+    """
+    if allow_workflow_token or not os.environ.get("GITHUB_ACTIONS"):
+        return
+    if write_token():
+        return
+    print(f"::error::--pr needs a {WRITE_TOKEN_ENV} secret in CI: without it "
+          "the pull request would be opened with the workflow's own token, "
+          "so no checks would run on it (and where GitHub Actions may not "
+          "open pull requests, the run would fail after pushing its branch).")
+    print(f"Add a {WRITE_TOKEN_ENV} secret (a token that may push branches, "
+          "open pull requests and write workflow files) and declare it in "
+          "the git-cicd job that runs this install, so the job is given it.")
+    print(f"To open the pull request with the workflow's own token on "
+          f"purpose, pass {ALLOW_WORKFLOW_TOKEN_FLAG}. Nothing was changed.")
+    sys.exit(1)
 
 
 NO_CHECKS_NOTE = (
     "\n\nOpened with the workflow's own token, so no checks will run on "
-    "this pull request; a `VENDOR_PAT` secret changes that.")
+    f"this pull request; a `{WRITE_TOKEN_ENV}` secret changes that.")
 
 
 def create_pull_request(results):
@@ -1319,10 +1520,11 @@ def create_pull_request(results):
     title = meta["title"]
     body = meta["body"]
 
-    # The pull request is opened (and auto-merge requested) with VENDOR_PAT
-    # when it is set: GitHub starts no workflows for a pull request opened
-    # with a workflow's own GITHUB_TOKEN, so it would get no checks.
-    pat = os.environ.get("VENDOR_PAT", "")
+    # The pull request is opened (and auto-merge requested) with the write
+    # token (CICD_WRITE_TOKEN, else the deprecated VENDOR_PAT) when it is set:
+    # GitHub starts no workflows for a pull request opened with a workflow's
+    # own GITHUB_TOKEN, so it would get no checks.
+    pat = write_token()
     gh_env = os.environ.copy()
     github_token = os.environ.get("GITHUB_TOKEN", "")
     pr_token = pat or github_token
@@ -1347,7 +1549,7 @@ def create_pull_request(results):
 
     # Workflow files (.github/workflows/) this install wrote or removed.
     # The workflow's own GITHUB_TOKEN may not push them (it lacks the
-    # `workflows` permission), so they are kept only when VENDOR_PAT is set
+    # `workflows` permission), so they are kept only when a write token is set
     # and the push is made with it; otherwise they are unstaged and the PR
     # body lists them with what to run and commit.
     workflow_files = staged_workflow_files()
@@ -1361,8 +1563,9 @@ def create_pull_request(results):
     if diff_result.returncode == 0:
         print("No changes to commit")
         if left_out:
-            print("Workflow files changed but were left out (set VENDOR_PAT "
-                  "to a token that may write workflows to carry them):")
+            print(f"Workflow files changed but were left out (set "
+                  f"{WRITE_TOKEN_ENV} to a token that may write workflows "
+                  "to carry them):")
             for path in left_out:
                 print(f"  {path}")
         return
@@ -1384,7 +1587,7 @@ def create_pull_request(results):
     push_result = push_branch(branch, pat if keep_workflows else None)
     if (push_result.returncode != 0 and keep_workflows
             and "workflow" in (push_result.stderr or "").lower()):
-        # VENDOR_PAT may not write workflow files: leave them out and push
+        # The write token may not write workflow files: leave them out and push
         # the rest, so the install still ends with a pull request.
         print("Push with workflow files was refused (the token may not "
               "write workflows); retrying without them")
@@ -1432,7 +1635,8 @@ def create_pull_request(results):
         print(f"  gh pr create --head {branch} --base main --fill")
         if not pat:
             print("If GitHub Actions may not create pull requests here, set "
-                  "a VENDOR_PAT secret so the pull request is opened with it.")
+                  f"a {WRITE_TOKEN_ENV} secret so the pull request is opened "
+                  "with it.")
         sys.exit(1)
 
     pr_url = pr_result.stdout.strip()
@@ -1670,6 +1874,10 @@ def validate_target(target):
         return "it is empty"
     if any(c.isspace() for c in target):
         return "it contains whitespace"
+    if _is_url(target):
+        if not vendor_name_for(target):
+            return "the URL names no repository"
+        return None
     if _is_repo_spec(target):
         parts = target.split("/")
         if len(parts) != 2:
@@ -1691,7 +1899,7 @@ def registered_vendor_for_repo(repo, vendors, name=None):
     for vname, vcfg in vendors.items():
         if vcfg.get("repo") == repo:
             return vname
-    key = name or repo.split("/")[-1]
+    key = name or vendor_name_for(repo)
     if key in vendors:
         other = vendors[key].get("repo", "(no repo recorded)")
         print(f"::error::Vendor '{key}' is already registered for {other}, "
@@ -1702,8 +1910,10 @@ def registered_vendor_for_repo(repo, vendors, name=None):
 
 
 def _is_repo_spec(arg):
-    """Check if an argument looks like owner/repo."""
-    return "/" in arg and not arg.startswith("-")
+    """Check if an argument names a repository: owner/repo or a git URL."""
+    if arg.startswith("-"):
+        return False
+    return "/" in arg or _is_url(arg)
 
 
 def list_vendors():
@@ -1735,7 +1945,7 @@ def main():
     )
     parser.add_argument(
         "target", nargs="?", default=None,
-        help='owner/repo (new vendor), vendor name, or "all"'
+        help='git URL or owner/repo (new vendor), vendor name, or "all"'
     )
     parser.add_argument(
         "--version", default="latest",
@@ -1768,7 +1978,14 @@ def main():
     )
     parser.add_argument(
         "--private", action="store_true",
-        help="Treat vendor as private (use VENDOR_PAT for auth)"
+        help="Treat vendor as private (read it with CICD_READ_TOKEN, "
+             "else CICD_WRITE_TOKEN)"
+    )
+    parser.add_argument(
+        ALLOW_WORKFLOW_TOKEN_FLAG, action="store_true",
+        dest="allow_workflow_token",
+        help="With --pr under CI and no CICD_WRITE_TOKEN, open the pull "
+             "request with the workflow's own token anyway (it gets no checks)"
     )
     args = parser.parse_args()
 
@@ -1794,8 +2011,11 @@ def main():
     if target_error:
         print(f"::error::Invalid vendor argument {raw_target!r}: {target_error}")
         print("Expected one of: <vendor> (a registered vendor name), "
-              "owner/repo, or all")
+              "a git URL, owner/repo, or all")
         sys.exit(1)
+
+    if args.pr:
+        require_write_token_in_ci(args.allow_workflow_token)
 
     # Migrate monolithic config.json to per-vendor configs/ if needed
     if _should_migrate_config():
@@ -1854,7 +2074,7 @@ def main():
             )
         output_results(results)
     elif _is_repo_spec(args.target) and registered_name:
-        # owner/repo of a vendor that is already registered — update path
+        # Repo (URL or owner/repo) of a registered vendor — update path
         name = registered_name
         print(f"{args.target} is registered as vendor '{name}'; updating it")
         result = install_existing_vendor(
@@ -1864,7 +2084,7 @@ def main():
         output_result(result)
         results = [result]
     elif _is_repo_spec(args.target):
-        # New vendor (owner/repo format) — add path
+        # New vendor (URL or owner/repo) — add path
         token = get_auth_token(private=args.private)
         result = install_new_vendor(args.target, args.version, token, args.name,
                                     deps_mode=args.deps,
@@ -1882,7 +2102,7 @@ def main():
     else:
         print(f"::error::Unknown vendor: {args.target}")
         print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")
-        print("To add a new vendor, use: .vendored/install owner/repo")
+        print("To add a new vendor, use: .vendored/install <url|owner/repo>")
         sys.exit(1)
 
     if args.pr:

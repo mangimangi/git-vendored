@@ -43,7 +43,8 @@ creates the GitHub release, or does nothing if that version is tagged; it
 pushes nothing to `main`),
 `update-vendored` (cron Mondays 09:00 UTC on `main`; `ci/update-vendored.sh`
 runs `.vendored/install <vendor> --version <version> --pr --deps=install`,
-`GH_TOKEN` from `VENDOR_PAT` when set) and `validate` (manual only;
+`GH_TOKEN` from `CICD_WRITE_TOKEN`, else the deprecated `VENDOR_PAT`,
+when set) and `validate` (manual only;
 `ci/validate.sh` runs `validate <repo> --version <version>`). Start one by
 hand: Actions tab -> **Manual** workflow -> Run workflow, `job` = the job name,
 `inputs` = its inputs as a JSON object of strings:
@@ -147,7 +148,7 @@ cron, manual); `git-cicd verify` checks they match.
 ## Key files
 
 - `VERSION` — current release version
-- `pyproject.toml` — declares the Python floor (`requires-python`); CI tests on it
+- `pyproject.toml` — declares the Python floor (`requires-python = ">=3.11"`); CI tests on Python 3.11
 - `madreperla.yaml` — repo metadata for madreperla orchestration
 - `pearls.yaml` — issue tracker config for pearls/prl
 - See `docs/` for adoption guide and vendor install dir guide

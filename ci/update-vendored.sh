@@ -9,9 +9,11 @@
 # defaults. Each input is one element of an argv array, never part of a shell
 # string, so a value is passed verbatim and never executed.
 #
-# .vendored/install reads its token from GH_TOKEN/GITHUB_TOKEN. When the
-# VENDOR_PAT secret is non-empty it becomes GH_TOKEN; otherwise GH_TOKEN and
-# GITHUB_TOKEN are left as they are. No token is printed.
+# .vendored/install reads its token from GH_TOKEN/GITHUB_TOKEN (and its write
+# token from CICD_WRITE_TOKEN, else the deprecated VENDOR_PAT). The first of
+# the CICD_WRITE_TOKEN and VENDOR_PAT secrets that is non-empty becomes
+# GH_TOKEN; otherwise GH_TOKEN and GITHUB_TOKEN are left as they are. No
+# token is printed.
 set -euo pipefail
 
 ARGS=(.vendored/install "${CICD_INPUT_VENDOR:-all}"
@@ -19,7 +21,9 @@ ARGS=(.vendored/install "${CICD_INPUT_VENDOR:-all}"
 if [ "${CICD_INPUT_PRIVATE:-}" = "true" ]; then
     ARGS+=(--private)
 fi
-if [ -n "${VENDOR_PAT:-}" ]; then
-    export GH_TOKEN="$VENDOR_PAT"
+WRITE_TOKEN="${CICD_WRITE_TOKEN:-${VENDOR_PAT:-}}"
+if [ -n "$WRITE_TOKEN" ]; then
+    export GH_TOKEN="$WRITE_TOKEN"
 fi
+unset WRITE_TOKEN
 exec python3 "${ARGS[@]}"

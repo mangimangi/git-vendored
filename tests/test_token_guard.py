@@ -1,8 +1,8 @@
 """The suite-wide token guard in conftest.py (gv-895e).
 
 No test may read a real token from the ambient environment: in CI it holds
-the repository's VENDOR_PAT, and a failed comparison against it prints part
-of the value in a public log. These tests fail if the guard is removed.
+the repository's CICD_WRITE_TOKEN, CICD_READ_TOKEN or VENDOR_PAT, and a
+failed comparison against it prints part of the value in a public log. These tests fail if the guard is removed.
 """
 
 import os
@@ -22,8 +22,13 @@ def test_test_body_sees_no_token():
 
 
 def test_guard_covers_all_token_variables():
-    assert set(conftest.TOKEN_ENV_VARS) == {"VENDOR_PAT", "GH_TOKEN",
-                                            "GITHUB_TOKEN"}
+    assert set(conftest.TOKEN_ENV_VARS) == {
+        "CICD_WRITE_TOKEN", "CICD_READ_TOKEN", "VENDOR_PAT", "GH_TOKEN",
+        "GITHUB_TOKEN"}
+
+
+def test_test_body_is_not_in_ci():
+    assert "GITHUB_ACTIONS" not in os.environ
 
 
 def test_outer_vendor_pat_is_not_seen_by_a_test(tmp_path):
@@ -32,12 +37,15 @@ def test_outer_vendor_pat_is_not_seen_by_a_test(tmp_path):
     (tmp_path / "test_inner.py").write_text(
         "import os\n"
         "def test_inner():\n"
-        "    for name in ('VENDOR_PAT', 'GH_TOKEN', 'GITHUB_TOKEN'):\n"
+        "    for name in ('CICD_WRITE_TOKEN', 'CICD_READ_TOKEN', 'VENDOR_PAT',\n"
+        "                 'GH_TOKEN', 'GITHUB_TOKEN'):\n"
         "        assert name not in os.environ, name\n"
     )
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("PYTEST_")}
-    env.update(VENDOR_PAT="outer-fake-pat", GH_TOKEN="outer-fake-gh",
+    env.update(CICD_WRITE_TOKEN="outer-fake-write",
+               CICD_READ_TOKEN="outer-fake-read",
+               VENDOR_PAT="outer-fake-pat", GH_TOKEN="outer-fake-gh",
                GITHUB_TOKEN="outer-fake-gt",
                # The inner run measures nothing: keep coverage out of it.
                COVERAGE_PROCESS_START="")

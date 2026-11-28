@@ -17,7 +17,7 @@ ROOT = Path(__file__).parent.parent
 def _import_audit():
     filepath = str(ROOT / "templates" / "audit")
     loader = importlib.machinery.SourceFileLoader("vendored_audit", filepath)
-    spec = importlib.util.spec_from_loader("vendored_audit", loader, origin=filepath)
+    spec = importlib.util.spec_from_file_location("vendored_audit", filepath, loader=loader)
     module = importlib.util.module_from_spec(spec)
     module.__file__ = filepath
     sys.modules["vendored_audit"] = module

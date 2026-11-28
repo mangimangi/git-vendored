@@ -6,19 +6,29 @@ Automated vendor install control for repo-embedded tools via GitHub workflows. R
 
 git-vendored implements a **manifest-driven vendor contract**:
 
-1. A vendor repo provides an `install.sh` at its root
-2. The framework runs `install.sh` with context via environment variables
-3. `install.sh` downloads its files and writes a manifest listing every file it installed
+1. A vendor is a git repository with version tags and an `install.sh` at its root
+2. The framework fetches it with git at the version's tag and runs `install.sh` from that checkout, with context via environment variables
+3. `install.sh` copies its files (from the checkout, or by downloading them) and writes a manifest listing every file it installed
 4. The framework stores the manifest, tracks versions, and derives file protection rules
 5. A GitHub workflow runs on a schedule (or manually), checks for updates, and opens PRs
 
 ## Quick Start
 
-Bootstrap git-vendored in a new repo:
+Bootstrap git-vendored in a new repo, from its root, with git (works with git-vendored on any git host):
 
 ```bash
-# Download and run the bootstrap installer
-curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.28/install.sh | bash -s 0.0.28
+tmp="$(mktemp -d)"
+git clone --depth 1 --branch v0.0.32 https://github.com/mangimangi/git-vendored.git "$tmp"
+VENDOR_CHECKOUT="$tmp" bash "$tmp/install.sh" 0.0.32
+rm -rf "$tmp"
+```
+
+With `VENDOR_CHECKOUT` set, `install.sh` copies every file from that checkout: no `gh`, no `curl`, no token.
+
+GitHub-specific shortcut (downloads each file from `raw.githubusercontent.com`, or through `gh api` when `GH_TOKEN` is set):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.32/install.sh | bash -s 0.0.32
 ```
 
 This creates:
@@ -40,14 +50,19 @@ The two workflows are installed only on this bootstrap install, into a repositor
 ## Adding a Vendor
 
 ```bash
-python3 .vendored/install owner/repo-name
+python3 .vendored/install owner/repo-name                          # github.com shorthand
+python3 .vendored/install https://git.example.com/team/repo-name.git  # any URL git can fetch
 ```
 
+A vendor is named by a URL git can fetch (`https://`, `ssh://`, `git@host:path`, `file://`) or by the `owner/repo` shorthand, which means that repository on github.com. Its default vendor name is the URL's last path component without `.git`.
+
 This will:
-1. Verify the repo has `install.sh` and a resolvable version
-2. Run the vendor's `install.sh` with `VENDOR_REPO`, `VENDOR_REF`, `VENDOR_MANIFEST`, and `VENDOR_INSTALL_DIR` set
+1. Resolve the version from the repo's version tags (`git ls-remote --tags`), then fetch the vendor once with git at that tag (a shallow clone into a temporary directory outside the repository, removed afterwards) and verify it has `install.sh` at its root
+2. Run the vendor's `install.sh` from that checkout with `VENDOR_REPO`, `VENDOR_REF`, `VENDOR_MANIFEST`, `VENDOR_INSTALL_DIR` and `VENDOR_CHECKOUT` set; `deps.json` and `templates/config.schema` are read from the same checkout
 3. Read the manifest output and store it at `.vendored/manifests/<vendor>.files`
-4. Store the version at `.vendored/manifests/<vendor>.version`
+4. Store the version at `.vendored/manifests/<vendor>.version` and the commit its tag points at at `.vendored/manifests/<vendor>.commit`
+
+A later install of the same version checks the tag: when it now points at another commit than the recorded one, the install prints `::warning::<vendor>: tag <tag> now points at <new sha>, recorded <old sha>` and still skips, unless `--force` is given, which reinstalls and records the new commit. An install made before commits were recorded has no `.commit` file; it gets one on its next install.
 
 Use `--name` to override the vendor key:
 
@@ -81,7 +96,7 @@ The vendor, the version and the private flag can also be given through the envir
 
 | Env var | Stands for | Used when |
 |---------|------------|-----------|
-| `VENDORED_VENDOR` | the target (`<vendor>`, `owner/repo` or `all`) | no positional target is given |
+| `VENDORED_VENDOR` | the target (`<vendor>`, a git URL, `owner/repo` or `all`) | no positional target is given |
 | `VENDORED_VERSION` | `--version` (empty means `latest`) | `--version` is not given |
 | `VENDORED_PRIVATE` | `--private` for `true`/`1`/`yes`; nothing for `false`/`0`/`no`/empty | `--private` is not given |
 
@@ -91,23 +106,33 @@ VENDORED_VENDOR=git-cicd VENDORED_VERSION=latest python3 .vendored/install --pr
 
 ### Which token does what
 
-| Token | Reads a private vendor | Pushes the install branch | Opens the PR and requests auto-merge |
-|-------|------------------------|---------------------------|--------------------------------------|
-| `VENDOR_PAT` (when set) | yes (required for `private: true`) | when the branch carries workflow files | yes, so the PR's checks run |
-| `GITHUB_TOKEN` (the workflow's own) | no (public vendors only) | otherwise (the checkout's credentials) | only when `VENDOR_PAT` is not set |
+The install uses two secrets, split by what a token may do. A git-cicd job is given a secret only when it declares it, so the job that runs `.vendored/install --pr` must declare `CICD_WRITE_TOKEN` (and `CICD_READ_TOKEN` when it installs a private vendor).
 
-GitHub starts no workflows for a pull request opened with a workflow's own `GITHUB_TOKEN`, so such an install PR gets no checks (and cannot merge where a status such as `Verdict / git-cicd:verdict` is required); its description says so in one line. Set a `VENDOR_PAT` secret to have the PR opened with it. If the PR cannot be opened after the branch was pushed (for example where GitHub Actions may not create pull requests), the install names the branch, says how to open the PR by hand and exits non-zero; a PR that already exists for the branch is reused. No token value is printed.
+| Token | What the install does with it | Read in this order | Fine-grained token permissions (on the repositories named) | Classic token scopes |
+|-------|-------------------------------|--------------------|-------------------------------------------------------------|----------------------|
+| `CICD_WRITE_TOKEN` | proposes changes: pushes the install branch (with its workflow files), opens the PR and requests auto-merge, so the PR's checks run | `CICD_WRITE_TOKEN`, then `VENDOR_PAT` | consuming repository: **Contents** read/write, **Pull requests** read/write, **Workflows** read/write | `repo`, `workflow` |
+| `CICD_READ_TOKEN` | reads a private vendor repository (`private: true`, `--private`); cannot write | `CICD_READ_TOKEN`, then `CICD_WRITE_TOKEN`, then `VENDOR_PAT` | each private vendor repository: **Contents** read-only (and **Metadata** read-only, which GitHub adds) | `repo` |
+| `GITHUB_TOKEN` (the workflow's own) | reads public vendors; pushes the branch without workflow files; opens the PR only with `--allow-workflow-token` or outside CI | | | |
 
-### Workflow files and `VENDOR_PAT`
+`VENDOR_PAT`, the old name for both, is still read where the new names are unset, as shown; it is deprecated, so set `CICD_WRITE_TOKEN` and `CICD_READ_TOKEN` instead. No token value is printed. A vendor is read with git (`git ls-remote`, `git clone`): the read token is handed to that one git command as an HTTP header scoped to the vendor's URL, through `GIT_CONFIG_*` environment variables, never in a URL or on the command line and never written to a git config file. With no token, git reads the vendor anonymously.
+
+### `--pr` in CI needs `CICD_WRITE_TOKEN`
+
+GitHub starts no workflows for a pull request opened with a workflow's own `GITHUB_TOKEN`, so such an install PR gets no checks (and cannot merge where a status such as `Verdict / git-cicd:verdict` is required); where GitHub Actions may not create pull requests, the run fails after pushing its branch. So in `--pr` mode under CI (`GITHUB_ACTIONS` set) with no write token (`CICD_WRITE_TOKEN`, or the deprecated `VENDOR_PAT`), the install fails before changing any file or pushing any branch. Its message names `CICD_WRITE_TOKEN`, says the git-cicd job must declare it, and names `--allow-workflow-token`.
+
+- **`--allow-workflow-token`** opens the PR with the workflow's own token on purpose, as before: its description then says in one line that no checks will run.
+- **Outside CI** (`GITHUB_ACTIONS` unset) nothing is checked, and the PR is opened with whatever token `gh` has.
+
+If the PR cannot be opened after the branch was pushed, the install names the branch, says how to open the PR by hand and exits non-zero; a PR that already exists for the branch is reused.
+
+### Workflow files and `CICD_WRITE_TOKEN`
 
 An install can change files under `.github/workflows/` (a vendor's workflows). The workflow's own `GITHUB_TOKEN` may not push those, so in `--pr` mode:
 
-- **With `VENDOR_PAT` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with `VENDOR_PAT` (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
-- **Without `VENDOR_PAT`**, workflow files are left out as before.
+- **With `CICD_WRITE_TOKEN` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with it (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
+- **Without a write token** (only with `--allow-workflow-token`, or outside CI), workflow files are left out.
 
 Whenever workflow files are left out, the PR description lists them and says what to run and commit on the branch: for git-cicd, `.vendored/pkg/git-cicd/git-cicd generate`; for other vendors, `python3 .vendored/install <vendor> --force` with a token that may write workflows.
-
-To carry workflow files and open the PR, `VENDOR_PAT` needs, on the consuming repository: **Contents** read/write, **Pull requests** read/write and **Workflows** write (fine-grained token), or the `repo` and `workflow` scopes (classic token). No token value is printed in any log.
 
 ## Removing a Vendor
 
@@ -134,10 +159,10 @@ Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `repo` | yes | GitHub repository (`owner/name`) |
+| `repo` | yes | A git URL of the vendor, or the `owner/name` shorthand for github.com; stored as given |
 | `install_branch` | yes | Branch prefix for vendor update PRs |
 | `allowed` | no | Glob patterns of vendor-managed files that users *can* edit |
-| `private` | no | If `true`, requires `VENDOR_PAT` secret for access |
+| `private` | no | If `true`, the vendor is read with `CICD_READ_TOKEN` (else `CICD_WRITE_TOKEN`) |
 | `automerge` | no | If `true`, auto-merge vendor update PRs (default: `false`) |
 | `dogfood` | no | If `true`, skips `VENDOR_INSTALL_DIR` (installs into framework paths) |
 
@@ -147,10 +172,10 @@ Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 
 ## Vendor Contract
 
-A vendor repo must provide:
+A vendor is a git repository, on any host git can fetch from, that has:
 
-1. **`install.sh` at repo root** — receives context via environment variables, downloads its files, and writes a manifest
-2. **Version discovery** — either GitHub Releases (tags like `v1.0.0`) or a `VERSION` file at repo root
+1. **`install.sh` at repo root** — receives context via environment variables, copies its files from the checkout (`VENDOR_CHECKOUT`, e.g. with the `$VENDOR_LIB` helpers) or downloads them, and writes a manifest
+2. **Version tags** — the vendor's versions are its version tags (`vX.Y.Z` or `X.Y.Z`, numeric parts), as `git ls-remote --tags` lists them; `latest` is the highest of them by version order (so `0.0.10` is above `0.0.9`). Tags that are not versions (such as `latest`) and a component's tags (`<subdir>/vX.Y.Z`, a separate series) are ignored. An explicit `--version X` installs tag `vX`, else `X`; a version with no tag is an error
 
 ### Environment Variables
 
@@ -158,11 +183,13 @@ A vendor repo must provide:
 
 | Env var | Purpose |
 |---------|---------|
-| `VENDOR_REPO` | `owner/repo` for API calls |
-| `VENDOR_REF` | Git ref to fetch files at |
+| `VENDOR_REPO` | The vendor's repository as configured (a git URL or `owner/repo`) |
+| `VENDOR_REF` | The version's tag, which `VENDOR_CHECKOUT` is checked out at |
 | `VENDOR_MANIFEST` | Path to write the file manifest to |
 | `VENDOR_INSTALL_DIR` | Target directory for vendor files (e.g., `.vendored/pkg/<vendor>`) |
-| `GH_TOKEN` | Auth token (when available) |
+| `VENDOR_CHECKOUT` | Absolute path of the vendor fetched with git at `VENDOR_REF` (removed after the install) |
+| `VENDOR_LIB` | Path of the helper library (`fetch_file`, `fetch_dir`), when installed |
+| `GH_TOKEN` | Auth token (when available), for an installer that downloads by itself |
 
 `VENDOR_INSTALL_DIR` is set for non-dogfood vendors. Vendors SHOULD install their primary files under this directory but MAY install to other paths (workflows) when the target system requires specific locations. If not set, the vendor falls back to its original file layout.
 
@@ -177,7 +204,7 @@ A vendor repo must provide:
 ```
 
 `install.sh` **must not**:
-- Write version files (the framework handles this via `.vendored/manifests/<vendor>.version`)
+- Write version files (the framework handles this via `.vendored/manifests/<vendor>.version` and `.vendored/manifests/<vendor>.commit`)
 - Modify `.vendored/config.json` (the framework handles vendor registration)
 
 On every install, add or update, `.vendored/manifests/<vendor>.files` is replaced by the manifest that install wrote, so it always lists the files of the installed version.
@@ -210,8 +237,8 @@ Each key is the dependency's vendor name, and the value is an object with:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `repo` | yes | GitHub repository (`owner/name`) |
-| `private` | no | If `true`, the dependency requires `VENDOR_PAT` for access. When omitted, inherits the parent vendor's `--private` flag |
+| `repo` | yes | A git URL of the dependency, or the `owner/name` shorthand for github.com |
+| `private` | no | If `true`, the dependency is read with `CICD_READ_TOKEN` (else `CICD_WRITE_TOKEN`). When omitted, inherits the parent vendor's `--private` flag |
 
 Usage:
 
@@ -220,7 +247,7 @@ Usage:
 python3 .vendored/install owner/my-tool --deps=install
 
 # Private vendor with private dependencies
-VENDOR_PAT=<token> python3 .vendored/install owner/my-tool --private --deps=install
+CICD_READ_TOKEN=<token> python3 .vendored/install owner/my-tool --private --deps=install
 ```
 
 Dependency modes (`--deps`):
@@ -276,6 +303,7 @@ No wrapper script is needed. The source branch (which decides whether an `instal
   manifests/
     my-tool.files                # one filepath per line
     my-tool.version              # single line: version string
+    my-tool.commit               # single line: commit of the installed version's tag
     my-tool.schema               # config schema (if vendor provides one)
     my-tool.deps                 # dependency list (if vendor declares deps)
     pearls.files
@@ -349,12 +377,12 @@ This requires the vendor repo to have updated its `install.sh` to use `$VENDOR_I
 
 git-vendored's own pull request checks, releases, vendor updates and vendor validations run through [git-cicd](https://github.com/mangimangi/git-cicd), installed at `.vendored/pkg/git-cicd/`. The jobs are declared in `.vendored/configs/git-cicd.json`:
 
-- `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names, plus `pytest` and `pyyaml`, plus `coverage` (with a startup hook so subprocess runs are measured), into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` under coverage with it and prints the line coverage of the six shipped Python scripts (`templates/install`, `templates/check`, `templates/remove`, `templates/audit`, `templates/feedback`, `validate`): `Stmts` executable lines, `Miss` lines no test ran, `Cover` the percentage, `Missing` their line numbers. Scripts a test starts as a subprocess are counted too. For one file: `python -m coverage report --include=templates/check` after a run. The job fails when the total or any one of those files is below 99% (`fail_under` in `pyproject.toml`, and a per-file check in `ci/test.sh`): a change that lowers coverage below 99% fails the verdict, so it adds its tests in the same pull request. A line is excluded (`# pragma: no cover`) only when no test can reach it, with the reason on the line. After pytest, `ci/test.sh` runs the bats tests in `tests/bats/` for `install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts (`ci/setup.sh` provides a pinned bats-core when none is on `PATH`); a failing bats test fails the job. Run them alone with `bats tests/bats/`.
+- `test` (Unit Tests): `ci/setup.sh` installs the Python floor that `requires-python` in `pyproject.toml` names (`>=3.11`, so Python 3.11; on GitHub runners it looks in the tool cache at `$RUNNER_TOOL_CACHE`), plus `pytest` and `pyyaml`, plus `coverage` (with a startup hook so subprocess runs are measured), into a virtualenv; `ci/test.sh` runs `pytest tests/ -v` under coverage with it and prints the line coverage of the six shipped Python scripts (`templates/install`, `templates/check`, `templates/remove`, `templates/audit`, `templates/feedback`, `validate`): `Stmts` executable lines, `Miss` lines no test ran, `Cover` the percentage, `Missing` their line numbers. Scripts a test starts as a subprocess are counted too. For one file: `python -m coverage report --include=templates/check` after a run. The job fails when the total or any one of those files is below 99% (`fail_under` in `pyproject.toml`, and a per-file check in `ci/test.sh`): a change that lowers coverage below 99% fails the verdict, so it adds its tests in the same pull request. A line is excluded (`# pragma: no cover`) only when no test can reach it, with the reason on the line. After pytest, `ci/test.sh` runs the bats tests in `tests/bats/` for `install.sh`, `templates/lib/vendor-helpers.sh` and the `ci/` scripts (`ci/setup.sh` provides a pinned bats-core when none is on `PATH`); a failing bats test fails the job. Run them alone with `bats tests/bats/`.
 - `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
 - `version-check` (Version Check): runs on every pull request into `main`. Its step is `.vendored/pkg/git-semver/git-semver check-bump`, which fails the pull request when it changes a file listed in `files` in `.vendored/configs/git-semver.json` (`install.sh`, `validate`, `templates/**`, `docs/**`, `AGENTS.md`, `README.md`) without raising `VERSION` above `main`'s.
 - `release` (Release): runs on every merge to `main`, and by hand. Its step is `.vendored/pkg/git-semver/release` with no subcommand; with `"bump_on": "pull_request"` in `.vendored/configs/git-semver.json` it tags the landed commit with the version it carries (`v<VERSION>`) and creates the GitHub release, or does nothing when that version is already tagged. It pushes nothing to `main`, makes no commit and moves no `latest` tag. It takes no inputs; a manual run releases the current commit of the branch it runs on.
-- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `VENDOR_PAT` secret when it is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
-- `validate` (Validate Vendor): by hand only. `ci/validate.sh` runs this repository's `validate <repo> --version <version>` to check whether a repository implements the vendor contract (nothing is installed). Inputs: `repo` (`owner/repo`, required) and `version` (default `latest`).
+- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `CICD_WRITE_TOKEN` secret (else the deprecated `VENDOR_PAT`) when one is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
+- `validate` (Validate Vendor): by hand only. `ci/validate.sh` runs this repository's `validate <repo> --version <version>` to check whether a repository implements the vendor contract (nothing is installed). Inputs: `repo` (a git URL, or `owner/repo` for github.com; required) and `version` (default `latest`). `validate` reads the vendor with git, the way an install does: its version tags from `git ls-remote --tags` and one fetch at the version's tag, so it needs no `gh`.
 
 ### How a release happens
 
