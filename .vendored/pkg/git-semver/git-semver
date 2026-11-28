@@ -8,12 +8,16 @@ Subcommands:
     bump-all --since <commit> [opts] Check all components, bump all triggered
     tag [--push] [--subdir <name>]   Create version tags from VERSION files
     released [<ref>]                 Print the version tags at a commit (read-only)
+    check-bump [--base <rev>] [--head <rev>]
+                                     Fail when a change touches configured files
+                                     without raising the version (read-only)
 
 Config: .vendored/configs/git-semver.json (see README for schema)
 """
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -26,7 +30,7 @@ DEFAULT_VERSION_FILE = "VERSION"
 
 # Keys reserved for root-level config (not subdirectory names)
 RESERVED_KEYS = frozenset({
-    "version_file", "files", "updates", "changelog", "install",
+    "version_file", "files", "updates", "changelog", "install", "bump_on",
 })
 
 
@@ -256,6 +260,31 @@ def get_changed_files(since):
     return [f for f in result.stdout.strip().split("\n") if f]
 
 
+def get_changed_files_between(base, head):
+    """Files changed on `head` since it left `base` (`git diff base...head`).
+
+    Three-dot, as git-cicd computes a pull request's changed files: only what
+    the change under test did, not what landed on the base since.
+    """
+    result = git("diff", "--name-only", f"{base}...{head}")
+    return [f for f in result.stdout.strip().split("\n") if f]
+
+
+def read_version_at(rev, version_file):
+    """The version file's content at `rev`, stripped, or None when absent."""
+    result = git("show", f"{rev}:{version_file}", check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def verify_commit(rev):
+    """Raise SemverError unless `rev` names a commit."""
+    if git("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}",
+           check=False).returncode != 0:
+        raise SemverError(f"not a commit: {rev}")
+
+
 def get_commits_since_tag(tag=None, subdir=None):
     """Get commit messages since the last tag (or all if no tag).
 
@@ -481,6 +510,93 @@ def cmd_check(args):
         return 1
 
 
+def _try_parse_version(version_str):
+    """parse_version, or None when the string is missing or malformed."""
+    if version_str is None:
+        return None
+    try:
+        return parse_version(version_str)
+    except SemverError:
+        return None
+
+
+def check_bump_component(changed, base, head, effective, subdir=None):
+    """Check one component for cmd_check_bump. Returns (ok, lines)."""
+    label = subdir or "root"
+    patterns = effective.get("files")
+    if not patterns:
+        return True, [f"{label}: skipped (no 'files' configured)"]
+
+    version_file = get_version_file(effective)
+    matches = check_files_changed(changed, patterns)
+    version_file_changed = version_file in changed
+    if not matches and not version_file_changed:
+        return True, [f"{label}: no configured file changed"]
+
+    base_version = read_version_at(base, version_file)
+    head_version = read_version_at(head, version_file)
+    base_tuple = _try_parse_version(base_version)
+    head_tuple = _try_parse_version(head_version)
+
+    if head_tuple is not None and (base_tuple is None or head_tuple > base_tuple):
+        shown_base = base_version if base_tuple is not None else "none"
+        return True, [f"{label}: version raised {shown_base} -> {head_version} "
+                      f"({version_file})"]
+
+    if matches:
+        files = ", ".join(f for f, _ in matches)
+        why = f"configured files changed ({files})"
+    else:
+        why = f"{version_file} changed"
+    if head_version is None:
+        found = f"{version_file} is missing"
+    elif head_tuple is None:
+        found = f"{version_file} holds {head_version!r}, not a valid X.Y.Z version"
+    elif head_tuple == base_tuple:
+        found = f"{version_file} is still {head_version}"
+    else:
+        found = f"{version_file} went down to {head_version}"
+    fix = "git-semver bump patch --no-push"
+    if subdir:
+        fix += f" --subdir {subdir}"
+    return False, [
+        f"{label}: FAIL: {why}, but the version was not raised: {found} "
+        f"(base {base} has {base_version if base_version is not None else 'no version'})",
+        f"  fix: run `{fix}` on the branch and push the commit "
+        "(minor or major instead of patch are accepted too)",
+    ]
+
+
+def cmd_check_bump(args):
+    """Fail when the change under test touches configured files without
+    raising the version.
+
+    Compares `head` with `base` (--base/--head, else CICD_BASE/CICD_HEAD;
+    head defaults to HEAD) for the root and every subdirectory component.
+    Read-only and local: needs no token or network and writes nothing.
+    Returns 0 when every component passes, 1 otherwise.
+    """
+    config = load_config(args.config)
+    base = getattr(args, "base", None) or os.environ.get("CICD_BASE", "")
+    head = getattr(args, "head", None) or os.environ.get("CICD_HEAD", "") or "HEAD"
+    if not base:
+        raise SemverError(
+            "no base to compare with: pass --base <rev> or set CICD_BASE"
+        )
+    verify_commit(base)
+    verify_commit(head)
+
+    changed = get_changed_files_between(base, head)
+    components = [(None, config)] + list(get_subdirectories(config).items())
+    ok = True
+    for subdir, effective in components:
+        passed, lines = check_bump_component(changed, base, head, effective, subdir)
+        ok = ok and passed
+        for line in lines:
+            print(line)
+    return 0 if ok else 1
+
+
 def cmd_bump(args):
     """Bump version, update files, commit, tag, push."""
     config = load_config(args.config)
@@ -667,9 +783,7 @@ def cmd_released(args):
     other non-version tag are never printed.
     """
     ref = getattr(args, "ref", None) or "HEAD"
-    if git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
-           check=False).returncode != 0:
-        raise SemverError(f"not a commit: {ref}")
+    verify_commit(ref)
     result = git("tag", "--points-at", ref)
     tags = sorted(t for t in result.stdout.split("\n") if VERSION_TAG_RE.match(t))
     for tag in tags:
@@ -744,6 +858,20 @@ def build_parser():
         "ref", nargs="?", default="HEAD", help="Commit to ask about (default: HEAD)",
     )
 
+    # check-bump
+    check_bump_parser = subparsers.add_parser(
+        "check-bump",
+        help="Fail when configured files changed but the version was not raised",
+    )
+    check_bump_parser.add_argument(
+        "--base", default=None,
+        help="Commit to compare with (default: $CICD_BASE)",
+    )
+    check_bump_parser.add_argument(
+        "--head", default=None,
+        help="Commit under test (default: $CICD_HEAD, else HEAD)",
+    )
+
     return parser
 
 
@@ -761,6 +889,7 @@ def main():
         "bump-all": cmd_bump_all,
         "tag": cmd_tag,
         "released": cmd_released,
+        "check-bump": cmd_check_bump,
     }
 
     try:
