@@ -544,13 +544,13 @@ git-vendored.version" ]
     [ "$(cat .vendored/manifests/git-vendored.version)" = "4.5.6" ]
 }
 
-@test "existing manifest files are overwritten" {
+@test "existing manifest files are overwritten (an upgrade: no workflows added)" {
     mkdir -p .vendored/manifests
     echo stale > .vendored/manifests/git-vendored.files
     echo 0.0.1 > .vendored/manifests/git-vendored.version
     run_install 1.0.0
     [ "$status" -eq 0 ]
-    [ "$(cat .vendored/manifests/git-vendored.files)" = "$SORTED_MANIFEST" ]
+    [ "$(cat .vendored/manifests/git-vendored.files)" = "$(grep -v workflows <<<"$SORTED_MANIFEST")" ]
     [ "$(cat .vendored/manifests/git-vendored.version)" = "1.0.0" ]
 }
 
