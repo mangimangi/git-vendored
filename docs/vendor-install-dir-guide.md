@@ -12,6 +12,7 @@ git-vendored is consolidating per-vendor dotdirs (`.pearls/`, `.dogfood/`, `.sem
   pkg/<vendor>/            # vendor-installed files (replaces dotdirs at repo root)
   manifests/<vendor>.files    # file manifest
   manifests/<vendor>.version
+  manifests/<vendor>.commit  # commit the installed version's tag points at
   manifests/<vendor>.schema  # config schema (if vendor ships templates/config.schema)
   manifests/<vendor>.registry # vendor registry metadata (repo, install_branch, etc.)
 ```
@@ -47,6 +48,18 @@ Some files must live in specific locations regardless of `VENDOR_INSTALL_DIR`:
 - **Config files** the user edits → wherever they currently live
 
 All files MUST appear in the manifest regardless of location.
+
+### Where an installer's files come from
+
+The framework fetches the vendor with git at `$VENDOR_REF` and passes the
+checkout's absolute path as `VENDOR_CHECKOUT`; the `$VENDOR_LIB` helpers
+(`fetch_file`, `fetch_dir`) copy from it (checkout mode). With no
+`VENDOR_CHECKOUT` (an installer run by hand, an older framework) the helpers
+download as before (fallback mode: `gh api`, then `curl`). Either way a file
+gets content only, so its mode is the umask default unless `fetch_file ... +x`
+is given. An installer that downloads by itself keeps working: `VENDOR_REPO`
+and `VENDOR_REF` are unchanged. The examples below use `fetch_file`, from
+`$VENDOR_LIB` or an inline fallback (see `docs/adoption.md`).
 
 ## Code Examples
 

@@ -309,3 +309,39 @@ class TestNoGh:
         assert (f"::warning::tool: tag v1.0.0 now points at {c2}, "
                 f"recorded {c1}") in result.stdout
         assert "already at v1.0.0, skipping" in result.stdout
+
+
+HELPER_INSTALL_SH = """#!/bin/bash
+set -euo pipefail
+source "$VENDOR_LIB"
+fetch_file tool "$VENDOR_INSTALL_DIR/tool" +x
+fetch_dir templates "$VENDOR_INSTALL_DIR/templates"
+"""
+
+
+class TestHelperVendorNoGh:
+    def test_helper_using_vendor_installs_from_checkout(self, vendor_repo,
+                                                        adopter, no_gh_path):
+        lib = adopter / ".vendored" / "lib"
+        lib.mkdir()
+        (lib / "vendor-helpers.sh").write_bytes(
+            (ROOT / "templates" / "lib" / "vendor-helpers.sh").read_bytes())
+        repo = vendor_repo()
+        repo.write("install.sh", HELPER_INSTALL_SH)
+        repo.write("tool", "#!/bin/bash\necho tool\n", mode=0o755)
+        repo.write("templates/hooks/pre.sh", "hook\n", mode=0o755)
+        repo.write("templates/a.txt", "a\n")
+        repo.commit("v1")
+        repo.tag("v1.0.0")
+        result = run_installer([repo.url], adopter, no_gh_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        pkg = adopter / ".vendored" / "pkg" / "tool"
+        assert (pkg / "tool").read_text() == "#!/bin/bash\necho tool\n"
+        assert os.access(pkg / "tool", os.X_OK)
+        assert (pkg / "templates/hooks/pre.sh").read_text() == "hook\n"
+        assert not os.access(pkg / "templates/hooks/pre.sh", os.X_OK)
+        assert (adopter / ".vendored/manifests/tool.files").read_text().split() == [
+            ".vendored/pkg/tool/templates/a.txt",
+            ".vendored/pkg/tool/templates/hooks/pre.sh",
+            ".vendored/pkg/tool/tool",
+        ]

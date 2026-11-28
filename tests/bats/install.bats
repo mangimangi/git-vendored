@@ -572,3 +572,77 @@ git-vendored.version" ]
     [ -z "${GH_TOKEN+set}" ]
     [ -z "${GITHUB_TOKEN+set}" ]
 }
+
+# ── checkout mode (VENDOR_CHECKOUT): bootstrap with git ─────────────────
+
+# A git-vendored checkout: this repository's own templates, which is what
+# `git clone --branch v<X.Y.Z>` of git-vendored gives.
+make_gv_checkout() {
+    CO="$BATS_TEST_TMPDIR/gv-checkout"
+    mkdir -p "$CO"
+    cp -R "$REPO_ROOT/templates" "$CO/templates"
+    cp "$REPO_ROOT/install.sh" "$CO/install.sh"
+}
+
+@test "checkout: every file is copied from VENDOR_CHECKOUT, no gh or curl even with GH_TOKEN" {
+    make_gv_checkout
+    export GH_TOKEN=tok VENDOR_CHECKOUT="$CO"
+    run_install 1.2.3 o/r
+    [ "$status" -eq 0 ]
+    [ "$(stub_calls gh)" -eq 0 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+    for f in "${REQUIRED[@]}"; do
+        cmp "$CO/templates/$f" ".vendored/$f"
+        is_executable ".vendored/$f"
+    done
+    cmp "$CO/templates/config.json" .vendored/config.json
+    for w in install-vendored.yml check-vendor.yml; do
+        cmp "$CO/templates/github/workflows/$w" ".github/workflows/$w"
+    done
+}
+
+@test "checkout: works with gh absent from PATH (git bootstrap)" {
+    make_gv_checkout
+    use_no_gh
+    run env PATH="$RUN_PATH" VENDOR_CHECKOUT="$CO" bash "$CO/install.sh" 1.2.3
+    [ "$status" -eq 0 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+    cmp "$CO/templates/install" .vendored/install
+}
+
+@test "checkout: config.json gets content only, not the checkout's mode" {
+    make_gv_checkout
+    chmod +x "$CO/templates/config.json"
+    export VENDOR_CHECKOUT="$CO"
+    run_install 1.2.3 o/r
+    [ "$status" -eq 0 ]
+    [ ! -x .vendored/config.json ]
+}
+
+@test "checkout: a file missing from the checkout fails the install" {
+    make_gv_checkout
+    rm "$CO/templates/check"
+    export VENDOR_CHECKOUT="$CO"
+    run_install 1.2.3 o/r
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"templates/check not found in the git-vendored checkout"* ]]
+    [ "$(stub_calls curl)" -eq 0 ]
+}
+
+@test "checkout: a workflow missing from the checkout is skipped, not fatal" {
+    make_gv_checkout
+    rm "$CO/templates/github/workflows/check-vendor.yml"
+    export VENDOR_CHECKOUT="$CO" VENDOR_MANIFEST="$BATS_TEST_TMPDIR/m.files"
+    run_install 1.2.3 o/r
+    [ "$status" -eq 0 ]
+    [ ! -e .github/workflows/check-vendor.yml ]
+    [ -f .github/workflows/install-vendored.yml ]
+    ! grep -q check-vendor.yml "$VENDOR_MANIFEST"
+}
+
+@test "checkout: empty VENDOR_CHECKOUT takes the download path" {
+    export VENDOR_CHECKOUT=""
+    run_install 1.2.3 o/r
+    [ "$status" -eq 0 ]
+    [ "$(stub_calls curl)" -eq 9 ]
+}

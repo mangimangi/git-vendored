@@ -6,19 +6,29 @@ Automated vendor install control for repo-embedded tools via GitHub workflows. R
 
 git-vendored implements a **manifest-driven vendor contract**:
 
-1. A vendor repo provides an `install.sh` at its root
-2. The framework runs `install.sh` with context via environment variables
-3. `install.sh` downloads its files and writes a manifest listing every file it installed
+1. A vendor is a git repository with version tags and an `install.sh` at its root
+2. The framework fetches it with git at the version's tag and runs `install.sh` from that checkout, with context via environment variables
+3. `install.sh` copies its files (from the checkout, or by downloading them) and writes a manifest listing every file it installed
 4. The framework stores the manifest, tracks versions, and derives file protection rules
 5. A GitHub workflow runs on a schedule (or manually), checks for updates, and opens PRs
 
 ## Quick Start
 
-Bootstrap git-vendored in a new repo:
+Bootstrap git-vendored in a new repo, from its root, with git (works with git-vendored on any git host):
 
 ```bash
-# Download and run the bootstrap installer
-curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.28/install.sh | bash -s 0.0.28
+tmp="$(mktemp -d)"
+git clone --depth 1 --branch v0.0.32 https://github.com/mangimangi/git-vendored.git "$tmp"
+VENDOR_CHECKOUT="$tmp" bash "$tmp/install.sh" 0.0.32
+rm -rf "$tmp"
+```
+
+With `VENDOR_CHECKOUT` set, `install.sh` copies every file from that checkout: no `gh`, no `curl`, no token.
+
+GitHub-specific shortcut (downloads each file from `raw.githubusercontent.com`, or through `gh api` when `GH_TOKEN` is set):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangimangi/git-vendored/v0.0.32/install.sh | bash -s 0.0.32
 ```
 
 This creates:
@@ -162,9 +172,9 @@ Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 
 ## Vendor Contract
 
-A vendor repo must provide:
+A vendor is a git repository, on any host git can fetch from, that has:
 
-1. **`install.sh` at repo root** — receives context via environment variables, downloads its files, and writes a manifest
+1. **`install.sh` at repo root** — receives context via environment variables, copies its files from the checkout (`VENDOR_CHECKOUT`, e.g. with the `$VENDOR_LIB` helpers) or downloads them, and writes a manifest
 2. **Version tags** — the vendor's versions are its version tags (`vX.Y.Z` or `X.Y.Z`, numeric parts), as `git ls-remote --tags` lists them; `latest` is the highest of them by version order (so `0.0.10` is above `0.0.9`). Tags that are not versions (such as `latest`) and a component's tags (`<subdir>/vX.Y.Z`, a separate series) are ignored. An explicit `--version X` installs tag `vX`, else `X`; a version with no tag is an error
 
 ### Environment Variables
@@ -173,12 +183,13 @@ A vendor repo must provide:
 
 | Env var | Purpose |
 |---------|---------|
-| `VENDOR_REPO` | `owner/repo` for API calls |
-| `VENDOR_REF` | Git ref to fetch files at |
+| `VENDOR_REPO` | The vendor's repository as configured (a git URL or `owner/repo`) |
+| `VENDOR_REF` | The version's tag, which `VENDOR_CHECKOUT` is checked out at |
 | `VENDOR_MANIFEST` | Path to write the file manifest to |
 | `VENDOR_INSTALL_DIR` | Target directory for vendor files (e.g., `.vendored/pkg/<vendor>`) |
 | `VENDOR_CHECKOUT` | Absolute path of the vendor fetched with git at `VENDOR_REF` (removed after the install) |
-| `GH_TOKEN` | Auth token (when available) |
+| `VENDOR_LIB` | Path of the helper library (`fetch_file`, `fetch_dir`), when installed |
+| `GH_TOKEN` | Auth token (when available), for an installer that downloads by itself |
 
 `VENDOR_INSTALL_DIR` is set for non-dogfood vendors. Vendors SHOULD install their primary files under this directory but MAY install to other paths (workflows) when the target system requires specific locations. If not set, the vendor falls back to its original file layout.
 
