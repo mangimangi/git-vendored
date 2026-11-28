@@ -3471,3 +3471,242 @@ class TestRegistryRefresh:
         git("commit", "-qm", "regen")
         result = run_check()
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ── Tests: workflow files in --pr mode (gv-05c2.3) ───────────────────────
+
+PAT = "ghp_secretTOKENvalue123"
+WF_FILES = [".github/workflows/git-cicd-merge.yml",
+            ".github/workflows/git-cicd-open.yml"]
+
+
+class TestPullRequestWorkflowFiles:
+    """create_pull_request carries workflow files when pushed with VENDOR_PAT."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+        monkeypatch.delenv("VENDOR_PAT", raising=False)
+
+    def _mock(self, push_results=None, workflow_files=WF_FILES,
+              only_workflows=False):
+        """subprocess.run stand-in tracking what is staged."""
+        state = {"workflows_staged": True, "pushes": list(push_results or [])}
+
+        def side_effect(cmd, **kwargs):
+            if cmd[:2] == ["git", "diff"] and "--name-only" in cmd:
+                return MagicMock(returncode=0,
+                                 stdout="\n".join(workflow_files) + "\n")
+            if cmd[:2] == ["git", "diff"]:
+                # --cached --quiet: 1 = something staged
+                other = not only_workflows
+                staged = other or state["workflows_staged"]
+                return MagicMock(returncode=1 if staged else 0)
+            if cmd[:2] == ["git", "reset"] and ".github/workflows/" in cmd:
+                state["workflows_staged"] = False
+                return MagicMock(returncode=0)
+            if "push" in cmd:
+                if state["pushes"]:
+                    return state["pushes"].pop(0)
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if cmd[:3] == ["gh", "pr", "create"]:
+                return MagicMock(returncode=0,
+                                 stdout="https://github.com/o/r/pull/9\n",
+                                 stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return side_effect
+
+    def _calls(self, mock_run):
+        return [c[0][0] for c in mock_run.call_args_list]
+
+    def _body(self, mock_run):
+        create = [c for c in self._calls(mock_run) if c[:3] == ["gh", "pr", "create"]]
+        assert len(create) == 1
+        return create[0][create[0].index("--body") + 1]
+
+    def _results(self, vendor="git-cicd"):
+        return [{"vendor": vendor, "old_version": "0.0.2",
+                 "new_version": "0.0.4", "changed": True}]
+
+    @patch("vendored_install.subprocess.run")
+    def test_vendor_pat_keeps_workflow_files(self, mock_run, make_config,
+                                             monkeypatch, capsys):
+        monkeypatch.setenv("VENDOR_PAT", PAT)
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        mock_run.side_effect = self._mock()
+
+        assert inst.create_pull_request(self._results()) == \
+            "https://github.com/o/r/pull/9"
+        calls = self._calls(mock_run)
+        assert not [c for c in calls if c[:2] == ["git", "reset"]]
+        push = [c for c in calls if "push" in c]
+        assert len(push) == 1
+        header = inst._auth_header(PAT)
+        assert push[0][:5] == ["git", "-c", "http.https://github.com/.extraheader=",
+                               "-c", f"http.https://github.com/.extraheader={header}"]
+        assert push[0][5:] == ["push", "--force-with-lease", "-u", "origin",
+                               "chore/install-git-cicd-v0.0.4"]
+        assert "Workflow files not included" not in self._body(mock_run)
+        out = capsys.readouterr()
+        assert PAT not in out.out + out.err
+
+    def test_auth_header_is_basic_x_access_token(self):
+        import base64
+        header = inst._auth_header(PAT)
+        assert header.startswith("AUTHORIZATION: basic ")
+        assert base64.b64decode(header.split()[-1]).decode() == \
+            f"x-access-token:{PAT}"
+
+    @patch("vendored_install.subprocess.run")
+    def test_without_vendor_pat_unstages_and_lists_git_cicd(self, mock_run,
+                                                           make_config):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        mock_run.side_effect = self._mock()
+
+        inst.create_pull_request(self._results())
+        calls = self._calls(mock_run)
+        assert ["git", "reset", "HEAD", "--", ".github/workflows/"] in calls
+        push = [c for c in calls if "push" in c]
+        assert push == [["git", "push", "--force-with-lease", "-u", "origin",
+                         "chore/install-git-cicd-v0.0.4"]]
+        body = self._body(mock_run)
+        assert "### Workflow files not included" in body
+        for path in WF_FILES:
+            assert f"- `{path}`" in body
+        assert "`.vendored/pkg/git-cicd/git-cicd generate`" in body
+
+    @patch("vendored_install.subprocess.run")
+    def test_without_vendor_pat_generic_instruction(self, mock_run, make_config):
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        mock_run.side_effect = self._mock(
+            workflow_files=[".github/workflows/tool.yml"])
+
+        inst.create_pull_request(self._results("tool"))
+        body = self._body(mock_run)
+        assert "- `.github/workflows/tool.yml`" in body
+        assert "`python3 .vendored/install tool --force`" in body
+        assert "git-cicd generate" not in body
+
+    @patch("vendored_install.subprocess.run")
+    def test_multi_vendor_note_names_the_owner(self, mock_run, make_config,
+                                               tmp_repo):
+        make_config({"vendors": {
+            "tool": SAMPLE_VENDOR,
+            "other": dict(SAMPLE_VENDOR, install_branch="chore/install-other")}})
+        inst.write_manifest("tool", [".github/workflows/tool.yml"])
+        mock_run.side_effect = self._mock(
+            workflow_files=[".github/workflows/tool.yml"])
+        results = self._results("tool") + self._results("other")
+
+        inst.create_pull_request(results)
+        body = self._body(mock_run)
+        assert "install tool --force" in body
+        assert "install other --force" not in body
+
+    @patch("vendored_install.subprocess.run")
+    def test_refused_workflow_push_retries_without_them(self, mock_run,
+                                                        make_config,
+                                                        monkeypatch, capsys):
+        monkeypatch.setenv("VENDOR_PAT", PAT)
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        refused = MagicMock(
+            returncode=1, stdout="",
+            stderr=("! [remote rejected] (refusing to allow a Personal Access "
+                    f"Token to create or update workflow without `workflow` scope) {PAT}"))
+        mock_run.side_effect = self._mock(push_results=[refused])
+
+        assert inst.create_pull_request(self._results()) == \
+            "https://github.com/o/r/pull/9"
+        calls = self._calls(mock_run)
+        assert ["git", "reset", "--soft", "HEAD~1"] in calls
+        assert ["git", "reset", "HEAD", "--", ".github/workflows/"] in calls
+        commits = [c for c in calls if c[:2] == ["git", "commit"]]
+        assert len(commits) == 2
+        push = [c for c in calls if "push" in c]
+        assert len(push) == 2
+        assert push[1] == ["git", "push", "--force-with-lease", "-u", "origin",
+                           "chore/install-git-cicd-v0.0.4"]
+        body = self._body(mock_run)
+        assert "### Workflow files not included" in body
+        assert "git-cicd generate" in body
+        out = capsys.readouterr()
+        assert "retrying without them" in out.out
+        assert PAT not in out.out + out.err
+
+    @patch("vendored_install.subprocess.run")
+    def test_refused_with_only_workflow_changes_creates_no_pr(
+            self, mock_run, make_config, monkeypatch, capsys):
+        monkeypatch.setenv("VENDOR_PAT", PAT)
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        refused = MagicMock(returncode=1, stdout="",
+                            stderr="refusing to allow ... workflow")
+        mock_run.side_effect = self._mock(push_results=[refused],
+                                          only_workflows=True)
+
+        assert inst.create_pull_request(self._results()) is None
+        calls = self._calls(mock_run)
+        assert not [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+        out = capsys.readouterr().out
+        assert "Only workflow files changed" in out
+        assert WF_FILES[0] in out
+
+    @patch("vendored_install.subprocess.run")
+    def test_only_workflow_changes_without_pat_says_so(self, mock_run,
+                                                       make_config, capsys):
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        mock_run.side_effect = self._mock(only_workflows=True)
+
+        assert inst.create_pull_request(self._results()) is None
+        out = capsys.readouterr().out
+        assert "No changes to commit" in out
+        assert "left out" in out and WF_FILES[1] in out
+
+    @patch("vendored_install.subprocess.run")
+    def test_retry_push_failure_exits(self, mock_run, make_config, monkeypatch,
+                                      capsys):
+        monkeypatch.setenv("VENDOR_PAT", PAT)
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        refused = MagicMock(returncode=1, stdout="", stderr="workflow scope")
+        broken = MagicMock(returncode=1, stdout="", stderr="network down")
+        mock_run.side_effect = self._mock(push_results=[refused, broken])
+
+        with pytest.raises(SystemExit) as exc:
+            inst.create_pull_request(self._results())
+        assert exc.value.code == 1
+        assert "network down" in capsys.readouterr().out
+
+    @patch("vendored_install.subprocess.run")
+    def test_other_push_failure_exits_and_scrubs_token(self, mock_run,
+                                                       make_config,
+                                                       monkeypatch, capsys):
+        monkeypatch.setenv("VENDOR_PAT", PAT)
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        header = inst._auth_header(PAT).split()[-1]
+        denied = MagicMock(returncode=128, stdout=f"x {header}",
+                           stderr=f"remote: Permission denied for {PAT}")
+        mock_run.side_effect = self._mock(push_results=[denied])
+
+        with pytest.raises(SystemExit) as exc:
+            inst.create_pull_request(self._results())
+        assert exc.value.code == 1
+        calls = self._calls(mock_run)
+        assert len([c for c in calls if "push" in c]) == 1
+        assert not [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+        out = capsys.readouterr()
+        assert PAT not in out.out + out.err
+        assert header not in out.out + out.err
+        assert "Permission denied for ***" in out.out
+
+    @patch("vendored_install.subprocess.run")
+    def test_vendor_pat_without_workflow_changes_pushes_as_before(
+            self, mock_run, make_config, monkeypatch):
+        """VENDOR_PAT is only used for the push when workflow files changed."""
+        monkeypatch.setenv("VENDOR_PAT", PAT)
+        make_config({"vendors": {"git-cicd": NEW_CICD_VENDOR}})
+        mock_run.side_effect = self._mock(workflow_files=[])
+
+        inst.create_pull_request(self._results())
+        push = [c for c in self._calls(mock_run) if "push" in c]
+        assert push == [["git", "push", "--force-with-lease", "-u", "origin",
+                         "chore/install-git-cicd-v0.0.4"]]
+        assert "Workflow files" not in self._body(mock_run)

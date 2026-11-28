@@ -16,8 +16,10 @@ Output (key=value lines for workflow consumption):
     changed=true|false
 
 Environment:
-    GITHUB_TOKEN - Auth for public repos
-    VENDOR_PAT   - Auth for private repos (vendor.private: true)
+    GITHUB_TOKEN - Auth for public repos; opens the PR in --pr mode
+    VENDOR_PAT   - Auth for private repos (vendor.private: true). In --pr
+                   mode, also pushes the install branch when it carries
+                   workflow files (needs workflow write permission)
     GH_TOKEN     - Fallback auth token
 """
 
@@ -1199,6 +1201,97 @@ def get_pr_metadata(results):
         }
 
 
+WORKFLOWS_DIR = ".github/workflows/"
+
+
+def staged_workflow_files():
+    """Return the staged paths under .github/workflows/ (written or removed)."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--no-renames", "--",
+         WORKFLOWS_DIR],
+        capture_output=True, text=True,
+    )
+    out = result.stdout if isinstance(result.stdout, str) else ""
+    return sorted(line.strip() for line in out.splitlines() if line.strip())
+
+
+def unstage_workflow_files():
+    """Unstage .github/workflows/ (the files stay on disk)."""
+    subprocess.run(
+        ["git", "reset", "HEAD", "--", WORKFLOWS_DIR],
+        capture_output=True,
+    )
+
+
+def _auth_header(token):
+    """The HTTP header value git sends to authenticate with `token`."""
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return f"AUTHORIZATION: basic {basic}"
+
+
+def _scrub(text, token):
+    """Remove a token (and its header form) from text that is printed."""
+    text = (text or "").strip()
+    if token:
+        for secret in (token, _auth_header(token).split()[-1]):
+            text = text.replace(secret, "***")
+    return text
+
+
+def push_branch(branch, token=None):
+    """Push the install branch, with `token` when given.
+
+    --force-with-lease: these install branches are ephemeral automation
+    artifacts; a stale remote ref from a prior run must not block the push.
+
+    With a token (VENDOR_PAT), it is passed as an http.extraheader for
+    github.com in the command's own -c options: never printed, never written
+    to .git/config. actions/checkout persists its own GITHUB_TOKEN header
+    under the same key, so an empty value is given first, which resets the
+    list of headers, and then the token's header.
+    """
+    cmd = ["git"]
+    if token:
+        key = "http.https://github.com/.extraheader"
+        cmd += ["-c", f"{key}=", "-c", f"{key}={_auth_header(token)}"]
+    cmd += ["push", "--force-with-lease", "-u", "origin", branch]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def workflow_files_note(results, paths):
+    """PR body section listing workflow files left out, and how to add them."""
+    changed = [r["vendor"] for r in results if r["changed"]]
+    owners = []
+    for vendor in changed:
+        manifest = set(read_manifest(vendor) or [])
+        if vendor == "git-cicd" or manifest.intersection(paths):
+            owners.append(vendor)
+    if not owners:
+        owners = changed
+    lines = [
+        "",
+        "",
+        "### Workflow files not included",
+        "",
+        "This branch was pushed with a token that may not write workflow "
+        "files, so these changes were left out:",
+        "",
+    ]
+    lines += [f"- `{path}`" for path in paths]
+    lines += ["", "To add them, on this branch:", ""]
+    for vendor in owners:
+        if vendor == "git-cicd":
+            lines.append(f"- {vendor}: run `.vendored/pkg/git-cicd/git-cicd "
+                         "generate` and commit `.github/workflows/`")
+        else:
+            lines.append(f"- {vendor}: run `python3 .vendored/install "
+                         f"{vendor} --force` with a token that may write "
+                         "workflow files and commit `.github/workflows/`")
+    lines += ["", "Set a `VENDOR_PAT` secret with workflow write permission "
+              "to carry them in future install PRs."]
+    return "\n".join(lines)
+
+
 def create_pull_request(results):
     """Create a PR with vendor install changes."""
     meta = get_pr_metadata(results)
@@ -1231,19 +1324,27 @@ def create_pull_request(results):
     )
     subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
 
-    # Unstage workflow files: the GITHUB_TOKEN used by CI lacks the
-    # `workflows` permission, so pushing commits that touch
-    # .github/workflows/ would be rejected.  Workflow templates are
-    # written to disk by install.sh for initial bootstrap; they should
-    # not be re-committed in automated update PRs.
-    subprocess.run(
-        ["git", "reset", "HEAD", "--", ".github/workflows/"],
-        capture_output=True,
-    )
+    # Workflow files (.github/workflows/) this install wrote or removed.
+    # The workflow's own GITHUB_TOKEN may not push them (it lacks the
+    # `workflows` permission), so they are kept only when VENDOR_PAT is set
+    # and the push is made with it; otherwise they are unstaged and the PR
+    # body lists them with what to run and commit.
+    workflow_files = staged_workflow_files()
+    pat = os.environ.get("VENDOR_PAT", "")
+    keep_workflows = bool(workflow_files and pat)
+    left_out = []
+    if not keep_workflows:
+        unstage_workflow_files()
+        left_out = workflow_files
 
     diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
     if diff_result.returncode == 0:
         print("No changes to commit")
+        if left_out:
+            print("Workflow files changed but were left out (set VENDOR_PAT "
+                  "to a token that may write workflows to carry them):")
+            for path in left_out:
+                print(f"  {path}")
         return
 
     # Skip git hooks: the install script is the authorized mechanism
@@ -1260,17 +1361,37 @@ def create_pull_request(results):
         ["git", "fetch", "origin", branch],
         capture_output=True,
     )
-    # --force-with-lease: these install branches are ephemeral automation
-    # artifacts; a stale remote ref from a prior run must not block the push.
-    push_result = subprocess.run(
-        ["git", "push", "--force-with-lease", "-u", "origin", branch],
-        capture_output=True, text=True,
-    )
+    push_result = push_branch(branch, pat if keep_workflows else None)
+    if (push_result.returncode != 0 and keep_workflows
+            and "workflow" in (push_result.stderr or "").lower()):
+        # VENDOR_PAT may not write workflow files: leave them out and push
+        # the rest, so the install still ends with a pull request.
+        print("Push with workflow files was refused (the token may not "
+              "write workflows); retrying without them")
+        subprocess.run(["git", "reset", "--soft", "HEAD~1"],
+                       check=True, capture_output=True)
+        unstage_workflow_files()
+        left_out = workflow_files
+        diff_result = subprocess.run(["git", "diff", "--cached", "--quiet"])
+        if diff_result.returncode == 0:
+            print("Only workflow files changed and they could not be "
+                  "pushed; no PR created:")
+            for path in left_out:
+                print(f"  {path}")
+            return
+        subprocess.run(
+            ["git", "commit", "--no-verify", "-m", title],
+            check=True, capture_output=True,
+        )
+        push_result = push_branch(branch, None)
     if push_result.returncode != 0:
         print(f"git push failed (exit {push_result.returncode}):")
-        print(f"  stdout: {push_result.stdout.strip()}")
-        print(f"  stderr: {push_result.stderr.strip()}")
+        print(f"  stdout: {_scrub(push_result.stdout, pat)}")
+        print(f"  stderr: {_scrub(push_result.stderr, pat)}")
         sys.exit(1)
+
+    if left_out:
+        body += workflow_files_note(results, left_out)
 
     pr_result = subprocess.run(
         ["gh", "pr", "create", "--title", title, "--body", body,

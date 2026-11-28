@@ -73,6 +73,17 @@ python3 .vendored/install all  # update all vendors
 python3 .vendored/install all --pr
 ```
 
+### Workflow files and `VENDOR_PAT`
+
+An install can change files under `.github/workflows/` (a vendor's workflows). The workflow's own `GITHUB_TOKEN` may not push those, so in `--pr` mode:
+
+- **With `VENDOR_PAT` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with `VENDOR_PAT` (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). The PR itself is still opened with `GITHUB_TOKEN`. If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
+- **Without `VENDOR_PAT`**, workflow files are left out as before.
+
+Whenever workflow files are left out, the PR description lists them and says what to run and commit on the branch: for git-cicd, `.vendored/pkg/git-cicd/git-cicd generate`; for other vendors, `python3 .vendored/install <vendor> --force` with a token that may write workflows.
+
+To carry workflow files, `VENDOR_PAT` needs, on the consuming repository: **Contents** read/write, **Pull requests** read/write and **Workflows** write (fine-grained token), or the `repo` and `workflow` scopes (classic token). No token value is printed in any log.
+
 ## Removing a Vendor
 
 ```bash
