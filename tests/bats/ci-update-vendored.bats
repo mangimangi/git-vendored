@@ -7,7 +7,7 @@ load ci-helpers
 
 setup() {
     ci_setup
-    unset CICD_INPUT_VENDOR CICD_INPUT_VERSION CICD_INPUT_PRIVATE VENDOR_PAT GH_TOKEN GITHUB_TOKEN
+    unset CICD_INPUT_VENDOR CICD_INPUT_VERSION CICD_INPUT_PRIVATE
     # The python3 stub logs each argument in [brackets], one line per call,
     # then the token variables on a line of their own.
     cat > "$BIN/python3" <<'STUB'
@@ -96,4 +96,12 @@ first_line() { head -n 1 "$STUB_LOG"; }
 @test "install's exit code is the step's exit code" {
     run_update STUB_INSTALL_STATUS=3
     [ "$status" -eq 3 ]
+}
+
+@test "ci_setup removes token variables the outer environment holds" {
+    export VENDOR_PAT=outer-fake-pat GH_TOKEN=outer-fake-gh GITHUB_TOKEN=outer-fake-gt
+    ci_setup
+    [ -z "${VENDOR_PAT+set}" ]
+    [ -z "${GH_TOKEN+set}" ]
+    [ -z "${GITHUB_TOKEN+set}" ]
 }

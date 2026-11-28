@@ -7,10 +7,38 @@ dict to subprocess would drop them, so that child's run would silently not be
 counted. This wraps ``subprocess.Popen`` (which ``run``, ``call`` and
 ``check_output`` all use) to copy those variables into such an env when the
 test did not set them itself.
+
+Tokens: no test may read a token from the ambient environment. In CI the
+job's environment holds real secrets (VENDOR_PAT), and a failed assertion
+that compares against one prints part of it, which GitHub does not mask.
+So VENDOR_PAT, GH_TOKEN and GITHUB_TOKEN are removed from os.environ when
+this file is imported (before collection and any session fixture), and again
+before every test by an autouse fixture; a test that needs one sets a fake
+value with monkeypatch.
 """
 
 import os
 import subprocess
+
+import pytest
+
+TOKEN_ENV_VARS = ("VENDOR_PAT", "GH_TOKEN", "GITHUB_TOKEN")
+
+
+def clear_token_env():
+    """Remove every token variable from os.environ."""
+    for name in TOKEN_ENV_VARS:
+        os.environ.pop(name, None)
+
+
+clear_token_env()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_tokens(monkeypatch):
+    """Each test starts with no token variable set."""
+    for name in TOKEN_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 COVERAGE_ENV_VARS = ("COVERAGE_PROCESS_START", "GIT_VENDORED_ROOT", "COVERAGE_RCFILE")
 
