@@ -30,5 +30,9 @@ relative_files = true
 parallel = true
 data_file = "${GIT_VENDORED_ROOT-.}/.coverage"
 
+# 99% is the rule: ci/test.sh fails the `test` job below it, in total
+# (fail_under) and for each file (coverage has no per-file setting, so
+# ci/test.sh checks each one).
 [tool.coverage.report]
 show_missing = true
+fail_under = 99

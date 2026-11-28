@@ -72,12 +72,22 @@ Reading the report: `Stmts` is the executable lines in the file, `Miss` how
 many of them no test ran, `Cover` the percentage run, and `Missing` the line
 numbers (ranges like `100-113`) still untested. To see one file after a run:
 `<venv>/bin/python -m coverage report --include=templates/check`.
+
+The rule: each of the six scripts, and their total, must stay at 99% line
+coverage or more. `ci/test.sh` fails the `test` job (and so
+`Verdict / git-cicd:verdict`) when the total is below `fail_under = 99`
+(`pyproject.toml`) or when any one file is, naming the file, its figure and
+its missing lines. The `Cover` column rounds, so trust the `ci/test.sh:` line.
+A change that lowers coverage below 99% adds its tests in the same pull
+request. A line is excluded with `# pragma: no cover` only when no test can
+reach it, with the reason in a comment on that line.
 After changing the git-cicd config, run `.vendored/pkg/git-cicd/git-cicd generate`
 and commit `.github/workflows/git-cicd-open.yml`.
 
 ## Contributing
 
 - Commits: `<type>: <description>` (e.g., `feat:`, `fix:`, `chore:`)
+- Keep every shipped Python script at >= 99% line coverage: a change that lowers it fails the `test` job, so add its tests in the same PR (`# pragma: no cover` only for lines no test can reach, reason on the line)
 - PRs run `tests/` and `.vendored/check` as git-cicd jobs (`Open / ... / git-vendored:<job>` rows, `Verdict / git-cicd:verdict` status)
 - Vendor configs live in `.vendored/configs/<vendor>.json`, not the legacy `config.json`
 - All vendor-installed files go under `.vendored/pkg/<vendor>/`

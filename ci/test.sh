@@ -1,6 +1,8 @@
 #!/bin/bash
 # ci/test.sh - the step of git-vendored's own `test` job: run pytest under
-# coverage and print the per-file line coverage of the shipped Python scripts.
+# coverage, print the per-file line coverage of the shipped Python scripts,
+# and fail when the total or any one file is below 99% (fail_under in
+# pyproject.toml; the per-file check is below, coverage has no setting for it).
 #
 # Uses the virtualenv ci/setup.sh creates for the Python floor. When setup was
 # skipped (a local `git-cicd check` without --setup), falls back to a python3
@@ -40,5 +42,41 @@ export GIT_VENDORED_ROOT="$PWD"
 status=0
 "$PYTHON" -m coverage run -m pytest tests/ -v || status=$?
 "$PYTHON" -m coverage combine --quiet
-"$PYTHON" -m coverage report
+# The full report is always printed; its exit code is non-zero when the total
+# is below fail_under.
+"$PYTHON" -m coverage report || status=$?
+
+# Per file: each measured script must be at the threshold too, so one file
+# below it fails the job even when the total is above.
+JSON="$(mktemp)"
+trap 'rm -f "$JSON"' EXIT
+"$PYTHON" -m coverage json --quiet --fail-under=0 -o "$JSON"
+THRESHOLD="$(sed -n 's/^fail_under *= *\([0-9][0-9.]*\).*/\1/p' pyproject.toml | head -n1)"
+"$PYTHON" - "$JSON" "${THRESHOLD:-99}" <<'PY' || status=$?
+import json, sys
+data = json.load(open(sys.argv[1]))
+threshold = float(sys.argv[2])
+low = []
+for name, info in sorted(data["files"].items()):
+    pct = info["summary"]["percent_covered"]
+    if pct < threshold:
+        low.append((name, pct, info["missing_lines"]))
+def ranges(lines):
+    out, start, prev = [], None, None
+    for n in lines + [None]:
+        if start is not None and n != prev + 1:
+            out.append(str(start) if start == prev else f"{start}-{prev}")
+            start = None
+        if start is None:
+            start = n
+        prev = n
+    return ", ".join(out)
+for name, pct, missing in low:
+    print(f"ci/test.sh: {name} is at {pct:.2f}% line coverage, below {threshold:g}%; "
+          f"missing lines: {ranges(missing)}", file=sys.stderr)
+if low:
+    print("ci/test.sh: add tests for those lines in this pull request "
+          "(see Coverage in AGENTS.md)", file=sys.stderr)
+sys.exit(1 if low else 0)
+PY
 exit "$status"
