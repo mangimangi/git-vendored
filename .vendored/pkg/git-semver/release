@@ -1,22 +1,50 @@
 #!/usr/bin/env python3
 """release — CI orchestration for git-semver.
 
-Subcommands:
-    bump      Version bump (push or dispatch event handling)
-    publish   Create tags and GitHub releases for bump commits
+Usage:
+    release           Work out the case from the environment and do it
+    release bump      Version bump (push or dispatch event handling)
+    release publish   Create tags and GitHub releases for bump commits
 
-Called by the version-bump.yml workflow. Reads GitHub Actions context from
-environment variables and orchestrates version bumps, PR creation, and
-GitHub Release creation.
+With no subcommand, release decides for itself what a run should do, so the
+decision lives here and not in a workflow file or a per-repo script:
 
-Environment variables (set by the workflow or GitHub Actions):
+    merge (a change landed on a branch), by the landed commit's subject:
+        starts with "chore: bump version"  ->  publish (tag + GitHub releases)
+        starts with "chore: install"       ->  nothing, exit 0
+        anything else                      ->  bump, as `release bump` on push
+                                               (honours install.on_merge and
+                                               install.automerge)
+    manual (a run started by hand)         ->  bump, as `release bump` on
+                                               workflow_dispatch, with inputs
+    any other trigger (open, cron, ...)    ->  refused, non-zero exit
+
+The same script serves a git-cicd job and the version-bump.yml workflow:
+git-cicd's CICD_* variables win over the GitHub Actions ones whenever they
+are set, because inside a git-cicd job on Actions both exist and git-cicd's
+describe the job. `release bump` and `release publish` are called by
+version-bump.yml and behave as before.
+
+Environment variables (set by git-cicd, the workflow or GitHub Actions):
+    CICD_TRIGGER                "merge" or "manual" (no-subcommand mode;
+                                wins over GITHUB_EVENT_NAME)
+    CICD_BASE                   Commit before the push (wins over
+                                GITHUB_EVENT_BEFORE in no-subcommand mode)
+    CICD_HEAD                   Landed commit (wins over GITHUB_SHA)
+    CICD_TARGET_BRANCH          Branch to sync with (wins over GITHUB_REF)
+    CICD_INPUT_BUMP_TYPE        Declared manual input (wins over INPUT_BUMP_TYPE)
+    CICD_INPUT_SUBDIRECTORY     Declared manual input (wins over INPUT_SUBDIRECTORY)
+    CICD_INPUT_CHANGELOG_DESCRIPTION
+                                Declared manual input (wins over
+                                INPUT_CHANGELOG_DESCRIPTION)
     GITHUB_EVENT_NAME           "push" or "workflow_dispatch"
     GITHUB_EVENT_BEFORE         Before-SHA for push events
     GITHUB_SHA                  Current commit SHA
-    INPUT_BUMP_TYPE             patch|minor|major (dispatch only)
+    INPUT_BUMP_TYPE             patch|minor|major (dispatch only, default patch)
     INPUT_SUBDIRECTORY          Subdirectory to bump (dispatch only, optional)
     INPUT_CHANGELOG_DESCRIPTION Changelog entry text (dispatch only, optional)
-    GH_TOKEN                    GitHub token (for gh CLI)
+    GH_TOKEN / GITHUB_TOKEN     GitHub token (gh reads either; git-cicd's
+                                merge and manual workflows pass GITHUB_TOKEN)
     GITHUB_REPOSITORY           owner/repo (for gh release create)
     GITHUB_REF                  Current branch ref
 """
@@ -79,8 +107,12 @@ def sync_branch():
     syncing, this run would read a stale VERSION file and try to create a tag
     that already exists.
     """
-    ref = os.environ.get("GITHUB_REF", "refs/heads/main")
-    branch = ref.split("/", 2)[-1] if ref.startswith("refs/heads/") else "main"
+    target = os.environ.get("CICD_TARGET_BRANCH", "")
+    if target:
+        branch = target[len("refs/heads/"):] if target.startswith("refs/heads/") else target
+    else:
+        ref = os.environ.get("GITHUB_REF", "refs/heads/main")
+        branch = ref.split("/", 2)[-1] if ref.startswith("refs/heads/") else "main"
     result = run("git", "pull", "--ff-only", "origin", branch, check=False, capture=True)
     if result.returncode != 0:
         print(f"Warning: could not fast-forward to latest {branch}, "
@@ -136,14 +168,40 @@ def create_releases():
             "--repo", repo, "--title", tag, "--generate-notes")
 
 
+def first_env(*names):
+    """The value of the first of `names` that is set and non-empty, else ""."""
+    for name in names:
+        value = os.environ.get(name, "")
+        if value:
+            return value
+    return ""
+
+
+def read_input(name):
+    """A manual-run input: CICD_INPUT_<name> when set, else INPUT_<name>.
+
+    A declared git-cicd input is always set, possibly empty, so its presence
+    (not its value) decides which variable is read.
+    """
+    cicd = f"CICD_INPUT_{name}"
+    if cicd in os.environ:
+        return os.environ[cicd]
+    return os.environ.get(f"INPUT_{name}", "")
+
+
 # ── Bump subcommand ───────────────────────────────────────────────────────
 
-def handle_push_bump(automerge):
-    """Handle push-to-main event for bump subcommand."""
-    before = os.environ.get("GITHUB_EVENT_BEFORE", "")
-    if not before:
-        print("Error: GITHUB_EVENT_BEFORE not set", file=sys.stderr)
-        sys.exit(1)
+def handle_push_bump(automerge, before=None):
+    """Handle push-to-main event for bump subcommand.
+
+    `before` is the commit before the push; when None it is read from
+    GITHUB_EVENT_BEFORE (as `release bump` always has).
+    """
+    if before is None:
+        before = os.environ.get("GITHUB_EVENT_BEFORE", "")
+        if not before:
+            print("Error: GITHUB_EVENT_BEFORE not set", file=sys.stderr)
+            sys.exit(1)
 
     configure_git()
     sync_branch()
@@ -174,9 +232,9 @@ def handle_push_bump(automerge):
 
 def handle_dispatch_bump(automerge):
     """Handle workflow_dispatch event for bump subcommand."""
-    bump_type = os.environ.get("INPUT_BUMP_TYPE", "patch")
-    subdirectory = os.environ.get("INPUT_SUBDIRECTORY", "")
-    description = os.environ.get("INPUT_CHANGELOG_DESCRIPTION", "")
+    bump_type = read_input("BUMP_TYPE") or "patch"
+    subdirectory = read_input("SUBDIRECTORY")
+    description = read_input("CHANGELOG_DESCRIPTION")
 
     configure_git()
 
@@ -238,12 +296,83 @@ def cmd_publish():
     create_releases()
 
 
+# ── No subcommand: decide for itself ─────────────────────────────────────
+
+BUMP_COMMIT_PREFIX = "chore: bump version"
+INSTALL_COMMIT_PREFIX = "chore: install"
+GITHUB_EVENT_TRIGGERS = {"push": "merge", "workflow_dispatch": "manual"}
+
+
+def resolve_trigger():
+    """Return (trigger, source) for this run.
+
+    CICD_TRIGGER wins when set; otherwise GITHUB_EVENT_NAME is mapped
+    (push -> merge, workflow_dispatch -> manual). An unmapped GitHub event
+    is returned as-is so the caller can name it in the refusal.
+    """
+    cicd = os.environ.get("CICD_TRIGGER", "")
+    if cicd:
+        return cicd, "CICD_TRIGGER"
+    event = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event:
+        return GITHUB_EVENT_TRIGGERS.get(event, event), "GITHUB_EVENT_NAME"
+    return "", ""
+
+
+def landed_subject():
+    """Subject line of the landed commit (CICD_HEAD, else GITHUB_SHA, else HEAD)."""
+    head = first_env("CICD_HEAD", "GITHUB_SHA") or "HEAD"
+    return run("git", "log", "-1", "--format=%s", head, capture=True).stdout.strip()
+
+
+def handle_merge():
+    """A change landed on a branch: publish, nothing, or bump by its subject."""
+    subject = landed_subject()
+    if subject.startswith(BUMP_COMMIT_PREFIX):
+        print(f"Landed commit is a bump commit ({subject!r}): publishing")
+        cmd_publish()
+        return
+    if subject.startswith(INSTALL_COMMIT_PREFIX):
+        print(f"Landed commit is an install commit ({subject!r}): nothing to do")
+        return
+
+    on_merge, automerge = read_config()
+    if not on_merge:
+        print("on_merge is false, skipping")
+        return
+    before = first_env("CICD_BASE", "GITHUB_EVENT_BEFORE")
+    if not before:
+        print("Error: neither CICD_BASE nor GITHUB_EVENT_BEFORE is set; "
+              "cannot tell what the merge changed", file=sys.stderr)
+        sys.exit(1)
+    handle_push_bump(automerge, before=before)
+
+
+def cmd_auto():
+    """No subcommand: work out whether this run bumps, publishes or does nothing."""
+    trigger, source = resolve_trigger()
+    if trigger == "merge":
+        handle_merge()
+    elif trigger == "manual":
+        _, automerge = read_config()
+        handle_dispatch_bump(automerge)
+    elif not trigger:
+        print("Error: release with no subcommand needs CICD_TRIGGER (merge or "
+              "manual) or GITHUB_EVENT_NAME (push or workflow_dispatch); "
+              "neither is set", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"Error: release does not run for trigger {trigger!r} (from "
+              f"{source}); it runs on a merge or a manual run", file=sys.stderr)
+        sys.exit(1)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: semver <bump|publish>", file=sys.stderr)
-        sys.exit(1)
+        cmd_auto()
+        return
 
     subcommand = sys.argv[1]
     if subcommand == "bump":
@@ -252,6 +381,7 @@ def main():
         cmd_publish()
     else:
         print(f"Unknown subcommand: {subcommand}", file=sys.stderr)
+        print("Usage: release [bump|publish]", file=sys.stderr)
         sys.exit(1)
 
 
