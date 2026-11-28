@@ -11,7 +11,10 @@
 #   manual  Manual  .github/workflows/git-cicd-manual.yml  (generated)
 #
 # Every generated file is fixed text except the cron workflow's schedule
-# block; this file does not vary with the config at all, only with the
+# block, the manual workflow's form and, in every workflow, the run job of
+# each permission group (below) with the decide output and the report's
+# `needs` that go with it; without a permission declaration beyond the
+# default this file does not vary with the config at all, only with the
 # git-cicd version (and the tool path, which is where git-cicd is installed).
 # Whoever upgrades git-cicd, or changes the config, runs
 #   .vendored/pkg/git-cicd/git-cicd generate
@@ -34,6 +37,27 @@
 # to see whether an open pull request owns it, and decide `actions: read` for
 # the queue.
 #
+# A config job that declares `permissions` beyond this default runs instead
+# in a run job of its own, one per distinct effective permission set, with
+# the id `run-` plus each scope and level beyond the default (for example
+# `run-packages-write`): generate writes it as a copy of `run` whose
+# permissions are the default plus the declaration (the higher level wins,
+# written literally: GitHub takes no expression in a job's `permissions`,
+# and they apply to every matrix entry) and whose matrix is that group's
+# entry of decide's `groups` output; `run` keeps every other job. A group
+# job with nothing to run runs its placeholder entry
+# `(nothing:<id>)`, row `Nothing needed / <repo>:(nothing:<id>)`, with its
+# steps skipped, for the reason `run` does (below).
+#
+# Secrets: a job gets only the secrets its config job declares (`secrets`,
+# from the documented set CICD_WRITE_TOKEN, CICD_READ_TOKEN and the
+# deprecated VENDOR_PAT). The step that runs a job has one fixed env line per
+# documented name, which gives the secret only to a matrix entry whose job
+# declares it (decide's `secrets` output, job -> declared names) and the empty
+# string otherwise; the tool removes every undeclared or empty one, so a
+# script sees a secret only when its job declares it and it is set. No config
+# value is written into this file. GITHUB_TOKEN reaches every job.
+#
 # Overlap rule for `merge`: runs on one branch go one at a time and are never
 # cancelled. There is no `concurrency` key: a GitHub concurrency group keeps
 # only one pending run and cancels the one before it when a newer run joins,
@@ -47,6 +71,13 @@
 # evaluated into the row name, never into a command) and
 # `Report / git-cicd:report`. Every fact reaches the tool as an environment
 # variable, never spliced into a command.
+#
+# A run that needs no job still runs the `run` job, once, as the placeholder
+# entry `(nothing)`, whose row is `Nothing needed / <repo>:(nothing)` and
+# whose steps are all skipped. The job has no job-level `if`: GitHub does not
+# expand a matrix job's name when the job is skipped before its matrix is
+# evaluated, so a skipped `run` job would show its `name:` expression as raw
+# text.
 #
 # The verdict: the `Verdict / git-cicd:verdict` COMMIT STATUS on the landed
 # commit, pending from the first step of decide and final from the last step
@@ -78,6 +109,7 @@ jobs:
     outputs:
       jobs: ${{ steps.decide.outputs.jobs }}
       names: ${{ steps.decide.outputs.names }}
+      secrets: ${{ steps.decide.outputs.secrets }}
       any: ${{ steps.decide.outputs.any }}
       max_parallel: ${{ steps.decide.outputs.max_parallel }}
     steps:
@@ -144,7 +176,6 @@ jobs:
   run:
     name: ${{ fromJSON(needs.decide.outputs.names)[matrix.job] }} / ${{ github.event.repository.name }}:${{ matrix.job }}
     needs: decide
-    if: needs.decide.outputs.any == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -156,19 +187,23 @@ jobs:
         job: ${{ fromJSON(needs.decide.outputs.jobs) }}
     steps:
       - name: Checkout repository
+        if: matrix.job != '(nothing)'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
 
       - name: Run job
+        if: matrix.job != '(nothing)'
         env:
           JOB: ${{ matrix.job }}
           BRANCH: ${{ github.ref_name }}
           BASE: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
           GITHUB_TOKEN: ${{ github.token }}
-          VENDOR_PAT: ${{ secrets.VENDOR_PAT }}
+          CICD_WRITE_TOKEN: ${{ contains(fromJSON(needs.decide.outputs.secrets)[matrix.job], 'CICD_WRITE_TOKEN') && secrets.CICD_WRITE_TOKEN || '' }}
+          CICD_READ_TOKEN: ${{ contains(fromJSON(needs.decide.outputs.secrets)[matrix.job], 'CICD_READ_TOKEN') && secrets.CICD_READ_TOKEN || '' }}
+          VENDOR_PAT: ${{ contains(fromJSON(needs.decide.outputs.secrets)[matrix.job], 'VENDOR_PAT') && secrets.VENDOR_PAT || '' }}
         run: |
           mkdir -p "$RUNNER_TEMP/git-cicd"
           python3 .vendored/pkg/git-cicd/git-cicd run-job "$JOB" --trigger=merge --target="$BRANCH" \
@@ -176,7 +211,7 @@ jobs:
             --setup --result="$RUNNER_TEMP/git-cicd/result.json"
 
       - name: Upload result
-        if: always()
+        if: always() && matrix.job != '(nothing)'
         uses: actions/upload-artifact@v4
         with:
           name: git-cicd-result-${{ matrix.job }}

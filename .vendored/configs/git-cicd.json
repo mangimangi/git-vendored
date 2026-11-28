@@ -16,6 +16,7 @@
         "pyproject.toml",
         "ci/**"
       ],
+      "manual": false,
       "setup": "ci/setup.sh",
       "steps": ["ci/test.sh"]
     },
@@ -24,6 +25,7 @@
       "on": ["open"],
       "branches": ["**"],
       "paths": ["**"],
+      "manual": false,
       "steps": ["ci/vendor-check.sh"]
     },
     "version-check": {
@@ -31,6 +33,8 @@
       "on": ["open"],
       "branches": ["main"],
       "paths": ["**"],
+      "manual": false,
+      "secrets": ["CICD_WRITE_TOKEN"],
       "steps": [[".vendored/pkg/git-semver/git-semver", "check-bump"]]
     },
     "release": {
@@ -59,6 +63,7 @@
           "default": "false"
         }
       },
+      "secrets": ["CICD_WRITE_TOKEN", "VENDOR_PAT"],
       "steps": ["ci/update-vendored.sh"]
     },
     "validate": {
