@@ -63,8 +63,11 @@ def _read_registry(vendor_name):
 def _extract_vendor_registry(raw, vendor_name=None):
     """Extract registry fields from a per-vendor config file's contents.
 
-    Prefers .registry file in manifests/ (new path). Falls back to _vendor
-    key in config, then treats all top-level keys as registry fields.
+    A file under .vendored/configs/ is a vendor only when a registry says
+    so: a .vendored/manifests/<vendor>.registry file, a _vendor block in
+    the file, or (the pre-_vendor form) top-level registry fields that
+    include `repo`. Returns None for any other file: it is the repository's
+    own configuration (for example a tool's job config in its own repo).
     """
     if vendor_name:
         registry = _read_registry(vendor_name)
@@ -72,7 +75,9 @@ def _extract_vendor_registry(raw, vendor_name=None):
             return registry
     if "_vendor" in raw:
         return dict(raw["_vendor"])
-    return dict(raw)
+    if "repo" in raw:
+        return dict(raw)
+    return None
 
 
 def load_config(config_path=".vendored/config.json"):
@@ -95,7 +100,9 @@ def load_config(config_path=".vendored/config.json"):
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
                     raw = json.load(f)
-                vendors[vendor_name] = _extract_vendor_registry(raw, vendor_name)
+                registry = _extract_vendor_registry(raw, vendor_name)
+                if registry is not None:
+                    vendors[vendor_name] = registry
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json

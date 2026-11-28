@@ -99,9 +99,11 @@ def read_registry(vendor_name):
 def _extract_vendor_registry(raw, vendor_name=None):
     """Extract registry fields from a per-vendor config file's contents.
 
-    Prefers .registry file in manifests/ (new path). Falls back to _vendor
-    key in config, then treats all top-level keys as registry fields
-    (backwards compat with pre-_vendor configs).
+    A file under .vendored/configs/ is a vendor only when a registry says
+    so: a .vendored/manifests/<vendor>.registry file, a _vendor block in
+    the file, or (the pre-_vendor form) top-level registry fields that
+    include `repo`. Returns None for any other file: it is the repository's
+    own configuration (for example a tool's job config in its own repo).
     """
     if vendor_name:
         registry = read_registry(vendor_name)
@@ -109,7 +111,9 @@ def _extract_vendor_registry(raw, vendor_name=None):
             return registry
     if "_vendor" in raw:
         return dict(raw["_vendor"])
-    return dict(raw)
+    if "repo" in raw:
+        return dict(raw)
+    return None
 
 
 def load_config(config_path=CONFIG_PATH):
@@ -134,7 +138,9 @@ def load_config(config_path=CONFIG_PATH):
                 filepath = os.path.join(CONFIGS_DIR, filename)
                 with open(filepath) as f:
                     raw = json.load(f)
-                vendors[vendor_name] = _extract_vendor_registry(raw, vendor_name)
+                registry = _extract_vendor_registry(raw, vendor_name)
+                if registry is not None:
+                    vendors[vendor_name] = registry
             return {"vendors": vendors}
 
     # Fallback to monolithic config.json
@@ -1213,7 +1219,11 @@ def install_existing_vendor(vendor_name, vendor_config, requested_version,
     """Update path: resolve version, skip if current, run install.sh."""
     if installing_set is None:
         installing_set = []
-    repo = vendor_config["repo"]
+    repo = vendor_config.get("repo")
+    if not repo:
+        print(f"::error::Vendor '{vendor_name}' has no repo in its registry "
+              f"(.vendored/manifests/{vendor_name}.registry)")
+        sys.exit(1)
     if repo in installing_set:
         chain = " -> ".join(installing_set) + " -> " + repo
         print(f"::error::Circular dependency detected: {chain}")
@@ -1740,6 +1750,9 @@ def migrate_project_configs():
         vendor_filepath = os.path.join(CONFIGS_DIR, filename)
         with open(vendor_filepath) as f:
             vendor_data = json.load(f)
+        if _extract_vendor_registry(vendor_data, vendor_name) is None:
+            # The repository's own config, not a vendor's: leave it alone
+            continue
 
         # Merge: project config keys go to top level, never overwrite _vendor
         for key, value in project_config.items():
@@ -2099,6 +2112,11 @@ def main():
         )
         output_result(result)
         results = [result]
+    elif os.path.isfile(os.path.join(CONFIGS_DIR, f"{args.target}.json")):
+        # The repository's own config (no registry): not a vendor
+        print(f"::error::'{args.target}' is not a registered vendor: "
+              f"{CONFIGS_DIR}/{args.target}.json has no registry")
+        sys.exit(1)
     else:
         print(f"::error::Unknown vendor: {args.target}")
         print(f"Registered vendors: {', '.join(sorted(vendors.keys()))}")

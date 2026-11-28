@@ -125,7 +125,7 @@ on:
         default: "latest"
         type: string
       private:
-        description: "Vendor repo is private (read with CICD_READ_TOKEN) (job update-vendored)"
+        description: "Vendor repo is private (only needed when adding a new vendor) (job update-vendored)"
         required: false
         default: "false"
         type: choice

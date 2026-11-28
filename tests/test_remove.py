@@ -684,3 +684,43 @@ class TestWhatRemovalLeaves:
         assert other_pkg.exists()
         assert untracked.exists()
         assert "(8 files deleted)" in capsys.readouterr().out
+
+
+class TestUnregisteredConfig:
+    """A config with no registry and no repo is the repository's own (gv-2668)."""
+
+    def _setup(self, tmp_repo):
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        configs_dir.mkdir(parents=True)
+        (configs_dir / "tool.json").write_text(json.dumps({"prefix": "t"}))
+        own = configs_dir / "git-cicd.json"
+        own.write_text('{\n  "jobs": {}\n}\n')
+        _write_file(tmp_repo, ".vendored/pkg/tool/run.sh")
+        _write_manifests(tmp_repo, "tool", [".vendored/pkg/tool/run.sh"],
+                         registry=json.dumps({"repo": "owner/tool"}),
+                         version="1.0.0\n")
+        return configs_dir, own
+
+    def test_load_config_skips_own_config(self, tmp_repo):
+        self._setup(tmp_repo)
+        assert list(rem.load_config()["vendors"]) == ["tool"]
+
+    def test_removing_a_vendor_keeps_own_config(self, tmp_repo):
+        configs_dir, own = self._setup(tmp_repo)
+        before = own.read_bytes()
+        with patch("sys.argv", ["remove", "tool", "--force"]):
+            rem.main()
+        assert not (configs_dir / "tool.json").exists()
+        assert own.read_bytes() == before
+
+    def test_naming_own_config_is_not_a_vendor(self, tmp_repo, capsys):
+        _, own = self._setup(tmp_repo)
+        before = own.read_bytes()
+        with patch("sys.argv", ["remove", "git-cicd", "--force"]):
+            with pytest.raises(SystemExit) as exc_info:
+                rem.main()
+        assert exc_info.value.code == 1
+        assert capsys.readouterr().out.splitlines() == [
+            "::error::'git-cicd' is not a registered vendor: "
+            ".vendored/configs/git-cicd.json has no registry"]
+        assert own.read_bytes() == before

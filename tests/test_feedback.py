@@ -114,6 +114,13 @@ class TestLoadVendors:
         assert vendors["tool"]["repo"] == "owner/new"
 
 
+    def test_skips_config_without_registry_or_repo(self, tmp_repo, make_vendor):
+        """The repository's own config (no registry, no repo) is not a vendor."""
+        make_vendor("tool-a", {"repo": "owner/tool-a"})
+        configs_dir = tmp_repo / ".vendored" / "configs"
+        (configs_dir / "git-cicd.json").write_text(json.dumps({"jobs": {}}))
+        assert list(fb.load_vendors()) == ["tool-a"]
+
 class TestGetInstalledVendors:
     def test_finds_installed(self, make_vendor):
         make_vendor("tool-a", {"repo": "owner/tool-a"})
