@@ -1279,7 +1279,8 @@ class TestPullRequestToken:
         assert body.endswith(inst.NO_CHECKS_NOTE)
         note = inst.NO_CHECKS_NOTE.strip()
         assert "\n" not in note
-        assert "no checks will run" in note and "`VENDOR_PAT`" in note
+        assert "no checks will run" in note and "`CICD_WRITE_TOKEN`" in note
+        assert "VENDOR_PAT" not in note
 
     @patch("vendored_install.subprocess.run")
     def test_no_token_leaves_callers_gh_token(self, mock_run, monkeypatch):
@@ -1312,7 +1313,7 @@ class TestPullRequestToken:
             in out.out
         assert "gh pr create --head chore/install-tool-v2.0.0 --base main" \
             in out.out
-        assert "set a VENDOR_PAT" not in out.out
+        assert "set a CICD_WRITE_TOKEN" not in out.out
 
     @patch("vendored_install.subprocess.run")
     def test_failed_create_with_workflow_token_suggests_vendor_pat(
@@ -1327,7 +1328,8 @@ class TestPullRequestToken:
         assert exc.value.code == 1
         out = capsys.readouterr().out
         assert "chore/install-tool-v2.0.0" in out
-        assert "set a VENDOR_PAT secret" in out
+        assert "set a CICD_WRITE_TOKEN secret" in out
+        assert "VENDOR_PAT" not in out
 
     @patch("vendored_install.subprocess.run")
     def test_existing_pr_is_reused(self, mock_run, monkeypatch, capsys):
@@ -4032,3 +4034,224 @@ class TestVendorArgument:
         out = capsys.readouterr().out
         assert "Unknown vendor: nope" in out
         assert "Registered vendors: git-cicd" in out
+
+
+# ── Tests: write and read tokens (gv-274f) ────────────────────────────────
+
+class TestTokenNames:
+    """CICD_WRITE_TOKEN proposes changes, CICD_READ_TOKEN reads private
+    vendors; the deprecated VENDOR_PAT is read when the new names are unset."""
+
+    @pytest.mark.parametrize("env, expected", [
+        ({"CICD_READ_TOKEN": "r", "CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "r"),
+        ({"CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "w"),
+        ({"CICD_READ_TOKEN": "", "CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "w"),
+        ({"VENDOR_PAT": "o"}, "o"),
+        ({"CICD_READ_TOKEN": "", "CICD_WRITE_TOKEN": "", "VENDOR_PAT": "o"}, "o"),
+        ({"CICD_READ_TOKEN": "r"}, "r"),
+    ], ids=["read-first", "write-second", "empty-read", "old-last",
+            "empty-new", "read-alone"])
+    def test_private_vendor_read_order(self, monkeypatch, env, expected):
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        assert inst.read_token() == expected
+        assert inst.get_auth_token(PRIVATE_VENDOR) == expected
+        assert inst.get_auth_token(private=True) == expected
+
+    def test_read_token_is_not_a_write_token(self, monkeypatch):
+        monkeypatch.setenv("CICD_READ_TOKEN", "r")
+        assert inst.write_token() == ""
+
+    @pytest.mark.parametrize("env, expected", [
+        ({"CICD_WRITE_TOKEN": "w", "VENDOR_PAT": "o"}, "w"),
+        ({"VENDOR_PAT": "o"}, "o"),
+        ({"CICD_WRITE_TOKEN": "", "VENDOR_PAT": "o"}, "o"),
+        ({}, ""),
+    ], ids=["new-name", "old-name", "empty-new", "none"])
+    def test_write_token_order(self, monkeypatch, env, expected):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        assert inst.write_token() == expected
+
+    def test_missing_private_token_names_new_secrets(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            inst.get_auth_token(PRIVATE_VENDOR)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "CICD_READ_TOKEN" in out and "CICD_WRITE_TOKEN" in out
+        assert "VENDOR_PAT" not in out
+
+
+class TestPullRequestWriteToken:
+    """The push (with workflow files), the PR and auto-merge use
+    CICD_WRITE_TOKEN, and VENDOR_PAT when only it is set."""
+
+    WRITE = "fake-cicd-write-token-123"
+    OLD = "fake-old-vendor-pat-456"
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch, make_config):
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        monkeypatch.setenv("GH_TOKEN", "caller-token")
+        make_config({"vendors": {
+            "git-cicd": dict(NEW_CICD_VENDOR, automerge=True)}})
+
+    @staticmethod
+    def _mock(cmd, **kwargs):
+        if cmd[:2] == ["git", "diff"] and "--name-only" in cmd:
+            return MagicMock(returncode=0, stdout="\n".join(WF_FILES) + "\n")
+        if cmd[:2] == ["git", "diff"]:
+            return MagicMock(returncode=1)
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return MagicMock(returncode=0,
+                             stdout="https://github.com/o/r/pull/5\n",
+                             stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def _run(self, mock_run, capsys):
+        mock_run.side_effect = self._mock
+        results = [{"vendor": "git-cicd", "old_version": "0.0.2",
+                    "new_version": "0.0.4", "changed": True}]
+        assert inst.create_pull_request(results) == \
+            "https://github.com/o/r/pull/5"
+        calls = mock_run.call_args_list
+        push = [c[0][0] for c in calls if "push" in c[0][0]]
+        create = [c for c in calls if c[0][0][:3] == ["gh", "pr", "create"]]
+        merge = [c for c in calls if c[0][0][:3] == ["gh", "pr", "merge"]]
+        assert len(push) == 1 and len(create) == 1 and len(merge) == 1
+        out = capsys.readouterr()
+        return push[0], create[0], merge[0], out.out + out.err
+
+    @pytest.mark.parametrize("env, expected", [
+        ({"CICD_WRITE_TOKEN": WRITE}, WRITE),
+        ({"CICD_WRITE_TOKEN": WRITE, "VENDOR_PAT": OLD}, WRITE),
+        ({"VENDOR_PAT": OLD}, OLD),
+        ({"CICD_WRITE_TOKEN": "", "VENDOR_PAT": OLD}, OLD),
+    ], ids=["write-token", "write-over-old", "old-alone", "empty-write"])
+    @patch("vendored_install.subprocess.run")
+    def test_push_pr_and_automerge_use_write_token(
+            self, mock_run, monkeypatch, capsys, env, expected):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        push, create, merge, out = self._run(mock_run, capsys)
+        header = inst._auth_header(expected)
+        assert f"http.https://github.com/.extraheader={header}" in push
+        assert create[1]["env"]["GH_TOKEN"] == expected
+        assert merge[1]["env"]["GH_TOKEN"] == expected
+        cmd = create[0][0]
+        assert "no checks will run" not in cmd[cmd.index("--body") + 1]
+        assert self.WRITE not in out and self.OLD not in out
+
+    @patch("vendored_install.subprocess.run")
+    def test_read_token_does_not_open_the_pr(self, mock_run, monkeypatch,
+                                             capsys):
+        monkeypatch.setenv("CICD_READ_TOKEN", "fake-read-token")
+        push, create, merge, out = self._run(mock_run, capsys)
+        assert push[:2] == ["git", "push"]
+        assert create[1]["env"]["GH_TOKEN"] == "workflow-token"
+        assert merge[1]["env"]["GH_TOKEN"] == "workflow-token"
+        assert "fake-read-token" not in out
+
+    def test_workflow_files_note_names_write_token(self):
+        note = inst.workflow_files_note(
+            [{"vendor": "git-cicd", "changed": True}], WF_FILES)
+        assert "`CICD_WRITE_TOKEN`" in note
+        assert "VENDOR_PAT" not in note
+
+
+class TestRequireWriteTokenInCI:
+    """--pr under CI without a write token fails before anything changes."""
+
+    def test_ci_without_write_token_fails_with_message(self, monkeypatch,
+                                                      capsys):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_TOKEN", "fake-gt-value-789")
+        monkeypatch.setenv("CICD_READ_TOKEN", "fake-read-token")
+        with pytest.raises(SystemExit) as exc:
+            inst.require_write_token_in_ci()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "CICD_WRITE_TOKEN" in out
+        assert "declare it in the git-cicd job" in out
+        assert "--allow-workflow-token" in out
+        assert "VENDOR_PAT" not in out
+        assert "fake-gt-value-789" not in out and "fake-read-token" not in out
+
+    @pytest.mark.parametrize("name", ["CICD_WRITE_TOKEN", "VENDOR_PAT"])
+    def test_ci_with_write_token_passes(self, monkeypatch, name):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv(name, "fake-token")
+        inst.require_write_token_in_ci()
+
+    def test_ci_with_flag_passes(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        inst.require_write_token_in_ci(allow_workflow_token=True)
+
+    def test_outside_ci_passes(self, monkeypatch):
+        inst.require_write_token_in_ci()
+        monkeypatch.setenv("GITHUB_ACTIONS", "")
+        inst.require_write_token_in_ci()
+
+    @patch("vendored_install.subprocess.run")
+    @patch("vendored_install.install_existing_vendor")
+    def test_main_pr_in_ci_fails_before_changing_anything(
+            self, mock_install, mock_run, tmp_repo, monkeypatch, capsys):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_TOKEN", "workflow-token")
+        # A monolithic config.json would be migrated (files written) by main.
+        config = {"vendors": {"tool": SAMPLE_VENDOR}}
+        config_path = tmp_repo / ".vendored" / "config.json"
+        config_path.write_text(json.dumps(config, indent=2) + "\n")
+        before = sorted(p.relative_to(tmp_repo).as_posix()
+                        for p in tmp_repo.rglob("*"))
+
+        with patch("sys.argv", ["install", "tool", "--pr"]):
+            with pytest.raises(SystemExit) as exc:
+                inst.main()
+        assert exc.value.code == 1
+        mock_install.assert_not_called()
+        mock_run.assert_not_called()
+        after = sorted(p.relative_to(tmp_repo).as_posix()
+                       for p in tmp_repo.rglob("*"))
+        assert after == before
+        assert json.loads(config_path.read_text()) == config
+        assert "CICD_WRITE_TOKEN" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("argv, env", [
+        (["install", "tool", "--pr", "--allow-workflow-token"],
+         {"GITHUB_ACTIONS": "true"}),
+        (["install", "tool", "--pr"], {}),
+        (["install", "tool", "--pr"],
+         {"GITHUB_ACTIONS": "true", "CICD_WRITE_TOKEN": "fake-write"}),
+    ], ids=["ci-with-flag", "outside-ci", "ci-with-write-token"])
+    @patch("vendored_install.create_pull_request")
+    @patch("vendored_install.output_result")
+    @patch("vendored_install.install_existing_vendor")
+    def test_main_pr_proceeds_as_before(self, mock_install, mock_output,
+                                        mock_pr, make_config, monkeypatch,
+                                        argv, env):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        result = {"vendor": "tool", "old_version": "1.0.0",
+                  "new_version": "2.0.0", "changed": True}
+        mock_install.return_value = result
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+
+        with patch("sys.argv", argv):
+            inst.main()
+        mock_install.assert_called_once()
+        mock_pr.assert_called_once_with([result])
+
+    @patch("vendored_install.install_existing_vendor")
+    @patch("vendored_install.output_result")
+    def test_main_without_pr_in_ci_is_unchanged(self, mock_output,
+                                                mock_install, make_config,
+                                                monkeypatch):
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        mock_install.return_value = {"vendor": "tool", "old_version": "1.0.0",
+                                     "new_version": "2.0.0", "changed": True}
+        make_config({"vendors": {"tool": SAMPLE_VENDOR}})
+        with patch("sys.argv", ["install", "tool"]):
+            inst.main()
+        mock_install.assert_called_once()

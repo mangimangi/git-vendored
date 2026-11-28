@@ -120,7 +120,7 @@ Framework-owned metadata is stored at `.vendored/manifests/<vendor>.registry`:
 |-------|------|----------|-------------|
 | `repo` | string | yes | GitHub repository (`owner/name`) |
 | `install_branch` | string | yes | Branch prefix for vendor update PRs |
-| `private` | bool | no | Requires `VENDOR_PAT` secret for access |
+| `private` | bool | no | Read with the `CICD_READ_TOKEN` secret (else `CICD_WRITE_TOKEN`) |
 | `dogfood` | bool | no | Excluded from `VENDOR_INSTALL_DIR` |
 | `automerge` | bool | no | Auto-merge vendor update PRs |
 | `protected` | list | yes | Glob patterns of protected files |

@@ -52,8 +52,9 @@ GitHub API to list directory contents).
 
 ### Auth
 
-Both functions respect `$VENDOR_PAT` (checked first) and `$GH_TOKEN` for
-private repo access. No additional auth setup is needed in vendor scripts.
+Both functions authenticate with the first of `$CICD_READ_TOKEN`,
+`$CICD_WRITE_TOKEN`, `$VENDOR_PAT` (deprecated) and `$GH_TOKEN` that is set,
+for private repo access. No additional auth setup is needed in vendor scripts.
 
 ### Environment variables
 
@@ -66,7 +67,9 @@ These are set by the framework before the vendor `install.sh` runs:
 | `VENDOR_MANIFEST`    | Path to the file manifest              |
 | `VENDOR_INSTALL_DIR` | Target directory for vendor files      |
 | `GH_TOKEN`           | Auth token (optional)                  |
-| `VENDOR_PAT`         | Auth token override for private repos  |
+| `CICD_READ_TOKEN`    | Token that reads private repos         |
+| `CICD_WRITE_TOKEN`   | Read when `CICD_READ_TOKEN` is unset   |
+| `VENDOR_PAT`         | Deprecated old name, read last         |
 
 ---
 

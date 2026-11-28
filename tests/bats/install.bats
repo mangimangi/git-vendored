@@ -563,8 +563,11 @@ git-vendored.version" ]
 }
 
 @test "stubs_setup removes token variables the outer environment holds" {
+    export CICD_WRITE_TOKEN=outer-fake-write CICD_READ_TOKEN=outer-fake-read
     export VENDOR_PAT=outer-fake-pat GH_TOKEN=outer-fake-gh GITHUB_TOKEN=outer-fake-gt
     stubs_setup
+    [ -z "${CICD_WRITE_TOKEN+set}" ]
+    [ -z "${CICD_READ_TOKEN+set}" ]
     [ -z "${VENDOR_PAT+set}" ]
     [ -z "${GH_TOKEN+set}" ]
     [ -z "${GITHUB_TOKEN+set}" ]

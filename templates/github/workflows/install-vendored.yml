@@ -11,7 +11,12 @@
 #
 # Auth:
 #   - GITHUB_TOKEN for public vendor repos
-#   - VENDOR_PAT secret for private vendor repos (vendor.private: true)
+#   - CICD_WRITE_TOKEN secret: pushes the install branch (with workflow
+#     files), opens the PR and requests auto-merge, so the PR's checks run.
+#     Required under CI: without it --pr fails before changing anything.
+#   - CICD_READ_TOKEN secret for private vendor repos (vendor.private: true);
+#     CICD_WRITE_TOKEN is used when it is not set
+#   - VENDOR_PAT secret: deprecated old name, still read
 
 name: Install Vendored
 
@@ -29,7 +34,7 @@ on:
         required: false
         default: 'latest'
       private:
-        description: 'Vendor repo is private (use VENDOR_PAT)'
+        description: 'Vendor repo is private (read with CICD_READ_TOKEN)'
         type: boolean
         required: false
         default: false
@@ -62,8 +67,10 @@ jobs:
       - name: Run vendored install
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          VENDOR_PAT: ${{ secrets.token || secrets.VENDOR_PAT || '' }}
-          GH_TOKEN: ${{ secrets.token || secrets.VENDOR_PAT || github.token }}
+          CICD_WRITE_TOKEN: ${{ secrets.token || secrets.CICD_WRITE_TOKEN || '' }}
+          CICD_READ_TOKEN: ${{ secrets.CICD_READ_TOKEN || '' }}
+          VENDOR_PAT: ${{ secrets.VENDOR_PAT || '' }}
+          GH_TOKEN: ${{ secrets.token || secrets.CICD_WRITE_TOKEN || secrets.VENDOR_PAT || github.token }}
         run: |
           VENDOR="${{ inputs.vendor || 'all' }}"
           VERSION="${{ inputs.version || 'latest' }}"

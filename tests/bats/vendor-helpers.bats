@@ -23,6 +23,36 @@ run_lib() {
 
 # ── _vendor_auth_header ─────────────────────────────────────────────────
 
+@test "auth header: CICD_READ_TOKEN first, over the write and old tokens" {
+    export CICD_READ_TOKEN=read CICD_WRITE_TOKEN=write VENDOR_PAT=pat GH_TOKEN=tok
+    run_lib '_vendor_auth_header'
+    [ "$status" -eq 0 ]
+    [ "$output" = "Authorization: token read" ]
+}
+
+@test "auth header: CICD_WRITE_TOKEN when CICD_READ_TOKEN is unset or empty" {
+    export CICD_WRITE_TOKEN=write VENDOR_PAT=pat GH_TOKEN=tok
+    run_lib '_vendor_auth_header'
+    [ "$output" = "Authorization: token write" ]
+    export CICD_READ_TOKEN=""
+    run_lib '_vendor_auth_header'
+    [ "$output" = "Authorization: token write" ]
+}
+
+@test "auth header: VENDOR_PAT when both new names are unset or empty" {
+    export CICD_READ_TOKEN="" CICD_WRITE_TOKEN="" VENDOR_PAT=pat GH_TOKEN=tok
+    run_lib '_vendor_auth_header'
+    [ "$output" = "Authorization: token pat" ]
+}
+
+@test "download: CICD_READ_TOKEN alone selects the gh path" {
+    export CICD_READ_TOKEN=read
+    run_lib '_vendor_download src/a.txt a.txt'
+    [ "$status" -eq 0 ]
+    [ "$(stub_calls gh)" -eq 1 ]
+    [ "$(stub_calls curl)" -eq 0 ]
+}
+
 @test "auth header: VENDOR_PAT overrides GH_TOKEN" {
     export VENDOR_PAT=pat GH_TOKEN=tok
     run_lib '_vendor_auth_header'

@@ -91,23 +91,33 @@ VENDORED_VENDOR=git-cicd VENDORED_VERSION=latest python3 .vendored/install --pr
 
 ### Which token does what
 
-| Token | Reads a private vendor | Pushes the install branch | Opens the PR and requests auto-merge |
-|-------|------------------------|---------------------------|--------------------------------------|
-| `VENDOR_PAT` (when set) | yes (required for `private: true`) | when the branch carries workflow files | yes, so the PR's checks run |
-| `GITHUB_TOKEN` (the workflow's own) | no (public vendors only) | otherwise (the checkout's credentials) | only when `VENDOR_PAT` is not set |
+The install uses two secrets, split by what a token may do. A git-cicd job is given a secret only when it declares it, so the job that runs `.vendored/install --pr` must declare `CICD_WRITE_TOKEN` (and `CICD_READ_TOKEN` when it installs a private vendor).
 
-GitHub starts no workflows for a pull request opened with a workflow's own `GITHUB_TOKEN`, so such an install PR gets no checks (and cannot merge where a status such as `Verdict / git-cicd:verdict` is required); its description says so in one line. Set a `VENDOR_PAT` secret to have the PR opened with it. If the PR cannot be opened after the branch was pushed (for example where GitHub Actions may not create pull requests), the install names the branch, says how to open the PR by hand and exits non-zero; a PR that already exists for the branch is reused. No token value is printed.
+| Token | What the install does with it | Read in this order | Fine-grained token permissions (on the repositories named) | Classic token scopes |
+|-------|-------------------------------|--------------------|-------------------------------------------------------------|----------------------|
+| `CICD_WRITE_TOKEN` | proposes changes: pushes the install branch (with its workflow files), opens the PR and requests auto-merge, so the PR's checks run | `CICD_WRITE_TOKEN`, then `VENDOR_PAT` | consuming repository: **Contents** read/write, **Pull requests** read/write, **Workflows** read/write | `repo`, `workflow` |
+| `CICD_READ_TOKEN` | reads a private vendor repository (`private: true`, `--private`); cannot write | `CICD_READ_TOKEN`, then `CICD_WRITE_TOKEN`, then `VENDOR_PAT` | each private vendor repository: **Contents** read-only (and **Metadata** read-only, which GitHub adds) | `repo` |
+| `GITHUB_TOKEN` (the workflow's own) | reads public vendors; pushes the branch without workflow files; opens the PR only with `--allow-workflow-token` or outside CI | | | |
 
-### Workflow files and `VENDOR_PAT`
+`VENDOR_PAT`, the old name for both, is still read where the new names are unset, as shown; it is deprecated, so set `CICD_WRITE_TOKEN` and `CICD_READ_TOKEN` instead. No token value is printed.
+
+### `--pr` in CI needs `CICD_WRITE_TOKEN`
+
+GitHub starts no workflows for a pull request opened with a workflow's own `GITHUB_TOKEN`, so such an install PR gets no checks (and cannot merge where a status such as `Verdict / git-cicd:verdict` is required); where GitHub Actions may not create pull requests, the run fails after pushing its branch. So in `--pr` mode under CI (`GITHUB_ACTIONS` set) with no write token (`CICD_WRITE_TOKEN`, or the deprecated `VENDOR_PAT`), the install fails before changing any file or pushing any branch. Its message names `CICD_WRITE_TOKEN`, says the git-cicd job must declare it, and names `--allow-workflow-token`.
+
+- **`--allow-workflow-token`** opens the PR with the workflow's own token on purpose, as before: its description then says in one line that no checks will run.
+- **Outside CI** (`GITHUB_ACTIONS` unset) nothing is checked, and the PR is opened with whatever token `gh` has.
+
+If the PR cannot be opened after the branch was pushed, the install names the branch, says how to open the PR by hand and exits non-zero; a PR that already exists for the branch is reused.
+
+### Workflow files and `CICD_WRITE_TOKEN`
 
 An install can change files under `.github/workflows/` (a vendor's workflows). The workflow's own `GITHUB_TOKEN` may not push those, so in `--pr` mode:
 
-- **With `VENDOR_PAT` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with `VENDOR_PAT` (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
-- **Without `VENDOR_PAT`**, workflow files are left out as before.
+- **With `CICD_WRITE_TOKEN` set**, the workflow files the install wrote or removed stay in the commit, and the branch is pushed with it (sent as an HTTP header on the `git push` command line, never printed or written to `.git/config`). If the push is refused because the token may not write workflows, the install leaves the workflow files out, pushes the rest and still opens the PR.
+- **Without a write token** (only with `--allow-workflow-token`, or outside CI), workflow files are left out.
 
 Whenever workflow files are left out, the PR description lists them and says what to run and commit on the branch: for git-cicd, `.vendored/pkg/git-cicd/git-cicd generate`; for other vendors, `python3 .vendored/install <vendor> --force` with a token that may write workflows.
-
-To carry workflow files and open the PR, `VENDOR_PAT` needs, on the consuming repository: **Contents** read/write, **Pull requests** read/write and **Workflows** write (fine-grained token), or the `repo` and `workflow` scopes (classic token). No token value is printed in any log.
 
 ## Removing a Vendor
 
@@ -137,7 +147,7 @@ Each vendor has its own config file at `.vendored/configs/<vendor>.json`:
 | `repo` | yes | GitHub repository (`owner/name`) |
 | `install_branch` | yes | Branch prefix for vendor update PRs |
 | `allowed` | no | Glob patterns of vendor-managed files that users *can* edit |
-| `private` | no | If `true`, requires `VENDOR_PAT` secret for access |
+| `private` | no | If `true`, the vendor is read with `CICD_READ_TOKEN` (else `CICD_WRITE_TOKEN`) |
 | `automerge` | no | If `true`, auto-merge vendor update PRs (default: `false`) |
 | `dogfood` | no | If `true`, skips `VENDOR_INSTALL_DIR` (installs into framework paths) |
 
@@ -211,7 +221,7 @@ Each key is the dependency's vendor name, and the value is an object with:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `repo` | yes | GitHub repository (`owner/name`) |
-| `private` | no | If `true`, the dependency requires `VENDOR_PAT` for access. When omitted, inherits the parent vendor's `--private` flag |
+| `private` | no | If `true`, the dependency is read with `CICD_READ_TOKEN` (else `CICD_WRITE_TOKEN`). When omitted, inherits the parent vendor's `--private` flag |
 
 Usage:
 
@@ -220,7 +230,7 @@ Usage:
 python3 .vendored/install owner/my-tool --deps=install
 
 # Private vendor with private dependencies
-VENDOR_PAT=<token> python3 .vendored/install owner/my-tool --private --deps=install
+CICD_READ_TOKEN=<token> python3 .vendored/install owner/my-tool --private --deps=install
 ```
 
 Dependency modes (`--deps`):
@@ -353,7 +363,7 @@ git-vendored's own pull request checks, releases, vendor updates and vendor vali
 - `vendor-check` (Vendor Check): `ci/vendor-check.sh` runs `.vendored/check` against the change's base.
 - `version-check` (Version Check): runs on every pull request into `main`. Its step is `.vendored/pkg/git-semver/git-semver check-bump`, which fails the pull request when it changes a file listed in `files` in `.vendored/configs/git-semver.json` (`install.sh`, `validate`, `templates/**`, `docs/**`, `AGENTS.md`, `README.md`) without raising `VERSION` above `main`'s.
 - `release` (Release): runs on every merge to `main`, and by hand. Its step is `.vendored/pkg/git-semver/release` with no subcommand; with `"bump_on": "pull_request"` in `.vendored/configs/git-semver.json` it tags the landed commit with the version it carries (`v<VERSION>`) and creates the GitHub release, or does nothing when that version is already tagged. It pushes nothing to `main`, makes no commit and moves no `latest` tag. It takes no inputs; a manual run releases the current commit of the branch it runs on.
-- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `VENDOR_PAT` secret when it is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
+- `update-vendored` (Update Vendored): runs Mondays at 09:00 UTC (cron `0 9 * * 1`) on `main`, and by hand. `ci/update-vendored.sh` runs `.vendored/install <vendor> --version <version> --pr --deps=install` (plus `--private` when `private` is `true`), passing each input as one argument, never through a shell, with `GH_TOKEN` set from the `CICD_WRITE_TOKEN` secret (else the deprecated `VENDOR_PAT`) when one is set. Inputs: `vendor` (default `all`), `version` (default `latest`), `private` (`false` or `true`; default `false`).
 - `validate` (Validate Vendor): by hand only. `ci/validate.sh` runs this repository's `validate <repo> --version <version>` to check whether a repository implements the vendor contract (nothing is installed). Inputs: `repo` (`owner/repo`, required) and `version` (default `latest`).
 
 ### How a release happens
