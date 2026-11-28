@@ -1,6 +1,3 @@
-.github/workflows/git-cicd-manual.yml
-.github/workflows/git-cicd-merge.yml
-.github/workflows/git-cicd-open.yml
 .vendored/manifests/git-cicd.schema
 .vendored/pkg/git-cicd/git-cicd
 .vendored/pkg/git-cicd/templates/workflows/cron.yml

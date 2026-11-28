@@ -29,6 +29,11 @@
       "type": "string",
       "required": false,
       "description": "When the version is bumped: \"merge\" (default; release bumps after the merge) or \"pull_request\" (the pull request bumps, checked by git-semver check-bump; release tags the landed commit and pushes nothing to the branch)"
+    },
+    "push_bump": {
+      "type": "boolean",
+      "required": false,
+      "description": "With bump_on pull_request: check-bump raises a missing version by a patch and pushes it to the pull request branch (default true); false = check only"
     }
   }
 }
